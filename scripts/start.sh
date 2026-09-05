@@ -160,7 +160,16 @@ elif [ "$OS" = "Linux" ]; then
        || _service_live "$INSTALL_DIR/store/claudeclaw.pid" "dist/index.js"; then
       echo "Dashboard mar fut, ujrainditas kihagyva."
     else
-      nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" > "$INSTALL_DIR/store/dashboard.log" 2>&1 9>&- &
+      # APPEND, not truncate. Two reasons, and the second is the load-bearing one:
+      #  1. `>` threw away the previous run's log on every start, so any measurement
+      #     made from it silently covered only "since the last restart" -- a zero
+      #     result there proves nothing about the install's history.
+      #  2. The store logrotate config rotates this file with copytruncate (it must:
+      #     systemd holds an open fd). With `>` the process keeps its file offset, so
+      #     after a truncation it resumes writing at the OLD offset and leaves a sparse
+      #     hole -- the file reads ~1MB of NULs again immediately. O_APPEND makes every
+      #     write land at the current end, which is what copytruncate assumes.
+      nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" >> "$INSTALL_DIR/store/dashboard.log" 2>&1 9>&- &
       echo $! > "$INSTALL_DIR/store/dashboard.pid"
     fi
     if _service_live "$INSTALL_DIR/store/channels.pid" "channels.sh"; then
