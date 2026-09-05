@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   initDatabase,
   saveAgentMemory,
@@ -134,5 +136,28 @@ describe('a helyben-javitas nyomot hagy a napi naploban (mechanizmus, nem szabal
     const before = getDailyLog('naplo-agens-2', today).length
     saveAgentMemory('naplo-agens-2', 'uj emlek, nem szerkesztes', 'warm')
     expect(getDailyLog('naplo-agens-2', today).length).toBe(before)
+  })
+})
+
+// Structural, not behavioural, on purpose: the window between "text updated" and
+// "vector cleared" cannot be observed from outside the function, but it is exactly
+// what this card exists to close. A future refactor that splits the two statements
+// apart would restore the bug silently, so the shape is pinned at source level --
+// the same approach conversation-ledger-schema.test.ts uses for schema drift.
+describe('az ervenytelenites ATOMI: egy UPDATE irja a szoveget es uriti a vektort', () => {
+  const dbts = readFileSync(join(__dirname, '..', 'db.ts'), 'utf-8')
+
+  it('a vektor-oszlopok a sets tombben vannak, nem kulon utasitasban', () => {
+    const m = dbts.match(/const sets: string\[\] = \[([^\]]*)\]/)
+    expect(m).not.toBeNull()
+    expect(m![1]).toContain("embedding = NULL")
+    expect(m![1]).toContain("embedding_source_sha256 = NULL")
+  })
+
+  it('KONTROLL: az updateMemory NEM tartalmaz kulon ervenytelenito UPDATE-et', () => {
+    const fn = dbts.slice(dbts.indexOf('export function updateMemory'))
+    const body = fn.slice(0, fn.indexOf('\nexport '))
+    // A kulon utasitas alakja: UPDATE ... SET embedding = NULL ... WHERE id
+    expect(body).not.toMatch(/UPDATE memories SET embedding = NULL[^\n]*WHERE id/)
   })
 })

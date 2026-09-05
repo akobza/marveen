@@ -1522,7 +1522,11 @@ export function updateMemory(id: number, content: string, category?: string, age
   // stale. Only the row itself knows that.
   const before = db.prepare('SELECT agent_id, category FROM memories WHERE id = ?').get(id) as
     { agent_id: string | null; category: string | null } | undefined
-  const sets: string[] = ['content = ?', 'accessed_at = ?']
+  // The vector columns are cleared in the SAME statement that rewrites the text.
+  // Two separate UPDATEs would leave a window -- narrow, but exactly the state this
+  // whole fix exists to prevent: NEW text next to the OLD vector. The card exists
+  // because that state persisted for hours; it must not be recreated for milliseconds.
+  const sets: string[] = ['content = ?', 'accessed_at = ?', 'embedding = NULL', 'embedding_source_sha256 = NULL']
   const params: unknown[] = [content, now]
   if (category) { sets.push('category = ?'); params.push(category) }
   if (agentId) { sets.push('agent_id = ?'); params.push(agentId) }
@@ -1530,13 +1534,12 @@ export function updateMemory(id: number, content: string, category?: string, age
   params.push(id)
   const changed = db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`).run(...params).changes > 0
   if (changed) {
-    // The row's TEXT just changed, so its vector now belongs to the previous wording.
-    // Leaving it would keep the memory searchable under the text we just corrected --
-    // measured on 2026-09-05: eleven rows, two of which had carried a claim that turned
-    // out to be false. Drop it FIRST (an absent vector is honest; a wrong one is not),
-    // then regenerate. If regeneration fails the row simply stays NULL and the next
-    // backfill picks it up -- FTS keeps working throughout.
-    db.prepare('UPDATE memories SET embedding = NULL, embedding_source_sha256 = NULL WHERE id = ?').run(id)
+    // The row's TEXT changed, so its vector belonged to the previous wording; the UPDATE
+    // above already cleared it in the same statement. Leaving it would have kept the
+    // memory searchable under the text we just corrected -- measured on 2026-09-05:
+    // eleven rows, two of which carried a claim that turned out to be false.
+    // Now regenerate. If that fails the row simply stays NULL and the next backfill
+    // picks it up: an absent vector is honest, a wrong one is not, and FTS works throughout.
     // Leave a dated trace of the in-place edit, in the SAME call that performs it.
     //
     // There is no updated_at column, so which rows were ever edited in place is not
@@ -3063,11 +3066,13 @@ export async function backfillEmbeddings(): Promise<number> {
   // Rows with a NULL hash are left alone -- they predate the column, so their freshness
   // is UNKNOWN, and re-embedding the whole store on first boot is not this function's
   // call to make (see getMemoryStats, which reports them as their own bucket).
+  // Only the NULL-ness of the vector matters here, not its contents -- pulling every
+  // embedding across just to test it for null would move megabytes for a boolean.
   const candidates = db.prepare(
-    'SELECT id, content, keywords, embedding, embedding_source_sha256 FROM memories'
-  ).all() as { id: number; content: string; keywords: string | null; embedding: string | null; embedding_source_sha256: string | null }[]
+    'SELECT id, content, keywords, (embedding IS NULL) AS emb_is_null, embedding_source_sha256 FROM memories'
+  ).all() as { id: number; content: string; keywords: string | null; emb_is_null: number; embedding_source_sha256: string | null }[]
   const rows = candidates.filter(r =>
-    r.embedding === null ||
+    r.emb_is_null === 1 ||
     (r.embedding_source_sha256 !== null && r.embedding_source_sha256 !== embeddingSourceHash(r.content, r.keywords))
   )
   let count = 0
