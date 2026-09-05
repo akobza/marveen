@@ -143,7 +143,11 @@ describe('PORTCHAIN1: the port chain follows WEB_PORT on a NON-default port', ()
 
   it('leaves the documented fallbacks alone', () => {
     const stays: Array<[string, RegExp]> = [
-      ['src/config.ts', /WEB_PORT = parseInt\(env\['WEB_PORT'\] \?\? '3420', 10\)/],
+      // b2cd0f43 changed the SHAPE, not the fallback: WEB_PORT now resolves through
+      // parseWebPort(), which validates and refuses a NaN port. The 3420 default is still
+      // here and still the last resort -- and this pattern now pins one thing more than
+      // before, namely that the value goes through the validating parser at all.
+      ['src/config.ts', /parseWebPort\([^)]*3420\)/],
       ['src/web.ts', /startWebServer\(port = 3420\)/],
       ['src/remote-enroll-core.ts', /REMOTE_PORT = 3420/],
       ['scripts/fleet-safe-start.sh', /MARVEEN_DASHBOARD_URL:-http:\/\/localhost:3420/],

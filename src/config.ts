@@ -287,9 +287,88 @@ export function systemdStatusUnits(serviceId: string): string[] {
   return [...new Set([`${serviceId}-dashboard`, serviceId, LEGACY_SERVICE_ID])]
 }
 
-export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
+// --- Boot-critical keys: process.env is allowed to win, for these two ONLY ----------
+//
+// readEnvFile() reads the .env FILE and nothing else, so until now
+// `WEB_PORT=39876 node dist/index.js` came up SILENTLY on 3420: the variable was not
+// wrong, it was not consulted. That is worse than a rejected value, because the
+// operator has evidence they set it and the process has evidence it did not.
+//
+// The allowlist is deliberately TWO keys and lives in one named place. It is NOT a
+// general process.env overlay: pouring the environment over the config would let an
+// inherited variable silently rewrite this install's identity (MAIN_AGENT_ID,
+// CHANNEL_PROVIDER, tokens), which is a much larger hole than the one being closed.
+// Any further key needs its own decision, not an edit to this array.
+//
+// CLAUDECLAW_ENV_DIR (env.ts:11) is untouched: it already reads process.env and is a
+// test seam for the .env path itself, not a config value.
+const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT', 'WEB_HOST'] as const
+type BootKey = (typeof PROCESS_ENV_BOOT_KEYS)[number]
 
-export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
+// process.env > config-overrides.json > .env  (the caller applies the default).
+// An empty or whitespace-only value counts as UNSET at every layer, so a stray
+// `WEB_HOST=` cannot blank the host -- it falls through to the next source, the same
+// way cfg() already treats an empty override.
+// Pure, so the ORDER can be asserted without booting the process or touching the
+// real .env -- the precedence is the thing this card changes, so it is the thing a
+// test has to be able to see.
+export function resolveBootValue(
+  fromProcess: string | undefined,
+  fromLayered: string | undefined,
+): { value: string; source: string } | undefined {
+  if (fromProcess !== undefined && fromProcess.trim().length > 0) {
+    return { value: fromProcess.trim(), source: 'process.env' }
+  }
+  if (fromLayered !== undefined && fromLayered.trim().length > 0) {
+    return { value: fromLayered.trim(), source: 'config-overrides.json/.env' }
+  }
+  return undefined
+}
+
+function bootEnv(key: BootKey): { value: string; source: string } | undefined {
+  return resolveBootValue(process.env[key], cfg(key))
+}
+
+/**
+ * Parse a port, or STOP.
+ *
+ * `parseInt('39876x', 10)` is 39876 and `parseInt('nope', 10)` is NaN -- and a NaN port
+ * makes listen() bind an arbitrary free port, so the dashboard would come up somewhere
+ * nobody is looking. While the value could only come from a hand-edited .env this was a
+ * once-per-install risk; now that a command line can set it, one keystroke is enough.
+ * Exported for tests: the failure path must be assertable without booting the process.
+ */
+export function parseWebPort(raw: string | undefined, source: string, fallback: number): number {
+  if (raw === undefined) return fallback
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `WEB_PORT is not a number: ${JSON.stringify(raw)} (source: ${source}). ` +
+      'Refusing to start: an unparsable port would bind an arbitrary free port and the ' +
+      'dashboard would come up where nobody is looking.',
+    )
+  }
+  const port = Number(raw)
+  if (port < 1 || port > 65535) {
+    throw new Error(
+      `WEB_PORT is out of range: ${port} (source: ${source}). Valid ports are 1-65535.`,
+    )
+  }
+  return port
+}
+
+const webPortRaw = bootEnv('WEB_PORT')
+export const WEB_PORT = parseWebPort(webPortRaw?.value, webPortRaw?.source ?? 'default', 3420)
+
+const webHostRaw = bootEnv('WEB_HOST')
+export const WEB_HOST = webHostRaw?.value ?? '127.0.0.1'
+
+// Which source each boot-critical key actually came from. The startup log prints this:
+// "the variable was ignored" and "the variable was applied" look identical from outside,
+// and that ambiguity is exactly what this card exists to remove.
+export const BOOT_KEY_SOURCES: Record<BootKey, string> = {
+  WEB_PORT: webPortRaw?.source ?? 'default',
+  WEB_HOST: webHostRaw?.source ?? 'default',
+}
 
 // Kanban card aging visual thresholds (hours since last update) and colours.
 // Override per-install via .env; defaults match the design spec (24/72/168h).

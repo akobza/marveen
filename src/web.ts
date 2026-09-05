@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, BOOT_KEY_SOURCES } from './config.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
 import { sweepExpiredSessions } from './web/auth-sessions.js'
@@ -288,7 +288,13 @@ export function startWebServer(port = 3420): http.Server {
   })
 
   server.listen(port, WEB_HOST, () => {
-    logger.info({ port }, `Web dashboard: http://localhost:${port}`)
+    // Name the SOURCE of the port and host, not just their values. "The variable was
+    // ignored" and "the variable was applied" produce identical output otherwise, and
+    // that ambiguity is what let WEB_PORT be silently dropped (card b2cd0f43).
+    logger.info(
+      { port, host: WEB_HOST, portSource: BOOT_KEY_SOURCES.WEB_PORT, hostSource: BOOT_KEY_SOURCES.WEB_HOST },
+      `Web dashboard: http://localhost:${port}`,
+    )
     // Do NOT log the bearer token: launchd/journal/pipe captures of the
     // structured log would otherwise carry a root-equivalent credential.
     // Print the bootstrap URL directly to stderr instead so it shows in the
