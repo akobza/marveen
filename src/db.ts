@@ -1537,6 +1537,22 @@ export function updateMemory(id: number, content: string, category?: string, age
     // then regenerate. If regeneration fails the row simply stays NULL and the next
     // backfill picks it up -- FTS keeps working throughout.
     db.prepare('UPDATE memories SET embedding = NULL, embedding_source_sha256 = NULL WHERE id = ?').run(id)
+    // Leave a dated trace of the in-place edit, in the SAME call that performs it.
+    //
+    // There is no updated_at column, so which rows were ever edited in place is not
+    // recoverable from the schema -- on 2026-09-05 it had to be reconstructed by asking
+    // each agent what it remembered correcting. That worked because the edits were hours
+    // old. It would not work next week.
+    //
+    // Deliberately part of this function rather than a rule for callers to follow: a rule
+    // that lives outside the operation is a rule that will eventually not run. Best-effort
+    // -- a failure to journal must not fail the edit the caller asked for.
+    const owner = before?.agent_id || agentId
+    if (owner) {
+      try {
+        appendDailyLog(owner, `PUT ${id} -- memória helyben javítva (a vektor újraépül)`)
+      } catch { /* the edit itself stands; the journal line is a trace, not a gate */ }
+    }
     const kw = keywords !== undefined ? keywords : (db.prepare('SELECT keywords FROM memories WHERE id = ?')
       .get(id) as { keywords: string | null } | undefined)?.keywords ?? null
     const srcHash = embeddingSourceHash(content, kw)

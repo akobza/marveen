@@ -5,6 +5,7 @@ import {
   updateMemory,
   getMemoryStats,
   getDb,
+  getDailyLog,
   invalidateEmbeddings,
   embeddingSourceText,
   embeddingSourceHash,
@@ -112,5 +113,26 @@ describe('invalidateEmbeddings (a torteneti sorok operatori javitasa)', () => {
 
   it('ures listara nem csinal semmit', () => {
     expect(invalidateEmbeddings([])).toBe(0)
+  })
+})
+
+describe('a helyben-javitas nyomot hagy a napi naploban (mechanizmus, nem szabaly)', () => {
+  it('updateMemory maga irja a naplo-sort, ugyanabban a hivasban', () => {
+    const { id } = saveAgentMemory('naplo-agens', 'eredeti szoveg', 'warm')
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Budapest' })
+    const before = getDailyLog('naplo-agens', today).length
+
+    updateMemory(id, 'javitott szoveg')
+
+    const after = getDailyLog('naplo-agens', today)
+    expect(after.length).toBe(before + 1)
+    expect(after[after.length - 1].content).toContain(`PUT ${id}`)
+  })
+
+  it('KONTROLL: a MENTES nem ir naplo-sort -- csak a helyben-javitas', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Budapest' })
+    const before = getDailyLog('naplo-agens-2', today).length
+    saveAgentMemory('naplo-agens-2', 'uj emlek, nem szerkesztes', 'warm')
+    expect(getDailyLog('naplo-agens-2', today).length).toBe(before)
   })
 })
