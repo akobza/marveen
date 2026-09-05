@@ -141,7 +141,23 @@ elif [ "$OS" = "Linux" ]; then
       echo "  another start.sh held the start lock for 120s; continuing WITHOUT it." >&2
     fi
     [ -f "$INSTALL_DIR/dist/index.js" ] || (cd "$INSTALL_DIR" && npm run build)
-    if _service_live "$INSTALL_DIR/store/dashboard.pid" "dist/index.js"; then
+    # TWO pidfiles exist for ONE dashboard, and only one of them is written on
+    # every boot. `store/dashboard.pid` is written HERE, so it exists only when
+    # start.sh itself launched the service; `store/claudeclaw.pid` is written by
+    # the app (src/config.ts PID_FILENAME) whichever way it was started -- npm
+    # start, systemd, the respawn path, or by hand. Checking only dashboard.pid
+    # therefore made every dashboard NOT started by this script invisible, and
+    # "invisible" here is not a no-op: the launch below would start a SECOND
+    # instance, and src/process-lock.ts takes over by SIGTERM/SIGKILLing the
+    # live predecessor of this install. So the blind gate did not merely skip a
+    # check, it could kill a healthy dashboard. Measured 2026-09-05 10:45 UTC on
+    # this box: claudeclaw.pid = 983475 (alive, node dist/index.js),
+    # dashboard.pid absent -- i.e. a start.sh run at that moment would have
+    # restarted a perfectly live service. Both are cross-checked against
+    # /proc/<pid>/cmdline by _service_live, so a stale file of either name still
+    # reads as "not live" and does not block a genuine start.
+    if _service_live "$INSTALL_DIR/store/dashboard.pid" "dist/index.js" \
+       || _service_live "$INSTALL_DIR/store/claudeclaw.pid" "dist/index.js"; then
       echo "Dashboard mar fut, ujrainditas kihagyva."
     else
       nohup "$NODE_BIN" "$INSTALL_DIR/dist/index.js" > "$INSTALL_DIR/store/dashboard.log" 2>&1 9>&- &
