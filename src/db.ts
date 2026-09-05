@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, closeSync, statSync } from 'node:fs'
 import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ } from './config.js'
@@ -359,6 +360,18 @@ export function initDatabase(dbPathOverride?: string): void {
   }
 
   // Migration: embedding column for vector search
+  // The text an embedding was built FROM, hashed. Without it the freshness of a
+  // vector is not measurable: `embedding IS NOT NULL` proves a vector EXISTS, not
+  // that it belongs to the row's current text. updateMemory() rewrote content and
+  // left the old vector in place, so a corrected memory stayed searchable under its
+  // OLD, sometimes false wording (card e04bda19, measured 2026-09-05: 11 such rows).
+  // NULL here means "unknown", not "fresh" -- rows written before this column
+  // existed cannot claim freshness they were never checked for.
+  try {
+    db.exec('ALTER TABLE memories ADD COLUMN embedding_source_sha256 TEXT')
+  } catch {
+    // column already exists
+  }
   try {
     db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT')
   } catch {
@@ -1199,9 +1212,15 @@ export function saveMemory(
   // log digest (memory.ts, "[Napi naplo ...]") is saved here, so every night
   // one memory was missing from semantic search until the Dream Engine
   // backfilled it by hand.
-  generateEmbedding(content).then(emb => {
+  // Canonical basis + its hash, so the vector's freshness stays measurable. This path
+  // used to embed `content` alone while the other two included keywords; see
+  // embeddingSourceText for why that mattered and why it is one function now.
+  const srcText = embeddingSourceText(content)
+  const srcHash = embeddingSourceHash(content)
+  generateEmbedding(srcText).then(emb => {
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), id)
+      db.prepare('UPDATE memories SET embedding = ?, embedding_source_sha256 = ? WHERE id = ?')
+        .run(JSON.stringify(emb), srcHash, id)
     }
   }).catch(() => {})
 }
@@ -1413,9 +1432,11 @@ export function saveAgentMemory(
   else memoryCacheInvalidate(agentId)
 
   // Fire-and-forget: generate embedding asynchronously
-  generateEmbedding(content + (keywords ? ' ' + keywords : '')).then(emb => {
+  const srcHash = embeddingSourceHash(content, keywords)
+  generateEmbedding(embeddingSourceText(content, keywords)).then(emb => {
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), id)
+      db.prepare('UPDATE memories SET embedding = ?, embedding_source_sha256 = ? WHERE id = ?')
+        .run(JSON.stringify(emb), srcHash, id)
     }
   }).catch(() => {})
 
@@ -1460,16 +1481,37 @@ export function searchAgentMemories(agentId: string, query: string, limit: numbe
   }
 }
 
-export function getMemoryStats(): { total: number; byAgent: Record<string, number>; byTier: Record<string, number>; withEmbedding: number } {
+export function getMemoryStats(): {
+  total: number; byAgent: Record<string, number>; byTier: Record<string, number>;
+  withEmbedding: number; embeddingFresh: number; embeddingStale: number; embeddingUnknown: number
+} {
   const total = (db.prepare('SELECT COUNT(*) as c FROM memories').get() as {c:number}).c
+  // withEmbedding answers "does a vector EXIST", which is not the question anyone
+  // actually has. It read 225/225 on 2026-09-05 while at least eleven of those vectors
+  // belonged to text that had since been rewritten -- a green that asserted the absence
+  // of a known failure, not the presence of evidence. It stays for compatibility, and
+  // the three buckets below say what it cannot:
+  //   fresh   -- the stored hash matches the row's current text: PROVEN current
+  //   stale   -- hash present and different: PROVEN out of date
+  //   unknown -- no hash (row predates the column): not proven either way, and
+  //              deliberately NOT counted as fresh
   const withEmbedding = (db.prepare('SELECT COUNT(*) as c FROM memories WHERE embedding IS NOT NULL').get() as {c:number}).c
+  const vecRows = db.prepare(
+    'SELECT content, keywords, embedding_source_sha256 FROM memories WHERE embedding IS NOT NULL'
+  ).all() as { content: string; keywords: string | null; embedding_source_sha256: string | null }[]
+  let embeddingFresh = 0, embeddingStale = 0, embeddingUnknown = 0
+  for (const r of vecRows) {
+    if (r.embedding_source_sha256 === null) embeddingUnknown++
+    else if (r.embedding_source_sha256 === embeddingSourceHash(r.content, r.keywords)) embeddingFresh++
+    else embeddingStale++
+  }
   const agentRows = db.prepare('SELECT agent_id, COUNT(*) as c FROM memories GROUP BY agent_id').all() as {agent_id:string, c:number}[]
   const tierRows = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all() as {category:string, c:number}[]
   const byAgent: Record<string, number> = {}
   const byTier: Record<string, number> = {}
   for (const r of agentRows) byAgent[r.agent_id] = r.c
   for (const r of tierRows) byTier[r.category] = r.c
-  return { total, byAgent, byTier, withEmbedding }
+  return { total, byAgent, byTier, withEmbedding, embeddingFresh, embeddingStale, embeddingUnknown }
 }
 
 export function updateMemory(id: number, content: string, category?: string, agentId?: string, keywords?: string): boolean {
@@ -1488,6 +1530,23 @@ export function updateMemory(id: number, content: string, category?: string, age
   params.push(id)
   const changed = db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`).run(...params).changes > 0
   if (changed) {
+    // The row's TEXT just changed, so its vector now belongs to the previous wording.
+    // Leaving it would keep the memory searchable under the text we just corrected --
+    // measured on 2026-09-05: eleven rows, two of which had carried a claim that turned
+    // out to be false. Drop it FIRST (an absent vector is honest; a wrong one is not),
+    // then regenerate. If regeneration fails the row simply stays NULL and the next
+    // backfill picks it up -- FTS keeps working throughout.
+    db.prepare('UPDATE memories SET embedding = NULL, embedding_source_sha256 = NULL WHERE id = ?').run(id)
+    const kw = keywords !== undefined ? keywords : (db.prepare('SELECT keywords FROM memories WHERE id = ?')
+      .get(id) as { keywords: string | null } | undefined)?.keywords ?? null
+    const srcHash = embeddingSourceHash(content, kw)
+    generateEmbedding(embeddingSourceText(content, kw)).then(emb => {
+      if (emb) {
+        db.prepare('UPDATE memories SET embedding = ?, embedding_source_sha256 = ? WHERE id = ?')
+          .run(JSON.stringify(emb), srcHash, id)
+      }
+    }).catch(() => {})
+
     if (before?.category === 'shared' || category === 'shared') {
       // A shared row is listed for every agent, so evicting one owner is not
       // enough. Same blunt call the DELETE route makes, for the same reason.
@@ -2860,6 +2919,24 @@ export function clearPendingTaskRetryOwnerAlert(taskName: string, agentName: str
 
 const EMBED_MODEL = 'nomic-embed-text'
 
+/**
+ * The ONE definition of what text a memory's embedding is built from, and the hash of it.
+ *
+ * Before this existed the three call sites disagreed: saveMemory embedded `content`
+ * alone, while saveAgentMemory and backfillEmbeddings embedded `content + " " + keywords`.
+ * The same row could therefore end up with a vector built from a different basis
+ * depending on which path last touched it -- and no measurement would show it, because
+ * every one of those vectors is equally "not null". A freshness check needs a single
+ * canonical basis, so this is it; the keywords-inclusive form was already the majority.
+ */
+export function embeddingSourceText(content: string, keywords?: string | null): string {
+  return content + (keywords ? ' ' + keywords : '')
+}
+
+export function embeddingSourceHash(content: string, keywords?: string | null): string {
+  return createHash('sha256').update(embeddingSourceText(content, keywords), 'utf8').digest('hex')
+}
+
 export async function generateEmbedding(text: string): Promise<number[] | null> {
   try {
     const resp = await fetch(`${OLLAMA_URL}/api/embeddings`, {
@@ -2935,14 +3012,55 @@ export async function hybridSearch(agentId: string, query: string, limit: number
   return ranked.slice(0, limit).map(([id]) => byId.get(id)!)
 }
 
+/**
+ * Drop the stored vector for specific rows so the next backfill rebuilds it.
+ *
+ * Needed because rows edited BEFORE embedding_source_sha256 existed carry no hash, so
+ * they are UNKNOWN rather than provably stale, and backfillEmbeddings deliberately does
+ * not touch them -- re-embedding an entire store on a hunch is not a decision this code
+ * should make silently. For the rows we KNOW were edited in place, the operator passes
+ * the ids here and then runs the backfill.
+ *
+ * Deliberately not called from anywhere automatically: which historical rows were edited
+ * is knowledge the AGENTS have (each one knows what it corrected), not something the
+ * schema can recover -- there is no updated_at column.
+ *
+ * Returns the number of rows actually cleared.
+ */
+export function invalidateEmbeddings(ids: number[]): number {
+  if (ids.length === 0) return 0
+  const stmt = db.prepare('UPDATE memories SET embedding = NULL, embedding_source_sha256 = NULL WHERE id = ?')
+  let cleared = 0
+  const tx = db.transaction((rows: number[]) => {
+    for (const id of rows) cleared += stmt.run(id).changes
+  })
+  tx(ids)
+  return cleared
+}
+
 export async function backfillEmbeddings(): Promise<number> {
-  const rows = db.prepare('SELECT id, content, keywords FROM memories WHERE embedding IS NULL').all() as { id: number; content: string; keywords: string | null }[]
+  // Two kinds of row need work, and the second one used to be invisible here:
+  //   embedding IS NULL                   -- never vectorised
+  //   embedding_source_sha256 mismatch    -- vectorised, but from OTHER text
+  // The old condition was NULL-only, so a stale vector was never repaired: it is not
+  // missing, it is wrong, and "not missing" was the only thing the query could see.
+  // Rows with a NULL hash are left alone -- they predate the column, so their freshness
+  // is UNKNOWN, and re-embedding the whole store on first boot is not this function's
+  // call to make (see getMemoryStats, which reports them as their own bucket).
+  const candidates = db.prepare(
+    'SELECT id, content, keywords, embedding, embedding_source_sha256 FROM memories'
+  ).all() as { id: number; content: string; keywords: string | null; embedding: string | null; embedding_source_sha256: string | null }[]
+  const rows = candidates.filter(r =>
+    r.embedding === null ||
+    (r.embedding_source_sha256 !== null && r.embedding_source_sha256 !== embeddingSourceHash(r.content, r.keywords))
+  )
   let count = 0
   for (const row of rows) {
-    const text = row.content + (row.keywords ? ' ' + row.keywords : '')
+    const text = embeddingSourceText(row.content, row.keywords)
     const emb = await generateEmbedding(text)
     if (emb) {
-      db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(JSON.stringify(emb), row.id)
+      db.prepare('UPDATE memories SET embedding = ?, embedding_source_sha256 = ? WHERE id = ?')
+        .run(JSON.stringify(emb), embeddingSourceHash(row.content, row.keywords), row.id)
       count++
     }
     // Small delay to not overwhelm Ollama
