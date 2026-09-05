@@ -147,17 +147,32 @@ describe('a helyben-javitas nyomot hagy a napi naploban (mechanizmus, nem szabal
 describe('az ervenytelenites ATOMI: egy UPDATE irja a szoveget es uriti a vektort', () => {
   const dbts = readFileSync(join(__dirname, '..', 'db.ts'), 'utf-8')
 
+  // A keresest ELOSZOR az updateMemory torzsere szukitjuk, es CSAK azutan illesztunk.
+  // Enelkul a `match()` (a /g hianyaban) a FAJL elso `const sets` sorat adna vissza -- ma az
+  // eppen az updateMemory-e, de a db.ts-ben harom ilyen sor van (updateMemory, updateIdea,
+  // updateVaultSshServer). Egy uj fuggveny az 1529. sor fole csendben athelyezne a merest, es
+  // a teszt ZOLD MARADNA, mikozben az updateMemory mar visszaesett. Egy zold teszt, ami mar
+  // mast mer, rosszabb a hianyzo tesztnel. (Talalta: fejlesztes-vezeto, msg 665.)
+  const fnStart = dbts.indexOf('export function updateMemory')
+  const rest = dbts.slice(fnStart)
+  const updateMemoryBody = rest.slice(0, rest.indexOf('\nexport '))
+
+  it('KONTROLL: a kimetszett torzs tenyleg az updateMemory-e, es csak az', () => {
+    expect(fnStart).toBeGreaterThan(-1)
+    expect(updateMemoryBody).toContain('export function updateMemory')
+    // A hatar mukodik: a kovetkezo exportalt fuggvenyek NEM szivarognak bele.
+    expect(updateMemoryBody).not.toContain('export function updateIdea')
+    expect(updateMemoryBody).not.toContain('export function updateVaultSshServer')
+  })
+
   it('a vektor-oszlopok a sets tombben vannak, nem kulon utasitasban', () => {
-    const m = dbts.match(/const sets: string\[\] = \[([^\]]*)\]/)
+    const m = updateMemoryBody.match(/const sets: string\[\] = \[([^\]]*)\]/)
     expect(m).not.toBeNull()
     expect(m![1]).toContain("embedding = NULL")
     expect(m![1]).toContain("embedding_source_sha256 = NULL")
   })
 
   it('KONTROLL: az updateMemory NEM tartalmaz kulon ervenytelenito UPDATE-et', () => {
-    const fn = dbts.slice(dbts.indexOf('export function updateMemory'))
-    const body = fn.slice(0, fn.indexOf('\nexport '))
-    // A kulon utasitas alakja: UPDATE ... SET embedding = NULL ... WHERE id
-    expect(body).not.toMatch(/UPDATE memories SET embedding = NULL[^\n]*WHERE id/)
+    expect(updateMemoryBody).not.toMatch(/UPDATE memories SET embedding = NULL[^\n]*WHERE id/)
   })
 })
