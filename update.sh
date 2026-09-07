@@ -270,6 +270,7 @@ fi
 # emit a warning so the operator does not lose work silently -- the
 # stash entry is also kept in `git stash list` for manual recovery.
 STASHED_AUTO=0
+GATE_TREE_BROKEN=0
 # HEARTBEAT.md is rewritten by the agent every heartbeat tick (self-modifying).
 # Exclude it from the dirty check; the preflight ignores it too. It will be
 # auto-overwritten on the next heartbeat anyway, so no data loss.
@@ -298,6 +299,78 @@ if [ -n "$DIRTY" ]; then
   fi
 fi
 
+
+# --- Gate: after a stash pop the tree must be conflict-free AND compilable. ---
+# Why this exists (2026-09-07, kanban db35188b, incident 2a91f715): at 10:04:23
+# an auto-stash pop left four files carrying conflict markers, and the update
+# finished "successfully". The tree stayed broken for six hours. Nothing burned
+# only because dist/ had been built 0.7s BEFORE the markers landed -- the box was
+# running a build that could no longer be reproduced from its own source, while
+# scripts/backup.sh sat one syntax error away from killing the next nightly
+# backup with nothing but a systemd exit code to show for it.
+#
+# Both facts WERE printed. As WARNINGs. On the stdout of a detached run.
+# That is the lesson encoded here: the information already existed and the
+# effect was still mute. So this gate does not print more -- it MEASURES, it
+# STOPS, and it makes the failure of its own alert visible. A notifier swallowed
+# by `|| true` would rebuild exactly the class of bug the gate exists to prevent.
+
+# Send one alert and REPORT WHETHER THE ALERT ITSELF GOT THROUGH.
+# Deliberately no `|| true`: a silent notifier is the failure mode here, not a
+# tidiness detail.
+_gate_alert() { # $1 = message
+  local n out rc
+  n="$INSTALL_DIR/scripts/notify.sh"
+  if [ ! -f "$n" ]; then
+    echo -e "${RED}A RIASZTAS NEM MENT KI:${NC} nincs $n -- a fenti hibarol NEM ertesult senki." >&2
+    return 1
+  fi
+  out="$(bash "$n" "$1" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo -e "${RED}A RIASZTAS NEM MENT KI (notify.sh rc=${rc}):${NC} ${out}" >&2
+    echo    "                        A fenti hibarol NEM ertesult senki -- kezi jelzes kell." >&2
+    return 1
+  fi
+  return 0
+}
+
+# 0 = a fa ep, 1 = nem. Magatol SOSEM lep ki: a hivo dont, mert a korai kilepesi
+# agakon mar uton van egy sajat kilepokod, es azt felulirni elrejtene, hogy
+# MIERT allt meg a frissites.
+assert_tree_sane_after_pop() { # $1 = kontextus-cimke
+  local ctx unmerged tsc_out tsc_rc msg
+  ctx="${1:-stash-pop}"
+  unmerged="$(cd "$INSTALL_DIR" && git diff --diff-filter=U --name-only 2>/dev/null)"
+  tsc_out="$(cd "$INSTALL_DIR" && npx tsc --noEmit 2>&1)"; tsc_rc=$?
+
+  if [ -z "$unmerged" ] && [ "$tsc_rc" -eq 0 ]; then
+    return 0
+  fi
+
+  # A `npm run build` sikere NEM helyettesiti ezt: az emit-el es tobbnyire akkor
+  # is atmegy, ha a forras nem forditodik tisztan. A kapu a FORDITHATOSAGOT meri.
+  msg="🔴 Marveen update: a stash-visszaallitas (${ctx}) UTAN a fa NEM ep."
+  if [ -n "$unmerged" ]; then
+    echo -e "${RED}HIBA:${NC} feloldatlan fajlok a stash-visszaallitas utan (${ctx}):" >&2
+    echo "$unmerged" | sed 's/^/         /' >&2
+    msg="${msg} Feloldatlan: $(echo "$unmerged" | tr '\n' ' ')."
+  fi
+  if [ "$tsc_rc" -ne 0 ]; then
+    echo -e "${RED}HIBA:${NC} \`npx tsc --noEmit\` rc=${tsc_rc} a stash-visszaallitas utan (${ctx})." >&2
+    echo "$tsc_out" | tail -20 | sed 's/^/         /' >&2
+    msg="${msg} tsc rc=${tsc_rc}."
+  fi
+  msg="${msg} A helyi valtozasok a stash-ben maradnak: \`git stash list\` (a legfelso a frissites auto-stashe). Kezi feloldas kell; a dist/ ettol meg a REGI forrasbol valo."
+  echo    "         A stash NEM lett eldobva -- git stash list / git stash apply / git stash drop" >&2
+
+  # A riasztas sajat bukasa is lelet: ha ez is elszall, a kilepokod marad az
+  # egyetlen jelzes, es azt ki kell mondani, nem elnyelni.
+  if ! _gate_alert "$msg"; then
+    echo -e "${RED}FIGYELEM:${NC} a fenti hiba jelzese CSAK a kilepokodban all -- csatornara nem jutott el." >&2
+  fi
+  return 1
+}
+
 # Restore an auto-stash before an EARLY exit (AHEAD-check / pull-failure /
 # build-failure below) -- any exit between the stash push above and the
 # normal restore point further down would otherwise strand the operator's
@@ -309,6 +382,12 @@ restore_stash_before_exit() {
     echo -e "  Auto-stash visszaallitasa (korai kilepes elott)..."
     if git stash pop; then
       STASHED_AUTO=0
+      # A kilepokodot NEM irjuk felul: ezen az agon mar uton van egy sajat kod,
+      # es az mondja meg, MIERT allt meg a frissites. A kapu dolga itt a MERES
+      # es a RIASZTAS -- hogy a hibas fa ne csak a naplo aljan alljon.
+      if ! assert_tree_sane_after_pop "korai kilepes elotti visszaallitas"; then
+        GATE_TREE_BROKEN=1
+      fi
     else
       if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
         echo -e "${RED}WARNING:${NC} Auto-stash pop had conflicts; the stash remains in 'git stash list'."
@@ -1009,6 +1088,15 @@ if [ "$STASHED_AUTO" = "1" ]; then
   echo -e "  Auto-stash visszaallitasa..."
   if git stash pop; then
     STASHED_AUTO=0
+    # ITT megallunk, MEG az ujraforditas es a szolgaltatas-ujrainditas ELOTT.
+    # Egy tores fa ujraforditasa ertelmetlen, az ujrainditasa pedig azt a
+    # helyzetet allitja elo, ami 2026-09-07-en hat oran at allt: futo rendszer
+    # egy olyan dist/-bol, amit a sajat forrasabol mar nem lehet eloallitani.
+    # A szolgaltatasokhoz meg nem nyultunk, tehat a megallas a BIZTONSAGOS irany:
+    # a regi, mukodo peldany fut tovabb, es a riasztas szol valakinek.
+    if ! assert_tree_sane_after_pop "frissites utani visszaallitas"; then
+      exit 9
+    fi
     if [ "${SKIP_BUILD:-0}" != "1" ]; then
       echo -e "  Ujraforditas a visszaallitott helyi valtozasokkal..."
       if ! retry 2 3 npm run build --silent; then
