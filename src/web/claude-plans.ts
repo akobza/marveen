@@ -22,7 +22,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { PROJECT_ROOT } from '../config.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
+import { getEffectiveSettingValue } from '../settings-store.js'
 import {
   expandAndValidateConfigDir,
   readAgentClaudeConfigDir,
@@ -168,6 +169,22 @@ export function resolveAgentConfigDir(
   return { configDir: readAgentClaudeConfigDir(name), planUnresolved: false }
 }
 
+// Config-dir candidates for the MAIN agent, most specific first. Same
+// filesystem-probe philosophy as the sub-agent branch: the caller checks
+// whether `projects` exists under each, and the first hit wins. An explicit
+// MAIN_AGENT_CONFIG_DIR is a deliberate operator choice and outranks the
+// MAIN_AGENT_ISOLATED_CONFIG dir; if neither is provisioned the caller gets
+// null and falls back to the shared ~/.claude, which is the correct answer on
+// a non-isolated install.
+function mainAgentConfigDirCandidates(root: string): string[] {
+  const out: string[] = []
+  let explicit = ''
+  try { explicit = String(getEffectiveSettingValue('MAIN_AGENT_CONFIG_DIR') ?? '').trim() } catch { explicit = '' }
+  if (explicit) out.push(explicit.startsWith('~') ? join(homedir(), explicit.slice(1)) : explicit)
+  out.push(join(root, '.channels-config'))
+  return out
+}
+
 // The config root a READER must look in to find an agent's transcripts.
 //
 // resolveAgentConfigDir() answers what the operator CONFIGURED. That is the
@@ -200,6 +217,29 @@ export function resolveAgentConfigDir(
 // probing the filesystem, so the probe root has to be redirectable to a
 // fixture. Production callers pass nothing.
 export function resolveAgentConfigDirForRead(name: string, projectRootOverride?: string): string | null {
+  // The MAIN agent has no agents/<name>/ tree, so the sub-agent probe below can
+  // never find its transcripts. Every caller used to hardcode `undefined` for
+  // it, which resolves to the shared ~/.claude -- and under
+  // MAIN_AGENT_ISOLATED_CONFIG that directory still holds an OLD transcript
+  // from before isolation was switched on. Not nothing: a stale-but-present
+  // reading, which is the exact failure this whole function was written to
+  // stop, just one agent short of covering it.
+  //
+  // Measured on this install 2026-09-04 16:35, main agent, both roots read
+  // through readContextTokensFromProjectDir:
+  //   shared ~/.claude      -> 50477 tokens, mtime 14:30 (2h frozen)
+  //   <root>/.channels-config -> 192843 tokens, mtime 16:35 (live)
+  // Consequences seen at the same time: schedule-runner's watchdog never got
+  // its `sawTurn` evidence, so it recorded every completed fast task as 'lost'
+  // and re-queued it (217 lost / 459 runs in 2.5h, a task cronned */2 arriving
+  // every ~30s), and the context guard sat on a frozen 50k while the session
+  // was really near 193k -- so it would never have fired its handoff.
+  if (name === MAIN_AGENT_ID) {
+    for (const dir of mainAgentConfigDirCandidates(projectRootOverride ?? PROJECT_ROOT)) {
+      if (existsSync(join(dir, 'projects'))) return dir
+    }
+    return null
+  }
   const configured = resolveAgentConfigDir(name).configDir
   if (configured) return configured
   const isolated = join(projectRootOverride ?? PROJECT_ROOT, 'agents', name, '.claude-config')
