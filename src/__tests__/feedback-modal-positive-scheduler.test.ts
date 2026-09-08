@@ -86,6 +86,12 @@ vi.mock('../web/agent-process.js', () => ({
   // post-send resubmit loop) returns null so the loop sees nothing parked
   // and stops, same as the sibling fixtures.
   capturePane: (..._a: unknown[]) => (capturePaneCalls++ === 0 ? 'plain pane\n❯ ' : null),
+  // Added 2026-09-07 (card 1d984c7e): the runner now reads the target session's
+  // creation time at injection and again in the sweep. A vi.mock factory REPLACES
+  // the module, so an export missing from this list is `undefined` at the call site
+  // and the tick throws -- which is how this test failed, not on its own subject.
+  // null = "cannot tell", the branch that deliberately does not fire.
+  sessionCreatedAtMs: vi.fn(() => null),
   sendEnterToSession: vi.fn(),
   clearStaleParkedInput: vi.fn(() => false),
   resolveAgentProvider: () => 'telegram',

@@ -49,6 +49,7 @@ import {
   startAgentProcess,
   sessionExistsOnHost,
   capturePane,
+  sessionCreatedAtMs,
   sendEnterToSession,
   clearStaleParkedInput,
   resolveAgentProvider,
@@ -117,6 +118,16 @@ export interface TaskInflightEntry {
   session: string
   host: string | null
   injectedAt: number
+  // When the target session was created, as read AT INJECTION TIME. The sweep
+  // re-reads it and treats a NEWER value as "this is not the session we typed
+  // into any more" -- see decideTaskTimeout's sessionRestarted input.
+  //
+  // Recorded rather than compared against injectedAt (the simpler form) on
+  // purpose: both readings then come from the SAME clock (the tmux host's), so
+  // a remote agent whose laptop clock is skewed against ours cannot make a
+  // healthy session look rebuilt -- which would re-deliver a prompt that is
+  // still running. Null when unreadable; the check then simply does not fire.
+  sessionCreatedAtMs: number | null
   // Stage 1: inter-agent notice sent to the main agent (was, until this
   // change, a direct channel alert).
   alerted: boolean
@@ -224,14 +235,49 @@ export type TaskTimeoutDecision = 'clear' | 'alert' | 'escalate' | 'hold' | 'los
 // evicted ('clear') before escalate is ever reached. Accepted -- a task
 // legitimately configured to run for hours AND stuck long enough to hit
 // that ceiling is an extreme edge case outside this change's scope.
+// The CALL SITE, extracted so it can be MEASURED rather than only source-matched.
+//
+// Why this tiny wrapper exists (ugyvezeto, 2026-09-07): the resolver has its own test
+// file with five green cases -- and all five stayed green while THIS call site passed a
+// hardcoded `undefined` for the main agent and never reached the resolver at all. A test
+// on the resolver cannot see a caller that does not call it. So the caller now has a
+// name, and a test can stand on it.
+//
+// It must stay a plain pass-through: NO special case for the main agent. The resolver
+// owns that branch (claude-plans.ts). Re-introducing one here is the exact bug that
+// recorded 217 of 459 main-agent runs as 'lost' -- measured 2026-09-04.
+export function inflightConfigDirFor(agentName: string, root?: string): string | undefined {
+  return resolveAgentConfigDirForRead(agentName, root) ?? undefined
+}
+
 export function decideTaskTimeout(
   entry: Pick<TaskInflightEntry, 'injectedAt' | 'alerted' | 'ownerAlerted' | 'sawTurn'>,
   paneState: PaneState | null,
   now: number,
   opts: { graceMs: number; timeoutMs: number; maxTrackMs: number; ownerExtraMs: number },
+  sessionRestarted = false,
 ): TaskTimeoutDecision {
   const elapsed = now - entry.injectedAt
   if (elapsed >= opts.maxTrackMs) return 'clear'
+  // THE SESSION WE TYPED INTO IS GONE (2026-09-07). A tmux session rebuilt
+  // under the same name is a different process, and its pane state says nothing
+  // about our prompt -- but every reader here is keyed by NAME, so it kept
+  // answering. Measured: kanban-audit had already sent its own notice at
+  // 12:06:08Z; the channels service died at 12:06:11Z; the session came back at
+  // 12:06:22Z; the sweep read the NEW session's 'busy' as "our prompt is still
+  // running" and was one step from escalating to the owner about a task that
+  // had finished.
+  //
+  // No grace window here, deliberately: the grace window exists to let a slow
+  // turn start, and there is no turn to wait for once the receiving process has
+  // died. 'lost' (not 'clear') because the delivery genuinely did not happen --
+  // that branch already undoes the success bookkeeping and re-queues, so a
+  // false 'busy' becomes a real REDELIVERY instead of a false alert.
+  //
+  // Ordered AFTER the maxTrackMs check on purpose: past the tracking ceiling we
+  // have given up on the entry anyway, and re-delivering a six-hour-old prompt
+  // helps nobody.
+  if (sessionRestarted) return 'lost'
   if (paneState === 'idle') {
     if (entry.sawTurn) return 'clear'
     // Idle, and nothing ever showed the prompt being picked up. Inside the
@@ -911,23 +957,37 @@ async function attemptFireTask(
       session,
       host,
       injectedAt: now,
+      sessionCreatedAtMs: sessionCreatedAtMs(session, host),
       alerted: false,
       ownerAlerted: false,
       sawTurn: false,
       workingDir: agentName === MAIN_AGENT_ID ? PROJECT_ROOT : agentDir(agentName),
-      // resolveAgentConfigDirForRead, not readAgentClaudeConfigDir -- same
-      // reason the context-guard and restart-gate runners use it. Since the
-      // fleet auth rule (2026-07-01) an agent's config dir is AUTO-PROVISIONED
-      // at <agentDir>/.claude-config and there is no `claudeConfigDir` field to
-      // read, so readAgentClaudeConfigDir returns null. That null made the
-      // sawTurn transcript probe look under ~/.claude/projects/<encoded>, a
-      // path that does not exist for such an agent -- so the probe returned
-      // null on every sweep, sawTurn stayed false, and any task that finished
-      // between two sweeps (i.e. any FAST task) was declared 'lost' and
-      // re-fired. Measured 2026-09-04 on cortex-voip-insight: 2069 false-lost
-      // re-injections in 24h from a */5 task (288 expected), a 7.5x
-      // amplification running unnoticed since 2026-08-27.
-      configDir: agentName === MAIN_AGENT_ID ? undefined : (resolveAgentConfigDirForRead(agentName) ?? undefined),
+      // resolveAgentConfigDirForRead, not readAgentClaudeConfigDir -- and with NO
+      // special case for the main agent. Two separately measured bugs sit behind
+      // this one line, one per agent kind, and the resolver already covers both:
+      //
+      // SUB-AGENTS: since the fleet auth rule (2026-07-01) an agent's config dir
+      // is AUTO-PROVISIONED at <agentDir>/.claude-config and there is no
+      // `claudeConfigDir` field to read, so readAgentClaudeConfigDir returns null.
+      // That null made the sawTurn transcript probe look under
+      // ~/.claude/projects/<encoded>, a path that does not exist for such an
+      // agent -- so the probe returned null on every sweep, sawTurn stayed false,
+      // and any task that finished between two sweeps (i.e. any FAST task) was
+      // declared 'lost' and re-fired. Measured 2026-09-04 on cortex-voip-insight:
+      // 2069 false-lost re-injections in 24h from a */5 task (288 expected), a
+      // 7.5x amplification running unnoticed since 2026-08-27.
+      //
+      // MAIN AGENT: passing `undefined` here (the earlier form) pointed the same
+      // probe at the shared ~/.claude, which under MAIN_AGENT_ISOLATED_CONFIG
+      // still holds a pre-isolation transcript whose mtime never advances. So
+      // `mtime > injectedAt` was never true, sawTurn never got set, and every
+      // fast main-agent task was recorded 'lost' and re-queued -- forever.
+      // Measured 2026-09-04: 217 lost / 459 runs.
+      //
+      // resolveAgentConfigDirForRead (claude-plans.ts) has its own MAIN_AGENT_ID
+      // branch for exactly this, so special-casing the main agent HERE would skip
+      // that branch and reintroduce the second bug. One call, both kinds.
+      configDir: inflightConfigDirFor(agentName),
       timeoutMs: resolveStuckTimeoutMs(task),
     })
 
@@ -1473,12 +1533,20 @@ export function startScheduleRunner(): NodeJS.Timeout {
           if (mtime != null && mtime > entry.injectedAt) entry.sawTurn = true
         }
       }
+      // Is the pane we just sampled even the same session we typed into? Both
+      // values come from the tmux host's own clock, so this comparison is immune
+      // to skew between us and a remote agent's machine. Unreadable on either
+      // side (null) means "cannot tell" -- and cannot-tell must not manufacture
+      // a 'lost', so the check simply does not fire.
+      const createdNow = sessionCreatedAtMs(entry.session, entry.host)
+      const sessionRestarted =
+        entry.sessionCreatedAtMs != null && createdNow != null && createdNow > entry.sessionCreatedAtMs
       const decision = decideTaskTimeout(entry, state, now, {
         graceMs: TASK_FIRE_GRACE_MS,
         timeoutMs: entry.timeoutMs,
         maxTrackMs: TASK_FIRE_MAX_TRACK_MS,
         ownerExtraMs: OWNER_ESCALATION_EXTRA_MS,
-      })
+      }, sessionRestarted)
       if (decision === 'clear') {
         taskInflightMap.delete(key)
       } else if (decision === 'alert') {

@@ -200,7 +200,11 @@ function configDirFor(name: string): string | undefined {
   // resolveAgentConfigDirForRead, not readAgentClaudeConfigDir: an agent whose
   // config dir was auto-provisioned by the launcher has no field to read, and
   // reading the host default silently returns another agent's absence.
-  return name === MAIN_AGENT_ID ? undefined : (resolveAgentConfigDirForRead(name) ?? undefined)
+  // Includes the MAIN agent: resolveAgentConfigDirForRead now resolves its
+  // isolated dir too. Hardcoding `undefined` here used to send this read to the
+  // shared ~/.claude, where a pre-isolation transcript keeps answering with a
+  // frozen token count -- so the guard believed it could see and never fired.
+  return resolveAgentConfigDirForRead(name) ?? undefined
 }
 
 /** Raw observed context size (tokens) for the idle-flush tier's absolute threshold. */

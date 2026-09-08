@@ -85,6 +85,12 @@ vi.mock('../web/agent-process.js', () => ({
   // null capture => no first-run gate is detected, and the post-send resubmit
   // loop sees nothing parked and stops.
   capturePane: () => null,
+  // Added 2026-09-07 (card 1d984c7e): the runner now reads the target session's
+  // creation time at injection and again in the sweep. A vi.mock factory REPLACES
+  // the module, so an export missing from this list is `undefined` at the call site
+  // and the tick throws -- which is how this test failed, not on its own subject.
+  // null = "cannot tell", the branch that deliberately does not fire.
+  sessionCreatedAtMs: vi.fn(() => null),
   sendEnterToSession: vi.fn(),
   clearStaleParkedInput: (...a: unknown[]) => mockClearParked(...(a as [])),
   // Only heartbeat tasks fire here, so the bound-channel path is not reached;

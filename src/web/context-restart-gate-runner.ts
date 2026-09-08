@@ -178,7 +178,11 @@ function configDirFor(name: string): string | undefined {
   // reading the host default returns a stale transcript instead of nothing --
   // which is worse than the null this comment warns about, because the gate
   // then believes it can see.
-  return name === MAIN_AGENT_ID ? undefined : (resolveAgentConfigDirForRead(name) ?? undefined)
+  // Includes the MAIN agent now -- see resolveAgentConfigDirForRead. The
+  // comment above warns that a stale transcript is worse than null because the
+  // gate then believes it can see; hardcoding `undefined` for the main agent
+  // was producing exactly that on an isolated-config install.
+  return resolveAgentConfigDirForRead(name) ?? undefined
 }
 
 function agentIdForLedger(name: string): string {
