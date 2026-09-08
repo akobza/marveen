@@ -2485,6 +2485,35 @@ export function capturePane(session: string, host: string | null = null): string
   }
 }
 
+// When the tmux session that received a prompt was CREATED. Epoch ms, or null
+// if it cannot be read (no session, unreachable host, tmux error).
+//
+// Why this exists: a tmux session name is not an identity. When a session dies
+// and is rebuilt under the SAME name, every name-keyed reader keeps sampling --
+// and now samples a DIFFERENT process. Measured 2026-09-07: the channels
+// service crashed at 12:06:11Z, the session was rebuilt at 12:06:22Z under the
+// same name, and the schedule watchdog read the new session's (legitimately)
+// busy pane as "our injected prompt is still running". The prompt was gone.
+//
+// `#{session_created}` is read instead of parsing `tmux ls`'s human date: the
+// format variable is already epoch seconds, so there is no locale- or
+// timezone-dependent parsing step to get wrong.
+export function sessionCreatedAtMs(session: string, host: string | null = null): number | null {
+  try {
+    const out = captureTmux(host, ['display-message', '-p', '-t', session, '#{session_created}']).trim()
+    // The `> 0` is load-bearing, and NOT for the reason it looks like. Measured
+    // 2026-09-07 on tmux 3.6: for a session that does not exist this command
+    // exits 0 with EMPTY stdout -- it does not throw, so the catch below never
+    // runs. `Number('')` is 0, so without this guard a missing session would
+    // report "created at epoch 0" instead of "unknown", and every caller
+    // comparing timestamps would silently get an answer where there is none.
+    const secs = Number(out)
+    return Number.isFinite(secs) && secs > 0 ? secs * 1000 : null
+  } catch {
+    return null
+  }
+}
+
 // Capture a pane for STUCK-INPUT detection, with the editor's dim "ghost
 // suggestion" autocomplete removed. Captures WITH colour (`-e`) and strips the
 // SGR-2 (dim) ghost + all ANSI, so a hint shown in an empty input box is never
