@@ -146,7 +146,16 @@ if [ -z "$DASHBOARD_PID" ]; then
   cd "$INSTALL_DIR" && nohup npm start >> "$INSTALL_DIR/logs/dashboard.log" 2>&1 &
   sleep 5
   NEW_PID=$(ps -ef | grep "node dist/index.js" | grep -v grep | awk '{print $2}' | head -1)
-  echo "$(timestamp) [watchdog] Dashboard restarted (PID: ${NEW_PID:-?})" >> "$LOG"
+  # Card c2f4e634: the log line follows the OUTCOME, not the attempt. This used
+  # to be written unconditionally, so a restart that brought nothing up still
+  # logged "Dashboard restarted (PID: ?)" -- and the "?" is exactly the case
+  # where the claim is false. A log that claims an action it did not achieve is
+  # worse than a silent one: the next reader stops looking.
+  if [ -n "$NEW_PID" ]; then
+    echo "$(timestamp) [watchdog] Dashboard restarted (PID: $NEW_PID)" >> "$LOG"
+  else
+    echo "$(timestamp) [watchdog] Dashboard restart FAILED: no 'node dist/index.js' process after the attempt -- see logs/dashboard.log" >> "$LOG"
+  fi
 fi
 
 # ── Main agent session ─────────────────────────────────────────────────────
