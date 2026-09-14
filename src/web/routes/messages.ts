@@ -1,4 +1,4 @@
-import {
+import { AGENT_MESSAGE_LIMIT_CAP,
   createAgentMessage, getPendingMessages, listAgentMessages,
   getAgentConversation, getAgentConversationThreads,
   getKanbanSeqByIdPrefix,
@@ -278,7 +278,26 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     }
     const agent = url.searchParams.get('agent') || ''
     const status = url.searchParams.get('status') || ''
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200)
+    // A limit ABOVE the cap used to be clamped in silence: the caller asked for
+    // 2000, got 200, and nothing in the response said so (MSGLISTCUT907). The
+    // route already fails loudly for an unknown parameter because answering
+    // with MORE than was asked is expensive; answering with LESS and staying
+    // quiet is the same bug pointing the other way, and it reads as "there is
+    // no more history" -- always the reassuring direction. Same for a limit
+    // that is not a number at all, which used to reach SQLite as NaN and come
+    // back as an empty list.
+    const limitRaw = url.searchParams.get('limit')
+    const limitNum = limitRaw === null ? 50 : parseInt(limitRaw, 10)
+    if (!Number.isFinite(limitNum) || limitNum < 1 || limitNum > AGENT_MESSAGE_LIMIT_CAP) {
+      json(res, {
+        error: `invalid limit: must be an integer between 1 and ${AGENT_MESSAGE_LIMIT_CAP}`,
+        max: AGENT_MESSAGE_LIMIT_CAP,
+        got: limitRaw,
+        hint: `page with "before=<oldest id you already have>" to read further back; a page shorter than the limit means you reached the end`,
+      }, 400)
+      return true
+    }
+    const limit = limitNum
     const beforeRaw = url.searchParams.get('before')
     const before = beforeRaw !== null ? parseInt(beforeRaw, 10) : undefined
 
@@ -292,7 +311,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       // global-last-N-then-JS-filter which starved rarely-active threads.
       messages = getAgentConversation(agent, limit, Number.isFinite(before as number) ? before : undefined)
     } else {
-      messages = listAgentMessages(limit)
+      messages = listAgentMessages(limit, Number.isFinite(before as number) ? before : undefined)
     }
 
     jsonMaybeGzip(req, res, messages)

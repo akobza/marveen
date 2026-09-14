@@ -2938,8 +2938,21 @@ export function markPendingFederatedFailed(id: number, error: string): boolean {
   return db.prepare("UPDATE agent_messages SET status = 'failed', result = ?, completed_at = ? WHERE id = ? AND status = 'pending'").run(error, now, id).changes > 0
 }
 
-export function listAgentMessages(limit = 50): AgentMessage[] {
-  return db.prepare('SELECT * FROM agent_messages ORDER BY created_at DESC LIMIT ?').all(limit) as AgentMessage[]
+// Global newest-first list, with the same `beforeId` cursor getAgentConversation
+// has (MSGLISTCUT907). Without it the agent-less branch could not reach past the
+// newest page AT ALL -- not slowly, but not at all -- and agents dedupe history
+// here, so every "first mention" drawn from that window could be wrong in the
+// reassuring direction.
+// `id DESC` is a correctness tiebreaker, not cosmetics: a burst of messages
+// shares one created_at, and with ties the row order is unspecified -- a cursor
+// walk over an unstable order silently skips or repeats rows.
+export function listAgentMessages(limit = 50, beforeId?: number): AgentMessage[] {
+  if (beforeId !== undefined && Number.isFinite(beforeId)) {
+    return db.prepare(
+      'SELECT * FROM agent_messages WHERE id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
+    ).all(beforeId, limit) as AgentMessage[]
+  }
+  return db.prepare('SELECT * FROM agent_messages ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as AgentMessage[]
 }
 
 // --- Context-restart gate helpers -------------------------------------------
@@ -3057,7 +3070,7 @@ export function hasOpenInboundQuestion(agentId: string): boolean {
 // getAgentConversation returns when you open it).
 export const CHAT_SYSTEM_AGENTS = ['heartbeat', 'telegram-coordinator', 'channel-coordinator', 'system'] as const
 
-const AGENT_MESSAGE_LIMIT_CAP = 200
+export const AGENT_MESSAGE_LIMIT_CAP = 200
 
 // The actual last-N messages for ONE agent, filtered in SQL (NOT global-last-N
 // then JS-filter -- that starved rarely-active agents' threads, dashboard bug
