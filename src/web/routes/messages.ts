@@ -1,4 +1,4 @@
-import { AGENT_MESSAGE_LIMIT_CAP,
+import { type AgentMessagePriority, getQueuePlacement, AGENT_MESSAGE_LIMIT_CAP,
   createAgentMessage, getPendingMessages, listAgentMessages,
   getAgentConversation, getAgentConversationThreads,
   getKanbanSeqByIdPrefix,
@@ -90,10 +90,27 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content, origin_note } = JSON.parse(body.toString()) as
-      { from: string; to: string; content: string; origin_note?: string }
+    const { from, to, content, origin_note, priority } = JSON.parse(body.toString()) as
+      { from: string; to: string; content: string; origin_note?: string; priority?: string }
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
+      return true
+    }
+    // Card ad771121. An ABSENT priority means 'normal' -- today's behaviour,
+    // unchanged, and stated rather than implied: with a new field it is the
+    // unset value that quietly picks a side. An UNKNOWN value is refused
+    // loudly instead of being coerced to normal, because a caller who writes
+    // priority:"urgent" and gets silent normal delivery is worse off than one
+    // who gets an error: they believe they escalated.
+    const msgPriority: AgentMessagePriority = priority === undefined || priority === null || priority === ''
+      ? 'normal'
+      : (priority as AgentMessagePriority)
+    if (msgPriority !== 'normal' && msgPriority !== 'high') {
+      json(res, {
+        error: `unknown priority "${String(priority)}": allowed values are "normal" (default) and "high"`,
+        allowed: ['normal', 'high'],
+        hint: 'an absent priority field means "normal"',
+      }, 400)
       return true
     }
     // Security: the channel-coordinator id grants channel-inbound delivery
@@ -211,7 +228,24 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // Card 06f062e4: optional attributability tag, self-declared like `from`
     // itself -- capped short so it stays a label, not a second content field.
     const trimmedOriginNote = origin_note?.trim().slice(0, 120) || null
-    const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote)
+    const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote, null, msgPriority)
+    // The sender used to get a warning TEXT about a deep queue and nothing to
+    // act on. These two numbers are what make "do I still need a manual nudge?"
+    // a decision instead of a guess (card ad771121, point 2).
+    //
+    // DECISION on point 3 of the card (automatic tmux nudge for 'high'): NO,
+    // not in this change, and the reason is measured rather than cautious.
+    // The queue in the recorded incident was NOT stuck -- it was draining; the
+    // delay came from long agent turns. An automatic nudge would interrupt a
+    // running turn on every high-priority send, which is a real cost paid on
+    // every message to buy back time only on the rare one that would otherwise
+    // wait. A second, priority-triggered nudge path would also run beside the
+    // existing inbox-nudge-watcher, with its own failure modes.
+    // What the gap actually was: the sender could not tell whether a nudge was
+    // needed. queuePosition/queueDepth answer that, and they also make the
+    // follow-up measurable -- REVISIT this decision if, with priority in place,
+    // high-priority messages are still measured waiting past a set threshold.
+    const placement = getQueuePlacement(msg.id)
     logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, originNote: msg.origin_note }, 'Agent message created')
     // A LOCAL recipient that is not running never receives this: the router
     // retries for a while and then abandons it, and the failure notice goes to
@@ -234,12 +268,14 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       logger.warn({ id: msg.id, to: msg.to_agent }, 'Agent message queued for a STOPPED agent -- likely to be abandoned')
       json(res, {
         ...msg,
+        queuePosition: placement?.position ?? null,
+        queueDepth: placement?.depth ?? null,
         targetRunning: false,
         warning: `'${msg.to_agent}' nem fut -- indítsd el (POST /api/agents/${msg.to_agent}/start), várd meg amíg feláll, és küldd újra. Egy leállított ügynöknek küldött üzenet nem várakozik, hanem elveszik.`,
       })
       return true
     }
-    json(res, msg)
+    json(res, { ...msg, queuePosition: placement?.position ?? null, queueDepth: placement?.depth ?? null })
     return true
   }
 

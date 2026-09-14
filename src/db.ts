@@ -760,6 +760,14 @@ export function initDatabase(dbPathOverride?: string): void {
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN span_id TEXT') } catch { /* exists */ }
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN parent_span_id TEXT') } catch { /* exists */ }
 
+  // Card ad771121: delivery priority. A queued urgent instruction is not an
+  // urgent instruction -- three GO messages once landed behind 10/11/43 pending
+  // rows (oldest 1h50m) and all three had to be overtaken by hand. The column
+  // defaults to 'normal' so EVERY existing row and every caller that does not
+  // know about the field keeps exactly today's FIFO behaviour: a new field's
+  // unset value is the one that silently picks a side, so it is pinned here.
+  try { db.exec("ALTER TABLE agent_messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'") } catch { /* exists */ }
+
   // INVARIANT: a row that says 'delivered' must carry a delivered_at.
   //
   // On 2026-07-27 an operator bulk-closed a 28-row backlog with raw SQL that
@@ -2722,6 +2730,8 @@ export function getDbFileSizeMb(): number | null {
 
 // --- Agent Messages ---
 
+export type AgentMessagePriority = 'normal' | 'high'
+
 export interface AgentMessage {
   id: number
   from_agent: string
@@ -2736,6 +2746,8 @@ export interface AgentMessage {
   // sub-agent's own task/branch name) -- NOT an authentication mechanism,
   // see the table-creation comment. Null for every caller that doesn't pass one.
   origin_note: string | null
+  // Card ad771121: 'high' overtakes 'normal' in the delivery order; absent == 'normal'.
+  priority: AgentMessagePriority
   // Card def5a189: distributed trace context (message-router middleware).
   trace_id: string | null
   span_id: string | null
@@ -2748,15 +2760,17 @@ export function createAgentMessage(
   content: string,
   originNote?: string | null,
   traceCtx?: { trace_id: string; span_id: string; parent_span_id: string | null } | null,
+  priority: AgentMessagePriority = 'normal',
 ): AgentMessage {
   const now = Math.floor(Date.now() / 1000)
   const info = db.prepare(
-    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null)
+    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null, priority)
   return {
     id: Number(info.lastInsertRowid),
     from_agent: from, to_agent: to, content, status: 'pending',
     result: null, created_at: now, delivered_at: null, completed_at: null,
+    priority,
     origin_note: originNote ?? null,
     trace_id: traceCtx?.trace_id ?? null,
     span_id: traceCtx?.span_id ?? null,
@@ -2764,13 +2778,33 @@ export function createAgentMessage(
   }
 }
 
+// Delivery order: 'high' first, then FIFO WITHIN each class (card ad771121).
+// The second key matters as much as the first -- priority must not turn into
+// "everything jumps": two high messages still arrive in the order they were
+// sent, and a normal message's position among normals is unchanged.
+const PENDING_ORDER = "ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, created_at ASC, id ASC"
+
 export function getPendingMessages(toAgent?: string): AgentMessage[] {
   if (toAgent) {
-    return db.prepare("SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ORDER BY created_at ASC")
+    return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ${PENDING_ORDER}`)
       .all(toAgent) as AgentMessage[]
   }
-  return db.prepare("SELECT * FROM agent_messages WHERE status = 'pending' ORDER BY created_at ASC")
+  return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' ${PENDING_ORDER}`)
     .all() as AgentMessage[]
+}
+
+/**
+ * Where a just-queued message actually sits in its recipient's delivery order,
+ * and how deep that queue is. The sender used to get only a warning TEXT about
+ * a deep queue; a number is what lets them decide whether a manual nudge is
+ * still needed (card ad771121, point 2).
+ */
+export function getQueuePlacement(id: number): { position: number; depth: number } | null {
+  const row = db.prepare('SELECT to_agent FROM agent_messages WHERE id = ?').get(id) as { to_agent: string } | undefined
+  if (!row) return null
+  const queue = getPendingMessages(row.to_agent)
+  const idx = queue.findIndex(m => m.id === id)
+  return { position: idx < 0 ? 0 : idx + 1, depth: queue.length }
 }
 
 // Status-guarded (pending only): the federation removal path bulk-fails
