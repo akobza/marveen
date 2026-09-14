@@ -2142,27 +2142,33 @@ export function sweepArchivedKanbanCards(): number {
   return res.changes
 }
 
-export function listKanbanCards(opts: { includeArchived?: boolean } = {}): KanbanCard[] {
-  // last_status_at: when the card LAST CHANGED COLUMN, not when its row was
-  // last touched. These are not the same thing, and the difference is a real
-  // blind spot: addKanbanComment() sets updated_at, so a card that has not
-  // moved in weeks looks fresh the moment anyone comments on it. The main agent
-  // comments more than anyone, so ageing measured on updated_at is mostly
-  // measuring the watcher, not the work. Falls back to created_at for cards
-  // that have never moved (no event rows), which is the honest age for those.
+export function listKanbanCards(
+  opts: { includeArchived?: boolean; agent?: string } = {},
+): KanbanCard[] {
+  // A szures SZERVER-oldalon tortenik, mert a hivo nem tudja ellenorizni, hogy megtortent-e.
+  // A defektus, amit ez javit: az `agent=` parametert a vegpont NEMAN eldobta, tehat egy
+  // ugynok a TELJES tablat kapta vissza sajatjakent (mert eset: 139 idegen lapot "sajatnak"
+  // latott, es egy elo tulajdonosi SOS-rol kezdett kerdezni).
   //
-  // The archived filter is a PARAMETER, not a constant: a caller that asks for
-  // archived cards has to get them, and one that does not ask must not. The two
-  // changes are orthogonal -- the ageing column is computed the same way either
-  // way -- so the merge keeps both rather than choosing. The alias is `c.`
-  // because the ageing sub-select needs to name the outer row.
-  const where = opts.includeArchived ? '' : 'WHERE c.archived_at IS NULL '
+  // last_status_at: when the card LAST CHANGED COLUMN, not when its row was last touched.
+  // addKanbanComment() sets updated_at, so a card that has not moved in weeks looks fresh the
+  // moment anyone comments on it -- ageing measured on updated_at would mostly measure the
+  // watcher, not the work. Falls back to created_at for cards that never moved.
+  //
+  // A ket valtozas ORTOGONALIS (MELYIK sorok vs. MILYEN oszlop), ezert a feloldas mindkettot
+  // megtartja. Az alias `c.`, mert az oregedes-alkerdes meg kell nevezze a kulso sort -- es
+  // ezert a feltetelek is `c.`-vel mennek, kulonben a `rowid`/`archived_at` ketertelmu lenne.
+  const feltetelek: string[] = []
+  const ertekek: unknown[] = []
+  if (!opts.includeArchived) feltetelek.push('c.archived_at IS NULL')
+  if (opts.agent) { feltetelek.push('c.assignee = ?'); ertekek.push(opts.agent) }
+  const where = feltetelek.length ? `WHERE ${feltetelek.join(' AND ')} ` : ''
   return db
     .prepare(`SELECT c.rowid AS seq, c.*,
                      COALESCE((SELECT MAX(e.created_at) FROM kanban_card_events e
                                WHERE e.card_id = c.id), c.created_at) AS last_status_at
               FROM kanban_cards c ${where}ORDER BY c.sort_order ASC`)
-    .all() as KanbanCard[]
+    .all(...ertekek) as KanbanCard[]
 }
 
 export function getKanbanCard(id: string): KanbanCard | undefined {
@@ -2891,14 +2897,16 @@ export function countNewerMessagesFromSameSender(fromAgent: string, toAgent: str
 // never going to pick it up.
 export type AgentBacklog = { agent: string; pending: number; oldestAgeSeconds: number }
 
-export function getPendingBacklogByAgent(): AgentBacklog[] {
+export function getPendingBacklogByAgent(agent?: string): AgentBacklog[] {
+  // Az `agent` szures SZERVER-oldalon: enelkul a hivo a TELJES flotta backlogjat kapta,
+  // es a sajatjanak olvashatta. Ugyanaz a hibaosztaly, mint a /api/kanban `agent=`-je.
   const now = Math.floor(Date.now() / 1000)
   const rows = db.prepare(
     `SELECT to_agent AS agent, COUNT(*) AS pending, MIN(created_at) AS oldest
        FROM agent_messages
-      WHERE status = 'pending'
+      WHERE status = 'pending'${agent ? ' AND to_agent = ?' : ''}
       GROUP BY to_agent`,
-  ).all() as { agent: string; pending: number; oldest: number }[]
+  ).all(...(agent ? [agent] : [])) as { agent: string; pending: number; oldest: number }[]
   return rows
     .map(r => ({ agent: r.agent, pending: r.pending, oldestAgeSeconds: Math.max(0, now - r.oldest) }))
     // oldest-first: whoever has been waiting longest is the one worth looking at
