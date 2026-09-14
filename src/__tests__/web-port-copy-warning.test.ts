@@ -151,12 +151,36 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
     expect(maradek, `besorolatlan iras-hely(ek): ${maradek.join(', ')}`).toEqual([])
   })
 
-  it('a MASOLT rekesz minden tagja behuzza a kozos forrast', () => {
+  it('a MASOLT rekesz minden tagja HASZNALJA a kozos forrast (nem csak importalja)', () => {
+    // ⛔ MERT JAVITAS: elobb a puszta emlitest kerestem, es egy mutacio, ami a
+    // HIVAST vette ki de az importot benne hagyta, ZOLDEN maradt. Az import-sorok
+    // kizarasa teszi a feltetelt HASZNALATTA -- a jelenlet nem a hatas.
     const hianyzik = [...MASOLT].filter((p) => {
-      const t = readFileSync(join(ROOT, p), 'utf-8')
-      return !/WEB_PORT_COPY_WARNING|withWebPortWarning/.test(t)
+      const torzs = readFileSync(join(ROOT, p), 'utf-8')
+        .split('\n')
+        .filter((l) => !/^\s*(import\b|\s*withWebPortWarning,\s*$|\s*WEB_PORT_COPY_WARNING,\s*$)/.test(l))
+        .join('\n')
+      return !/WEB_PORT_COPY_WARNING|withWebPortWarning/.test(torzs)
     })
-    expect(hianyzik, `jelzes nelkuli masolt hely: ${hianyzik.join(', ')}`).toEqual([])
+    expect(hianyzik, `a jelzest nem HASZNALO masolt hely: ${hianyzik.join(', ')}`).toEqual([])
+  })
+
+  it('⛔ VISELKEDESI par egy MASODIK helyen is: a heartbeat CLAUDE.md', async () => {
+    // A sablon-ut mellett ez egy fuggetlen renderelo, es tisztan hivhato.
+    const m = await modul('nope', '../web/heartbeat-agent-scaffold.js')
+    const id = { ownerName: 'X', mainAgentId: 'a', botName: 'B', storePath: '/s',
+                 calendarAccount: null, dashboardOrigin: 'http://localhost:3420', lang: 'hu' }
+    const out = m.renderHeartbeatClaudeMd(id as never)
+    expect(out).toMatch(/^# WEB_PORT was INVALID at boot/)
+  })
+
+  it('⛔ KONTROLL ugyanoda: tiszta uton a heartbeat CLAUDE.md jelzes NELKUL all elo', async () => {
+    const m = await modul('39876', '../web/heartbeat-agent-scaffold.js')
+    const id = { ownerName: 'X', mainAgentId: 'a', botName: 'B', storePath: '/s',
+                 calendarAccount: null, dashboardOrigin: 'http://localhost:39876', lang: 'hu' }
+    const out = m.renderHeartbeatClaudeMd(id as never)
+    expect(out).toMatch(/^# Heartbeat agent/)
+    expect(out).not.toMatch(/INVALID/)
   })
 
   it('⛔ A MEGNEVEZETT KIVETEL: a settings.json.template utja NEM kaphat jelzest', () => {
