@@ -356,8 +356,48 @@ export function parseWebPort(raw: string | undefined, source: string, fallback: 
   return port
 }
 
+/**
+ * Two-level validation, LEVEL ONE: resolve, or FALL BACK -- never throw here.
+ *
+ * The first shape of this fix threw at module load. That is wrong for a measured
+ * reason: WEB_PORT is imported by ten places that are NOT the web server -- agent
+ * scaffolds, enroll bundles, the bridge port routes, the example curl commands written
+ * into agent instructions. A module-level throw does not STOP a typo, it SPREADS it:
+ * every one of those importers dies at import time, and the message lands wherever that
+ * importer happens to write, which is usually nowhere anyone is looking.
+ *
+ * So the module level does what resolveAppTz above already does for SCHEDULER_TZ: fall
+ * back, and export the rejected value as a flag. The difference from SCHEDULER_TZ is
+ * what the consumer then does: a bad timezone warns and keeps scheduling, a bad port
+ * REFUSES -- quietly accepting the fallback port is the exact defect this card exists to
+ * remove. See assertWebPortUsable below.
+ *
+ * The flag carries the raw value, its source, the validator's OWN words and the fallback
+ * actually taken, so the refusal downstream is one signal read in two places, not a log
+ * line someone has to grep for.
+ */
+export function resolveWebPort(
+  raw: { value: string; source: string } | undefined,
+  fallback: number,
+): { port: number; invalid?: { raw: string; source: string; reason: string; fallback: number } } {
+  try {
+    return { port: parseWebPort(raw?.value, raw?.source ?? 'default', fallback) }
+  } catch (e) {
+    return {
+      port: fallback,
+      invalid: {
+        raw: raw?.value ?? '',
+        source: raw?.source ?? 'default',
+        reason: e instanceof Error ? e.message : String(e),
+        fallback,
+      },
+    }
+  }
+}
+
 const webPortRaw = bootEnv('WEB_PORT')
-export const WEB_PORT = parseWebPort(webPortRaw?.value, webPortRaw?.source ?? 'default', 3420)
+const webPortResolved = resolveWebPort(webPortRaw, 3420)
+export const WEB_PORT = webPortResolved.port
 
 const webHostRaw = bootEnv('WEB_HOST')
 export const WEB_HOST = webHostRaw?.value ?? '127.0.0.1'
@@ -368,6 +408,44 @@ export const WEB_HOST = webHostRaw?.value ?? '127.0.0.1'
 export const BOOT_KEY_SOURCES: Record<BootKey, string> = {
   WEB_PORT: webPortRaw?.source ?? 'default',
   WEB_HOST: webHostRaw?.source ?? 'default',
+}
+
+// The WEB_PORT value that was REJECTED, if any -- undefined on the healthy path.
+// It sits right next to BOOT_KEY_SOURCES on purpose: both answer the same question
+// ("what actually happened to this key at boot"), and both are READ, not grepped. A log
+// line is not addressed to anyone; a flag can be asserted, and is.
+export const WEB_PORT_INVALID = webPortResolved.invalid
+
+/**
+ * LEVEL TWO: refuse.
+ *
+ * Call this before anything acts on WEB_PORT in a way that a wrong value makes
+ * destructive or invisible. Two such places exist, and the second one is why this
+ * function is not simply inlined into the web server:
+ *
+ *   1. acquireLock() in index.ts -- it SIGTERMs and then SIGKILLs whatever holds
+ *      WEB_PORT. On the fallback that is 3420, i.e. the install's OWN running
+ *      dashboard. Measured: index.ts calls acquirePortLock(WEB_PORT) ~115 lines
+ *      before startWebServer(WEB_PORT), so a gate that only sat in the web server
+ *      would let a typo kill the live dashboard first and refuse to start second --
+ *      strictly worse than the defect it fixes.
+ *   2. startWebServer() in web.ts -- binding the fallback port is the silent
+ *      acceptance itself.
+ *
+ * The message names the raw value, its source, the fallback that was taken and the
+ * validator's own sentence, because the operator reading it is holding the typo, not
+ * the source tree.
+ */
+export function assertWebPortUsable(): void {
+  if (!WEB_PORT_INVALID) return
+  const { raw, source, reason, fallback } = WEB_PORT_INVALID
+  throw new Error(
+    `WEB_PORT is unusable, refusing to continue. The raw value ${JSON.stringify(raw)} ` +
+    `(source: ${source}) was REJECTED at module load, and config.ts fell back to ` +
+    `${fallback} so the rest of the process could still be imported. ${reason} ` +
+    `Fix WEB_PORT or unset it, then start again: continuing would put the dashboard on ` +
+    `${fallback} -- not where you asked for it, and not where you would go looking.`,
+  )
 }
 
 // Kanban card aging visual thresholds (hours since last update) and colours.

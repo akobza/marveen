@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, BOOT_KEY_SOURCES } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, BOOT_KEY_SOURCES, assertWebPortUsable } from './config.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
 import { sweepExpiredSessions } from './web/auth-sessions.js'
@@ -91,6 +91,14 @@ function ensureDirs() {
 }
 
 export function startWebServer(port = 3420): http.Server {
+  // Level TWO of the WEB_PORT validation (card b2cd0f43). config.ts deliberately did
+  // NOT throw at module load -- see resolveWebPort -- so an invalid value reaches here
+  // as a flag with a fallback port already substituted. Binding that fallback is the
+  // silent acceptance of a wrong port, which is precisely the defect this card exists
+  // to remove, so this is where the boot stops. The message comes from the flag, not
+  // from a second sentence written here: one signal, read in two places.
+  assertWebPortUsable()
+
   // SECURITY: Server binds to 127.0.0.1 (see server.listen below). The allowed
   // browser origins mirror that -- anything else is rejected to prevent CSRF
   // from malicious websites the user may visit while the dashboard is running.
