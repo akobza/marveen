@@ -75,10 +75,14 @@ elif [ "$OS" = "Linux" ]; then
 fi
 tmux kill-session -t marveen-channels 2>/dev/null || true
 
-# DB rewrite. Use the SQLite CLI that ships with the project.
+# DB rewrite, through the same engine src/db.ts uses. The previous line here
+# claimed the SQLite CLI "ships with the project" -- it does not, and it is not an
+# install dependency either, so on a normal install this step died under `set -e`
+# AFTER the services above had already been stopped and disabled: a half-migrated
+# install, not a no-op. (Card 252ab361.)
 DB="$INSTALL_DIR/store/claudeclaw.db"
 if [ -f "$DB" ]; then
-  sqlite3 "$DB" <<SQL
+  node "$INSTALL_DIR/scripts/lib/sqlite-cli.mjs" "$DB" <<SQL
 UPDATE memories        SET agent_id   = '$NEW_SLUG' WHERE agent_id   = 'marveen';
 UPDATE daily_logs      SET agent_id   = '$NEW_SLUG' WHERE agent_id   = 'marveen';
 UPDATE agent_messages  SET from_agent = '$NEW_SLUG' WHERE from_agent = 'marveen';
