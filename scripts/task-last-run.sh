@@ -27,6 +27,53 @@
 
 set -euo pipefail
 DB="$(cd "$(dirname "$0")/.." && pwd)/store/claudeclaw.db"
+
+# Query helpers on python3 instead of the sqlite3 CLI. The CLI is not an install
+# dependency (ffmpeg, git, tmux, lsof, curl, python3, pipx, unzip), so under
+# `set -e` every call below killed this script outright on a normal install --
+# a diagnostic that exits 127 tells you nothing about the thing you came to check.
+# (Card 252ab361.)
+#
+# sqlq reproduces `sqlite3 -header -column`: header row, a dashed rule, and
+# left-aligned columns padded to the widest value, NULL shown as empty. The output
+# is read by a person, so the shape is part of the contract, not decoration.
+sqlq() {
+  python3 - "$1" "$2" <<'PYQ'
+import sqlite3, sys
+db, sql = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+try:
+    cur = con.execute(sql)
+    fejlec = [d[0] for d in cur.description or []]
+    sorok = [["" if v is None else str(v) for v in r] for r in cur.fetchall()]
+finally:
+    con.close()
+if not fejlec:
+    sys.exit(0)
+szel = [len(h) for h in fejlec]
+for r in sorok:
+    for i, v in enumerate(r):
+        if i < len(szel):
+            szel[i] = max(szel[i], len(v))
+print("  ".join(h.ljust(w) for h, w in zip(fejlec, szel)).rstrip())
+print("  ".join("-" * w for w in szel))
+for r in sorok:
+    print("  ".join(v.ljust(w) for v, w in zip(r, szel)).rstrip())
+PYQ
+}
+
+# Single value, printed bare -- the callers compare or echo it directly.
+sqlscalar() {
+  python3 - "$1" "$2" <<'PYS'
+import sqlite3, sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    r = con.execute(sys.argv[2]).fetchone()
+    print("" if r is None or r[0] is None else r[0])
+finally:
+    con.close()
+PYS
+}
 NAME="${1:-}"
 HOURS="${2:-}"
 
@@ -36,7 +83,7 @@ if [ "$NAME" = "--stats" ]; then
   # mert osszeget adja vissza az ablak helyett.
   W="${HOURS:-24}"
   echo "-- ablak: utolso ${W} ora | MA=$(date '+%Y-%m-%d %H:%M:%S') --"
-  sqlite3 -header -column "$DB" "
+  sqlq "$DB" "
     SELECT name,
            sum(status='fired')   AS fired,
            sum(status='skipped') AS skipped,
@@ -49,7 +96,7 @@ if [ "$NAME" = "--stats" ]; then
      ORDER BY skipped DESC, name;"
   echo
   echo "-- pozitiv kontroll: az ablakon KIVULI sorok szama (ha 0, az ablak gyanusan tag) --"
-  sqlite3 "$DB" "SELECT count(*) FROM task_runs WHERE ts/1000 <= strftime('%s','now') - ($W * 3600);"
+  sqlscalar "$DB" "SELECT count(*) FROM task_runs WHERE ts/1000 <= strftime('%s','now') - ($W * 3600);"
   exit 0
 fi
 
@@ -57,7 +104,7 @@ if [ -z "$NAME" ]; then
   # Minden task utolso futasa. A rendezes az epoch-on tortenik, a kiiras
   # localtime-ban -- a datum MINDIG benne van, hogy a frissesseg-itelet ne
   # egy csupasz ora-percbol szulessen.
-  sqlite3 -header -column "$DB" "
+  sqlq "$DB" "
     SELECT name,
            agent,
            datetime(max(ts)/1000,'unixepoch','localtime') AS utolso_futas,
@@ -75,7 +122,7 @@ if [ -n "$HOURS" ]; then
   WHERE="$WHERE AND ts/1000 > strftime('%s','now') - ($HOURS * 3600)"
 fi
 
-sqlite3 -header -column "$DB" "
+sqlq "$DB" "
   SELECT datetime(ts/1000,'unixepoch','localtime') AS futas,
          status,
          agent
@@ -89,7 +136,7 @@ sqlite3 -header -column "$DB" "
 # nem letezik a tablaban.
 echo
 echo "-- pozitiv kontroll (szuro nelkul, ugyanerre a nevre) --"
-sqlite3 -header -column "$DB" "
+sqlq "$DB" "
   SELECT count(*) AS osszes_futas,
          datetime(max(ts)/1000,'unixepoch','localtime') AS legutolso
     FROM task_runs WHERE name = '$NAME';"

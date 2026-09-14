@@ -226,7 +226,18 @@ fi
 # --- Database ---
 echo -e "\n${BOLD}Database${RESET}"
 if [ -f "store/claudeclaw.db" ]; then
-  MEM=$(sqlite3 store/claudeclaw.db "SELECT COUNT(*) FROM memories;" 2>/dev/null || echo "?")
+  # python3, not the sqlite3 CLI: the CLI is not an install dependency, so on a
+  # normal install this printed "?" and the line read "alive (? memories)" -- a
+  # diagnostic that cannot diagnose. (Card 252ab361.)
+  MEM=$(python3 -c "
+import sqlite3, sys
+try:
+    con = sqlite3.connect('file:store/claudeclaw.db?mode=ro', uri=True)
+    print(con.execute('SELECT COUNT(*) FROM memories').fetchone()[0])
+    con.close()
+except Exception:
+    print('?')
+" 2>/dev/null || echo "?")
   ok "claudeclaw.db: alive ($MEM memories)"
 else
   fail "store/claudeclaw.db missing"
