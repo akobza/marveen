@@ -1,4 +1,4 @@
-import {
+import { supersedePendingMessage,
   createAgentMessage, getPendingMessages, listAgentMessages,
   getAgentConversation, getAgentConversationThreads,
   getKanbanSeqByIdPrefix,
@@ -90,8 +90,8 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content, origin_note } = JSON.parse(body.toString()) as
-      { from: string; to: string; content: string; origin_note?: string }
+    const { from, to, content, origin_note, supersedes } = JSON.parse(body.toString()) as
+      { from: string; to: string; content: string; origin_note?: string; supersedes?: number }
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
@@ -212,6 +212,27 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // itself -- capped short so it stays a label, not a second content field.
     const trimmedOriginNote = origin_note?.trim().slice(0, 120) || null
     const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote)
+    // Card 8efec4aa: "this message overrides #N". The revocation is reported
+    // back explicitly, because the one failure mode that matters here is a
+    // caller who believes the old instruction was stopped when it was not --
+    // that is the same false comfort the card was opened for. `supersededOk`
+    // is therefore present whenever `supersedes` was given, and false carries
+    // the reason.
+    let supersededOk: boolean | undefined
+    let supersededError: string | undefined
+    if (supersedes !== undefined && supersedes !== null) {
+      const targetId = Number(supersedes)
+      if (!Number.isFinite(targetId)) {
+        supersededOk = false
+        supersededError = `supersedes must be a message id, got ${JSON.stringify(supersedes)}`
+      } else {
+        const outcome = supersedePendingMessage(targetId, msg.id, from.trim(), storedTo)
+        supersededOk = outcome.ok
+        if (!outcome.ok) supersededError = outcome.error
+        logger.info({ id: msg.id, supersedes: targetId, ok: outcome.ok }, 'Supersede requested for a queued message')
+      }
+    }
+    const supersedeFields = supersededOk === undefined ? {} : { supersededOk, ...(supersededError ? { supersededError } : {}) }
     logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, originNote: msg.origin_note }, 'Agent message created')
     // A LOCAL recipient that is not running never receives this: the router
     // retries for a while and then abandons it, and the failure notice goes to
@@ -234,12 +255,13 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       logger.warn({ id: msg.id, to: msg.to_agent }, 'Agent message queued for a STOPPED agent -- likely to be abandoned')
       json(res, {
         ...msg,
+        ...supersedeFields,
         targetRunning: false,
         warning: `'${msg.to_agent}' nem fut -- indítsd el (POST /api/agents/${msg.to_agent}/start), várd meg amíg feláll, és küldd újra. Egy leállított ügynöknek küldött üzenet nem várakozik, hanem elveszik.`,
       })
       return true
     }
-    json(res, msg)
+    json(res, { ...msg, ...supersedeFields })
     return true
   }
 

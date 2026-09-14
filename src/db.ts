@@ -760,6 +760,20 @@ export function initDatabase(dbPathOverride?: string): void {
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN span_id TEXT') } catch { /* exists */ }
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN parent_span_id TEXT') } catch { /* exists */ }
 
+  // Card 8efec4aa: revoking a QUEUED instruction. A superseded row is marked by
+  // pointing at the message that replaced it, and every consumer of the pending
+  // queue skips it.
+  //
+  // WHY A COLUMN AND NOT status='superseded': the status column carries
+  // CHECK(status IN ('pending','delivered','done','failed')), and SQLite cannot
+  // alter a CHECK -- adding a fifth value means rebuilding the table (create,
+  // copy, drop, rename) on the fleet's busiest table. That is a heavier,
+  // riskier migration than this fix needs, and it would be a schema decision
+  // rather than a bug fix. Reusing 'done' or 'failed' was the other option and
+  // is worse: both are lies about what happened ('done' = executed,
+  // 'failed' = the delivery broke), and they would pollute failure metrics.
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN superseded_by INTEGER') } catch { /* exists */ }
+
   // INVARIANT: a row that says 'delivered' must carry a delivered_at.
   //
   // On 2026-07-27 an operator bulk-closed a 28-row backlog with raw SQL that
@@ -2736,6 +2750,9 @@ export interface AgentMessage {
   // sub-agent's own task/branch name) -- NOT an authentication mechanism,
   // see the table-creation comment. Null for every caller that doesn't pass one.
   origin_note: string | null
+  // Card 8efec4aa: id of the message that revoked this one while it was still
+  // queued. Non-null means it must NOT be delivered. Null for every normal row.
+  superseded_by: number | null
   // Card def5a189: distributed trace context (message-router middleware).
   trace_id: string | null
   span_id: string | null
@@ -2757,6 +2774,7 @@ export function createAgentMessage(
     id: Number(info.lastInsertRowid),
     from_agent: from, to_agent: to, content, status: 'pending',
     result: null, created_at: now, delivered_at: null, completed_at: null,
+    superseded_by: null,
     origin_note: originNote ?? null,
     trace_id: traceCtx?.trace_id ?? null,
     span_id: traceCtx?.span_id ?? null,
@@ -2764,13 +2782,52 @@ export function createAgentMessage(
   }
 }
 
+// A revoked row stays 'pending' in the status column (see the migration note on
+// the CHECK constraint) -- so EVERY consumer of the queue has to skip it here,
+// or the revocation would only be cosmetic. This is the single place the
+// delivery path reads from, which is why the guard lives in it.
+const NOT_REVOKED = 'superseded_by IS NULL'
+
 export function getPendingMessages(toAgent?: string): AgentMessage[] {
   if (toAgent) {
-    return db.prepare("SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ORDER BY created_at ASC")
+    return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' AND ${NOT_REVOKED} AND to_agent = ? ORDER BY created_at ASC`)
       .all(toAgent) as AgentMessage[]
   }
-  return db.prepare("SELECT * FROM agent_messages WHERE status = 'pending' ORDER BY created_at ASC")
+  return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' AND ${NOT_REVOKED} ORDER BY created_at ASC`)
     .all() as AgentMessage[]
+}
+
+export type SupersedeResult = { ok: true } | { ok: false; error: string }
+
+/**
+ * Revoke a still-queued message (card 8efec4aa). Guarded four ways, and each
+ * guard is a refusal the caller is TOLD about rather than a silent no-op:
+ *  - the target must exist;
+ *  - it must still be pending (once delivered, the recipient has it -- claiming
+ *    success then would be the exact false comfort this card is about);
+ *  - the revoker must be the SAME sender to the SAME recipient, so one agent
+ *    cannot cancel another's instruction;
+ *  - it must not already be revoked.
+ */
+export function supersedePendingMessage(
+  targetId: number,
+  bySupersederId: number,
+  from: string,
+  to: string,
+): SupersedeResult {
+  const row = db.prepare('SELECT id, from_agent, to_agent, status, superseded_by FROM agent_messages WHERE id = ?')
+    .get(targetId) as { from_agent: string; to_agent: string; status: string; superseded_by: number | null } | undefined
+  if (!row) return { ok: false, error: `message ${targetId} not found` }
+  if (row.status !== 'pending') return { ok: false, error: `message ${targetId} is no longer pending (status: ${row.status}) -- the recipient already has it` }
+  if (row.superseded_by !== null) return { ok: false, error: `message ${targetId} was already superseded by ${row.superseded_by}` }
+  if (row.from_agent !== from || row.to_agent !== to) {
+    return { ok: false, error: `message ${targetId} is not yours to revoke: a sender may only supersede its own message to the same recipient` }
+  }
+  const now = Math.floor(Date.now() / 1000)
+  const changed = db.prepare(
+    "UPDATE agent_messages SET superseded_by = ?, result = ?, completed_at = ? WHERE id = ? AND status = 'pending' AND superseded_by IS NULL"
+  ).run(bySupersederId, `superseded by msg ${bySupersederId}`, now, targetId).changes > 0
+  return changed ? { ok: true } : { ok: false, error: `message ${targetId} changed state while being superseded` }
 }
 
 // Status-guarded (pending only): the federation removal path bulk-fails
@@ -2822,7 +2879,7 @@ export function getPendingBacklogByAgent(): AgentBacklog[] {
   const rows = db.prepare(
     `SELECT to_agent AS agent, COUNT(*) AS pending, MIN(created_at) AS oldest
        FROM agent_messages
-      WHERE status = 'pending'
+      WHERE status = 'pending' AND superseded_by IS NULL
       GROUP BY to_agent`,
   ).all() as { agent: string; pending: number; oldest: number }[]
   return rows
