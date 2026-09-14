@@ -1,4 +1,4 @@
-// Card 669df94a, step (a): the tick needs an IDENTIFIER in the log.
+// Card 669df94a, step (1): per-recipient sampling.
 //
 // Today it cannot be established from the log whether two deliveries happened
 // in the SAME router pass: the delivery line carries no tick id, and the "not
@@ -31,6 +31,7 @@ const mockMarkDelivered = vi.fn((..._a: unknown[]) => true)
 const mockMarkFailed = vi.fn((..._a: unknown[]) => true)
 const mockSessionExistsOnHost = vi.fn((..._a: unknown[]) => false)
 
+const mockIsReady = vi.fn(async (..._a: unknown[]) => true)
 const logInfo = vi.fn()
 const logWarn = vi.fn()
 vi.mock('../logger.js', () => ({
@@ -83,7 +84,7 @@ vi.mock('../web/agent-process.js', () => ({
   // its existing skip/busy behaviour and these fixtures are unaffected.
   clearFeedbackModalAndRecheck: () => false,
   agentSessionName: (name: string) => `agent-${name}`,
-  isSessionReadyForPrompt: vi.fn(async () => true),
+  isSessionReadyForPrompt: (...a: unknown[]) => mockIsReady(...a),
   clearStaleParkedInput: vi.fn(() => false),
   sendPromptToSession: vi.fn(),
   sessionExistsOnHost: (...a: unknown[]) => mockSessionExistsOnHost(...a),
@@ -103,74 +104,87 @@ vi.mock('../web/agent-message-wrap.js', () => ({
 }))
 
 
+
 import { runMessageRouterTick } from '../web/message-router.js'
 
-type LogCall = [Record<string, unknown>, string]
+// The card's wording matters and is pinned here: NOT "let us cache", but ONE
+// SAMPLE, ONE USE. A cache would go stale in the DANGEROUS direction -- after a
+// delivery the pane is busy, so a cached "ready" would inject a second message
+// into a pane that is no longer free. So: probe a recipient once per pass, and
+// if it was ready, send that recipient's OLDEST message and leave the rest for
+// the next pass.
+//
+// The measured price, from the card: if a pane becomes ready DURING the pass,
+// that recipient loses one tick (~5s). The price of today's behaviour in the
+// same situation is the oldest message waiting for the next idle window --
+// median 116s, 90th percentile 381s. And the one-per-recipient-per-tick limit
+// costs nothing measurable: of 582 deliveries on the tmux path there was NOT
+// ONE pair where the same recipient got two within 5 seconds.
 
 function pending(rows: Array<{ id: number; to: string; ageSec?: number }>) {
   const nowSec = Math.floor(Date.now() / 1000)
   return rows.map(r => ({
-    id: r.id,
-    from_agent: 'orin',
-    to_agent: r.to,
-    content: 'ping',
+    id: r.id, from_agent: 'orin', to_agent: r.to, content: 'ping',
     created_at: nowSec - (r.ageSec ?? 0),
   }))
 }
-
-function lines(mock: { mock: { calls: unknown[][] } }, msg: string): LogCall[] {
-  return (mock.mock.calls as LogCall[]).filter(c => c[1] === msg)
+function deliveredIds(): number[] {
+  return (logInfo.mock.calls as Array<[Record<string, unknown>, string]>)
+    .filter(c => c[1] === 'Agent message delivered')
+    .map(c => c[0].id as number)
 }
 
-describe('router tick identity in the log (card 669df94a, step a)', () => {
+describe('per-recipient sampling in one router pass (card 669df94a, step 1)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockSessionExistsOnHost.mockReturnValue(true)
     mockMarkDelivered.mockReturnValue(true)
     mockMarkFailed.mockReturnValue(true)
+    mockIsReady.mockImplementation(async () => true)
   })
 
-  it('every delivery line carries the tick id', async () => {
-    mockGetPendingMessages.mockReturnValue(pending([{ id: 1, to: 'dex' }, { id: 2, to: 'ada' }]))
-    await runMessageRouterTick()
-    const delivered = lines(logInfo, 'Agent message delivered')
-    expect(delivered.length).toBe(2)
-    for (const [fields] of delivered) expect(typeof fields.tick).toBe('number')
-    expect(delivered[0][0].tick).toBe(delivered[1][0].tick)   // same pass = same id
-  })
-
-  it('two passes get DIFFERENT tick ids (otherwise the id measures nothing)', async () => {
-    mockGetPendingMessages.mockReturnValue(pending([{ id: 1, to: 'dex' }]))
-    await runMessageRouterTick()
-    mockGetPendingMessages.mockReturnValue(pending([{ id: 2, to: 'dex' }]))
-    await runMessageRouterTick()
-    const ids = lines(logInfo, 'Agent message delivered').map(c => c[0].tick)
-    expect(ids.length).toBe(2)
-    expect(ids[0]).not.toBe(ids[1])
-  })
-
-  it('POSITIVE CONTROL: the per-tick summary reports PER RECIPIENT how many went out', async () => {
+  it('POSITIVE CONTROL: one pass sends at most ONE message per recipient, and it is the OLDEST', async () => {
+    // dex has two queued, ada one. Oldest first in the queue, as the DB returns it.
     mockGetPendingMessages.mockReturnValue(pending([
-      { id: 1, to: 'dex' }, { id: 2, to: 'ada' }, { id: 3, to: 'dex' },
+      { id: 11, to: 'dex', ageSec: 300 },   // dex, oldest
+      { id: 12, to: 'ada', ageSec: 200 },
+      { id: 13, to: 'dex', ageSec: 100 },   // dex, newer -- must wait for the next pass
     ]))
     await runMessageRouterTick()
-    const summary = lines(logInfo, 'message-router: tick summary')
-    expect(summary.length).toBe(1)
-    const fields = summary[0][0] as { tick: number; delivered: Record<string, number>; pendingSeen: number }
-    expect(typeof fields.tick).toBe('number')
-    // ⛔ This expectation CHANGED with step (1) of the same card, and the change
-    // is the point rather than an adjustment: since a recipient is sampled once
-    // per pass, dex's second message waits for the next pass. Before step (1)
-    // this line read { dex: 2, ada: 1 }. The summary is what makes that visible.
-    expect(fields.delivered).toEqual({ dex: 1, ada: 1 })    // measured, not assumed
-    expect(fields.pendingSeen).toBe(3)                      // the pass SAW three
+    expect(deliveredIds().sort((a, b) => a - b)).toEqual([11, 12])
   })
 
-  it('NEGATIVE CONTROL: a tick with nothing pending still reports itself, with an empty split', async () => {
-    mockGetPendingMessages.mockReturnValue([])
+  it('ONE readiness probe per recipient per pass (one sample, one use)', async () => {
+    mockGetPendingMessages.mockReturnValue(pending([
+      { id: 21, to: 'dex', ageSec: 300 }, { id: 22, to: 'dex', ageSec: 200 }, { id: 23, to: 'ada', ageSec: 100 },
+    ]))
     await runMessageRouterTick()
-    const summary = lines(logInfo, 'message-router: tick summary')
-    expect(summary.length).toBe(1)
-    expect((summary[0][0] as { delivered: Record<string, number> }).delivered).toEqual({})
+    const probedSessions = (mockIsReady.mock.calls as unknown[][]).map(c => String(c[0]))
+    expect(probedSessions.length).toBe(new Set(probedSessions).size)   // no recipient probed twice
+    expect(new Set(probedSessions)).toEqual(new Set(['agent-dex', 'agent-ada']))
+  })
+
+  it('NEGATIVE CONTROL: a NOT-ready recipient blocks only itself, the other still gets its oldest', async () => {
+    mockIsReady.mockImplementation(async (session: unknown) => session !== 'agent-dex')
+    mockGetPendingMessages.mockReturnValue(pending([
+      { id: 31, to: 'dex', ageSec: 300 }, { id: 32, to: 'ada', ageSec: 200 },
+    ]))
+    await runMessageRouterTick()
+    expect(deliveredIds()).toEqual([32])
+  })
+
+  it('the next pass carries on with the recipient\'s next-oldest, so nothing is starved', async () => {
+    mockGetPendingMessages.mockReturnValue(pending([
+      { id: 41, to: 'dex', ageSec: 300 }, { id: 42, to: 'dex', ageSec: 200 },
+    ]))
+    await runMessageRouterTick()
+    expect(deliveredIds()).toEqual([41])
+    vi.clearAllMocks()
+    mockSessionExistsOnHost.mockReturnValue(true)
+    mockMarkDelivered.mockReturnValue(true)
+    mockIsReady.mockImplementation(async () => true)
+    mockGetPendingMessages.mockReturnValue(pending([{ id: 42, to: 'dex', ageSec: 205 }]))
+    await runMessageRouterTick()
+    expect(deliveredIds()).toEqual([42])
   })
 })

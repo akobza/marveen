@@ -434,6 +434,24 @@ export async function runMessageRouterTick(): Promise<void> {
     // out: one place writes both.
     const deliveredPerAgent: Record<string, number> = {}
     let pendingSeen = 0
+    // Card 669df94a, step (1): ONE SAMPLE, ONE USE per recipient per pass.
+    // Deliberately NOT a readiness cache: a cache would go stale in the
+    // DANGEROUS direction -- right after a delivery the pane is busy, so a
+    // remembered "ready" would inject a second message into a pane that is no
+    // longer free. A recipient enters this set when its readiness is sampled,
+    // and every further message to it waits for the next pass. Because the
+    // pending list is ordered oldest-first, the one that goes IS the oldest.
+    //
+    // Price, measured (card): if a pane becomes ready DURING a pass, that
+    // recipient loses one tick (~5s). Today's price in the same situation is
+    // the oldest message waiting for the next idle window -- median 116s, 90th
+    // percentile 381s. The limit itself costs nothing measurable: of 582 tmux
+    // deliveries there was not one pair where a recipient got two within 5s.
+    //
+    // Queue-serving (worksource) recipients are NOT in scope: they never reach
+    // the readiness probe, so they never enter this set. Limiting them would be
+    // an unmeasured behaviour change on a path this card did not measure.
+    const sampledThisTick = new Set<string>()
     // Reset per-tick batched-message tracker.
     batchedMsgIdsThisTick = new Set()
     // Cap work per tick: process at most MAX_MESSAGES_PER_TICK messages, the
@@ -520,6 +538,9 @@ export async function runMessageRouterTick(): Promise<void> {
       // Skip messages already batched by the reconnect pre-pass: they are
       // 'done' in the DB now but still appear in our snapshot slice.
       if (batchedMsgIdsThisTick.has(msg.id)) continue
+      // Already sampled this recipient in this pass (step 1): its oldest
+      // message was handled, the rest belong to the next pass.
+      if (sampledThisTick.has(msg.to_agent)) continue
       // Per-message fault isolation: a throw from any helper (e.g. safeJoin
       // on a '..'-bearing to_agent) previously escaped the whole tick through
       // the catch-less try/finally, aborting delivery for every younger
@@ -611,6 +632,10 @@ export async function runMessageRouterTick(): Promise<void> {
         continue
       }
 
+      // One sample per recipient per pass -- recorded BEFORE the await, so a
+      // second message to the same recipient cannot slip past while this probe
+      // is in flight.
+      if (!worksourceServing) sampledThisTick.add(msg.to_agent)
       if (!worksourceServing && !(await isSessionReadyForPrompt(session, host))) {
         // A self-drafted feedback modal ("Bug report drafted ... 0 to dismiss")
         // holds the pane in a not-ready state, and the pre-flight dismissal in
