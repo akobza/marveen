@@ -22,10 +22,49 @@ DEST="$BKDIR/${TS}-${LABEL}"
 mkdir -p "$DEST"
 
 # Consistent SQLite snapshot (NOT a raw cp -- the live dashboard may be mid-write).
+#
+# Done through python3's sqlite3 module and its Connection.backup API, NOT the
+# sqlite3 CLI. The CLI is not an install dependency (the documented list is
+# ffmpeg, git, tmux, lsof, curl, python3, pipx, unzip), so on a normal install the
+# old `sqlite3 ... ".backup ..."` line was a command that is not there -- and its
+# `|| echo WARNING` turned that into a warning, after which the script carried on
+# and printed "backup ok" with exit 0. Measured on 2026-09-14: this install's
+# backup directory had NEVER received a snapshot, so the failure had never been
+# seen -- it would have surfaced on the FIRST real use, which is exactly when the
+# backup is needed. python3 IS an install dependency and its backup API takes the
+# same consistent, live-safe snapshot the CLI dot-command did. (Card 252ab361.)
+snapshot_db() {
+  python3 - "$1" "$2" <<'PYBACKUP'
+import sqlite3, sys
+src, dst = sys.argv[1], sys.argv[2]
+# Read-only source URI: a backup must never be able to write to the live file.
+con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+try:
+    out = sqlite3.connect(dst)
+    try:
+        con.backup(out)
+    finally:
+        out.close()
+finally:
+    con.close()
+PYBACKUP
+}
+
 if [ -f "$STORE/claudeclaw.db" ]; then
-  sqlite3 "$STORE/claudeclaw.db" ".backup '$DEST/claudeclaw.db'" \
-    && echo "  db: consistent snapshot ok" \
-    || echo "  db: WARNING snapshot failed"
+  if snapshot_db "$STORE/claudeclaw.db" "$DEST/claudeclaw.db"; then
+    echo "  db: consistent snapshot ok"
+  else
+    # LOUD and NON-ZERO. The whole point of this script is the recovery path; a
+    # backup without the database that reports success is worse than no backup,
+    # because it is believed. The directory is renamed so the failure cannot be
+    # mistaken for a usable snapshot later, when someone is looking for one.
+    echo "pre-modify-backup: FATAL -- the database snapshot FAILED." >&2
+    echo "pre-modify-backup: this backup is NOT usable for recovery." >&2
+    echo "pre-modify-backup: source: $STORE/claudeclaw.db" >&2
+    mv "$DEST" "${DEST}-INCOMPLETE" 2>/dev/null \
+      && echo "pre-modify-backup: directory marked ${DEST}-INCOMPLETE" >&2
+    exit 1
+  fi
 fi
 
 # Small critical state git does not track. Explicit list -- store/ also holds
@@ -95,5 +134,28 @@ if [ -d "$BKDIR" ]; then
   done
 fi
 
+# Manifest for the WHOLE snapshot: one line per file with size and sha256.
+# Without it, "does this backup contain the database?" is a directory walk and a
+# judgement call; with it, it is one grep. That question is not hypothetical: the
+# defect this script just stopped having produced exactly that situation, and the
+# only way to answer it for an OLD backup is a record written at the time.
+MANIFEST="$DEST/MANIFEST.sha256"
+(
+  cd "$DEST" || exit 1
+  find . -type f ! -name 'MANIFEST.sha256' -printf '%P\n' 2>/dev/null | LC_ALL=C sort | while read -r rel; do
+    printf '%s  %s  %s\n' "$(sha256sum "$rel" | cut -d' ' -f1)" "$(stat -c %s "$rel")" "$rel"
+  done
+) > "$MANIFEST"
+
+# The database is the reason this script exists, so its presence is asserted, not
+# assumed: a manifest that silently lacks it would be the same quiet failure in a
+# new place.
+if [ -f "$STORE/claudeclaw.db" ] && ! grep -q '  claudeclaw\.db$' "$MANIFEST"; then
+  echo "pre-modify-backup: FATAL -- the manifest does not list claudeclaw.db." >&2
+  mv "$DEST" "${DEST}-INCOMPLETE" 2>/dev/null
+  exit 1
+fi
+
 SIZE="$(du -sh "$DEST" 2>/dev/null | cut -f1)"
+echo "  manifest: $(wc -l < "$MANIFEST") file(s) listed with size + sha256"
 echo "backup ok: $DEST ($SIZE, retain newest $KEEP)"
