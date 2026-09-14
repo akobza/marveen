@@ -112,7 +112,13 @@ describe('PORTCHAIN1: the port chain follows WEB_PORT on a NON-default port', ()
 
   it('channel-monitor builds its agent instruction from WEB_PORT', () => {
     const src = readFileSync(join(ROOT, 'src/web/channel-monitor.ts'), 'utf-8')
-    expect(src).toContain("import { WEB_PORT } from '../config.js'")
+    // PORTCHAIN1 allitasa az, hogy a port a CONFIGBOL jon, nem beegetve. A pin
+    // eredetileg az import PONTOS SZOVEGET rogzitette, ami egy TULAJDONSAG helyett
+    // egy ALAKOT mert: a b2cd0f43 negyedik kikotese egy masodik nevet huzott be
+    // ugyanabbol a modulbol, es a pin elbukott, holott a vedett tulajdonsag all.
+    // Most a tulajdonsagra all -- es tovabbra is pirosodik, ha a WEB_PORT eltunik
+    // az importbol vagy mas modulbol jon.
+    expect(src).toMatch(/import \{[^}]*\bWEB_PORT\b[^}]*\} from '\.\.\/config\.js'/)
     expect(src).toMatch(/localhost:\$\{WEB_PORT\}\/api\/memories/)
     expect(src).not.toMatch(/localhost:3420/)
   })
