@@ -43,13 +43,15 @@ import {
   type ConnectionBundleInput,
 } from '../src/remote-enroll-core.js'
 import { enrollAuthorizedKey } from '../src/remote-enroll-fs.js'
-import { WEB_PORT as ENV_WEB_PORT } from '../src/config.js'
+import { WEB_PORT as ENV_WEB_PORT, WEB_PORT_COPY_WARNING } from '../src/config.js'
 
 interface Args {
   keyLine?: string
   host?: string
   port: number
   webPort: number
+  /** false once --web-port was given explicitly; drives the fallback warning. */
+  webPortFromEnv: boolean
   includeDashboardToken: boolean
 }
 
@@ -64,7 +66,7 @@ function defaultWebPort(): number {
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { port: 22, webPort: defaultWebPort(), includeDashboardToken: true }
+  const out: Args = { port: 22, webPort: defaultWebPort(), webPortFromEnv: true, includeDashboardToken: true }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--host') {
@@ -90,6 +92,7 @@ function parseArgs(argv: string[]): Args {
       const n = Number(v)
       if (!Number.isInteger(n) || n < 1 || n > 65535) fail('--web-port must be 1..65535')
       out.webPort = n
+      out.webPortFromEnv = false
     } else if (a.startsWith('--')) {
       fail(`unknown flag: ${a}`)
     } else if (out.keyLine === undefined) {
@@ -244,6 +247,17 @@ async function main(): Promise<void> {
         'hand it over on a private channel, never by email or shared chat. ' +
         'Use --no-dashboard-token to emit a token-free bundle.\n',
     )
+  }
+
+  // Card b2cd0f43, 4th condition. This CLI is the ONE place that writes WEB_PORT
+  // into a copied artefact WITHOUT passing a boot gate first: the dashboard's own
+  // gates stop that process before any of its template paths run, but this script
+  // imports config directly and never calls them. So on the fallback path the
+  // bundle would carry 3420 looking exactly like a configured value. Same sentence
+  // as everywhere else, from the same constant -- on stderr, so it cannot corrupt
+  // the bundle on stdout that a consumer pipes.
+  if (WEB_PORT_COPY_WARNING && args.webPortFromEnv) {
+    process.stderr.write(`WARNING: ${WEB_PORT_COPY_WARNING}\n`)
   }
 
   const encoded = encodeBundle(buildBundle(bundleInput))

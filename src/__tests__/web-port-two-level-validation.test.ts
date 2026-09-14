@@ -110,6 +110,54 @@ describe('(ii) UGYANAKKOR a megtagadas megtortenik -- e nelkul az (i) csendes el
   })
 })
 
+describe('⛔ VISELKEDESI par a kapu HARMADIK helyere: a kill-ag EL SEM ERHETO (fv 13517)', () => {
+  // ⛔ Eles porton NEM fut: injektalt ProcessLockContext, ami minden jelzest FELJEGYEZ
+  // ahelyett, hogy kuldene. Amit ez mer, az NEM a production sorrend (azt a
+  // forras-allitas meri lentebb) -- hanem az, hogy AMIKOR a kapu elol all, a
+  // pusztito ag tenylegesen elerhetetlen marad. A ketto ket kulon allitas.
+  function rogzitoCtx(jelek: string[]) {
+    return {
+      currentPid: process.pid,
+      uid: process.getuid?.() ?? 0,
+      selfProjectRoot: process.cwd(),
+      listPortHolders: () => [424242],
+      listOwnProcessesMatching: () => [424242],
+      getProcessCommand: () => 'node',
+      getProcessUid: () => process.getuid?.() ?? 0,
+      getProcessCwd: () => process.cwd(),
+      signal: (pid: number, sig: 0 | 'SIGTERM' | 'SIGKILL') => { jelek.push(`${pid}:${sig}`); return 'gone' as const },
+      sleep: async () => {},
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+    }
+  }
+
+  it('ervenytelen WEB_PORT: a kapu dob, es a port-zar EGYETLEN jelzest sem kuld', async () => {
+    vi.resetModules()
+    process.env.WEB_PORT = 'nope'
+    const cfg = await import('../config.js')
+    const { acquirePortLock } = await import('../process-lock.js')
+    const jelek: string[] = []
+    await expect((async () => {
+      cfg.assertWebPortUsable()                                   // index.ts: acquireLock() elso sora
+      await acquirePortLock(cfg.WEB_PORT, rogzitoCtx(jelek), {})  // index.ts:468
+    })()).rejects.toThrow(/WEB_PORT is unusable/)
+    expect(jelek).toEqual([])
+  })
+
+  it('⛔ NEGATIV KONTROLL: ervenyes ertek mellett a kill-ag ELERHETO (kulonben a fenti ures allitas lenne)', async () => {
+    vi.resetModules()
+    process.env.WEB_PORT = '39876'
+    const cfg = await import('../config.js')
+    const { acquirePortLock } = await import('../process-lock.js')
+    const jelek: string[] = []
+    cfg.assertWebPortUsable()
+    await acquirePortLock(cfg.WEB_PORT, rogzitoCtx(jelek), {})
+    // ⛔ Nem eleg, hogy "erkezett valami jelzes": egy sig 0 eletjel-proba is az lenne.
+    // A kontroll targya az OLO ag, tehat SIGTERM-et kell latni.
+    expect(jelek).toContain('424242:SIGTERM')
+  })
+})
+
 describe('⛔ a kapu a PUSZTITO hasznalat ELOTT all, nem csak a webkiszolgaloban', () => {
   // Merve: az index.ts az acquirePortLock(WEB_PORT)-tal SIGTERM-et majd SIGKILL-t kuld
   // arra, ami a portot tartja -- a fallbacken az a sajat, FUTO dashboard. A

@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { STORE_DIR, WEB_PORT } from '../config.js'
+import { STORE_DIR, WEB_PORT, WEB_PORT_COPY_WARNING } from '../config.js'
 import { AGENTS_BASE_DIR } from './agent-config.js'
 
 // Resolve the directory where an agent's channel plugin stores its bot .env.
@@ -55,6 +55,9 @@ export function buildTtsDirective(opts: {
     return (
       `\n\n[Hang válasz direktíva]: A fenti hangüzenetre HANGBAN válaszolj. ` +
       `Amikor megvan a válaszod szövege, futtasd le ezt a parancsot (a szöveget JSON-escape-elve add meg a --arg-ban):\n` +
+      // Card b2cd0f43: the port below is copied and run. On the fallback path it is
+      // NOT the operator's value, and nothing in the command would say so.
+      (WEB_PORT_COPY_WARNING ? `⛔ ${WEB_PORT_COPY_WARNING}\n` : '') +
       `\`\`\`bash\n` +
       `jq -n --arg t "A_VÁLASZOD_SZÖVEGE" '{"text":$t,"chat_id":"${chatId}","state_dir":"${escapedStateDir}","voice_model":"${voiceModel}"}' | ` +
       `curl -s -X POST http://localhost:${WEB_PORT}/api/voice/tts -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" -d @-\n` +

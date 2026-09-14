@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync, rmSync, watchFile, unwatchFile } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, AGENT_API_ORIGIN, STORE_DIR } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, AGENT_API_ORIGIN, STORE_DIR, withWebPortWarning } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
@@ -109,24 +109,35 @@ export interface TemplateIdentity {
 // substitutions, so a shipped template never seeds a foreign absolute path or
 // name into a user's tree. {{INSTALL_DIR}} and {{PROJECT_ROOT}} both denote the
 // install location.
-export function substituteTemplatePlaceholders(content: string, id: TemplateIdentity): string {
-  return content
+// `warnMarker` opts a caller INTO the WEB_PORT fallback warning (card b2cd0f43,
+// 4th condition). It is opt-in and not automatic for one measured reason: the
+// result of this function is JSON.parse()d for settings.json.template (see
+// ensureAgentSettings below), and a prepended comment line would make that throw.
+// Callers that render plain text pass a marker; the JSON caller does not, and that
+// exemption is named and pinned in web-port-copy-warning.test.ts rather than left
+// to be rediscovered.
+export function substituteTemplatePlaceholders(content: string, id: TemplateIdentity, warnMarker?: string): string {
+  const substituted = content
     .replaceAll('{{PROJECT_ROOT}}', id.projectRoot)
     .replaceAll('{{INSTALL_DIR}}', id.projectRoot)
     .replaceAll('{{MAIN_AGENT_ID}}', id.mainAgentId)
     .replaceAll('{{BOT_NAME}}', id.botName)
     .replaceAll('{{OWNER_NAME}}', id.ownerName)
     .replaceAll('{{WEB_PORT}}', String(id.webPort))
+  // Only warn when the port actually landed in this text -- a template without
+  // {{WEB_PORT}} carries nothing to mislead anyone.
+  if (warnMarker === undefined || !content.includes('{{WEB_PORT}}')) return substituted
+  return withWebPortWarning(substituted, warnMarker)
 }
 
-export function resolveTemplatePlaceholders(content: string): string {
+export function resolveTemplatePlaceholders(content: string, warnMarker?: string): string {
   return substituteTemplatePlaceholders(content, {
     projectRoot: PROJECT_ROOT,
     mainAgentId: MAIN_AGENT_ID,
     botName: BOT_NAME,
     ownerName: OWNER_NAME,
     webPort: WEB_PORT,
-  })
+  }, warnMarker)
 }
 
 // Return the settings.json path for an agent.
@@ -1044,7 +1055,7 @@ export function ensureDefaultScheduledTasks(): void {
         // sed) so a template's SKILL.md never seeds a foreign absolute path or
         // name into the user's task. Binary/unreadable -> fall back to a copy.
         try {
-          writeFileSync(destFile, resolveTemplatePlaceholders(readFileSync(srcFile, 'utf-8')))
+          writeFileSync(destFile, resolveTemplatePlaceholders(readFileSync(srcFile, 'utf-8'), '# '))
         } catch {
           copyFileSync(srcFile, destFile)
         }

@@ -3,7 +3,7 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { makeLazyBinResolver } from '../platform.js'
-import { WEB_PORT } from '../config.js'
+import { WEB_PORT, WEB_PORT_COPY_WARNING } from '../config.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from '../config-registry.js'
@@ -558,6 +558,8 @@ async function triggerMarveenMemorySave(): Promise<void> {
     'aktiv feladatok (category hot), friss dontesek/preferenciak (warm), tanulsagok (cold).',
     `Hasznald: curl -s -X POST http://localhost:${WEB_PORT}/api/memories ... (lasd CLAUDE.md).`,
     'Ha kesz vagy, irj egy rovid napi naplo bejegyzest is a /api/daily-log-ra. Utana eleg.',
+    // Card b2cd0f43: the agent copies the curl above. Same sentence, one source.
+    ...(WEB_PORT_COPY_WARNING ? [`⛔ ${WEB_PORT_COPY_WARNING}`] : []),
   ].join(' ')
   try {
     // GUARDHITELES903: the "save your memory NOW, restart in 60s" order is an

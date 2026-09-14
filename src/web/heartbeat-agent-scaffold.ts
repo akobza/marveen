@@ -47,6 +47,7 @@ import {
   APP_TZ,
   DASHBOARD_PUBLIC_URL,
   AGENT_API_ORIGIN,
+  withWebPortWarning,
 } from '../config.js'
 import { resolveDashboardOrigin } from './agent-scaffold.js'
 import { logger } from '../logger.js'
@@ -145,7 +146,9 @@ export function renderHeartbeatClaudeMd(id: HeartbeatIdentity): string {
   const calendarTarget = id.calendarAccount
     ? `against \`${id.calendarAccount}\``
     : 'against the calendar the dashboard is configured for (HEARTBEAT_CALENDAR_ID)'
-  return `# Heartbeat agent
+  // Card b2cd0f43, 4th condition: this prose carries the dashboard origin into a
+  // file the agent reads and copies commands from. Same sentence, one source.
+  return withWebPortWarning(`# Heartbeat agent
 
 You are the **heartbeat agent** -- a dedicated, headless worker that
 runs on the hourly schedule and produces a structured summary of
@@ -361,7 +364,7 @@ directly. The only inputs you ever process are heartbeat prompts
 from the scheduler. If you receive anything else, hand it off to the
 main agent with a brief "received off-pattern input, please advise"
 note and stop.
-`
+`, '# ')
 }
 
 function renderAgentConfigJson(): string {

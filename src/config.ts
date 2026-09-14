@@ -436,6 +436,41 @@ export const WEB_PORT_INVALID = webPortResolved.invalid
  * validator's own sentence, because the operator reading it is holding the typo, not
  * the source tree.
  */
+/**
+ * LEVEL TWO, second half: the warning that travels WITH the value.
+ *
+ * The two gates above stand where the fault ARISES. This one stands where it
+ * SPREADS: WEB_PORT is written into agent templates, enroll bundles and example
+ * curl commands, and those outlive the process that produced them. Someone copies
+ * a command tomorrow; the 3420 in it looks like a configured value, because
+ * nothing in the text says otherwise.
+ *
+ * ONE string, emitted verbatim at every such site -- deliberately a constant and
+ * not a per-site sentence. Ten hand-written variants drift, and the next edit
+ * updates eight of them.
+ *
+ * null on the healthy path, so a site can branch on it without knowing anything
+ * about how the port was resolved.
+ */
+export const WEB_PORT_COPY_WARNING: string | null = WEB_PORT_INVALID
+  ? `WEB_PORT was INVALID at boot (${JSON.stringify(WEB_PORT_INVALID.raw)}, source: ` +
+    `${WEB_PORT_INVALID.source}), so this text carries the ${WEB_PORT_INVALID.fallback} ` +
+    `fallback, NOT your configured port. Fix WEB_PORT and regenerate before using this.`
+  : null
+
+/**
+ * Put the warning in front of `text` when one stands, commented with the marker
+ * the destination understands ('# ' for shell and most config, '// ' for JS-like).
+ * Returns `text` byte-for-byte unchanged on the healthy path -- so a site can call
+ * it unconditionally and the clean output is not altered at all, which is what
+ * makes "the warning is absent on the clean path" a testable claim rather than an
+ * intention.
+ */
+export function withWebPortWarning(text: string, marker = '# '): string {
+  if (!WEB_PORT_COPY_WARNING) return text
+  return `${marker}${WEB_PORT_COPY_WARNING}\n${text}`
+}
+
 export function assertWebPortUsable(): void {
   if (!WEB_PORT_INVALID) return
   const { raw, source, reason, fallback } = WEB_PORT_INVALID
