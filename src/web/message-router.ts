@@ -47,6 +47,14 @@ const JANITOR_PARKED_MIN_AGE_MS = 45 * 1000
 // Log "skipping, target not ready" at most once per message id so a busy
 // receiver over many 5s ticks does not spam the log.
 const routerLoggedMisses: Set<number> = new Set()
+
+// Card 669df94a, step (a): an identifier for one router pass.
+// Without it the log cannot answer the question the fairness work starts from:
+// did these two deliveries happen in the SAME pass? The delivery line and the
+// skip line carry it, and a per-tick summary states the per-recipient split --
+// which is also why this step goes FIRST: it only logs, it does not behave, and
+// its measurement is the input to the change that follows.
+let routerTickSeq = 0
 // Per-message consecutive tmux-inject-failure counter. A send that THROWS
 // (send-keys hit the pane at a bad instant -- e.g. the receiver was mid-turn /
 // momentarily un-ready despite passing the readiness check) used to instant-
@@ -420,6 +428,12 @@ function batchDeliverBacklog(agent: string, agentPending: AgentMessage[], now: n
 // setInterval body so it can be exercised directly in unit tests (the
 // _tickRunning re-entrancy guard stays in startMessageRouter, around the call).
 export async function runMessageRouterTick(): Promise<void> {
+    const tick = ++routerTickSeq
+    // Per-recipient delivery split for this pass. Counting happens where the
+    // delivery is logged, so the summary cannot drift from what actually went
+    // out: one place writes both.
+    const deliveredPerAgent: Record<string, number> = {}
+    let pendingSeen = 0
     // Reset per-tick batched-message tracker.
     batchedMsgIdsThisTick = new Set()
     // Cap work per tick: process at most MAX_MESSAGES_PER_TICK messages, the
@@ -437,6 +451,7 @@ export async function runMessageRouterTick(): Promise<void> {
     const federatedPending: AgentMessage[] = []
     for (const m of allPending) (isQualifiedId(m.to_agent) ? federatedPending : localPending).push(m)
     const pending = localPending.slice(0, MAX_MESSAGES_PER_TICK)
+    pendingSeen = pending.length
     const now = Date.now()
     // ---- update absent/present tracking for all receivers in this tick ----
     // Rebuild the stuck-detector's view of which agents are absent RIGHT NOW.
@@ -590,7 +605,7 @@ export async function runMessageRouterTick(): Promise<void> {
 
       if (!worksourceServing && !sessionExists) {
         if (!routerLoggedMisses.has(msg.id)) {
-          logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message target session not running, will retry')
+          logger.warn({ tick, id: msg.id, to: msg.to_agent, session }, 'Agent message target session not running, will retry')
           routerLoggedMisses.add(msg.id)
         }
         continue
@@ -787,7 +802,8 @@ export async function runMessageRouterTick(): Promise<void> {
         }
         routerInjectFailures.delete(msg.id)
         routerLoggedMisses.delete(msg.id)
-        logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, category, traceId: traceCtx?.trace_id }, 'Agent message delivered')
+        deliveredPerAgent[msg.to_agent] = (deliveredPerAgent[msg.to_agent] ?? 0) + 1
+        logger.info({ tick, id: msg.id, from: msg.from_agent, to: msg.to_agent, category, traceId: traceCtx?.trace_id }, 'Agent message delivered')
       } catch (err) {
         // An inject throw is usually transient (pane un-ready at the instant of
         // send-keys). Retry across ticks instead of the old silent instant-fail;
@@ -822,6 +838,12 @@ export async function runMessageRouterTick(): Promise<void> {
     // (default off); when enabled it is cheap statSync-gated so an empty fleet
     // costs one stat per agent and no tmux I/O.
     void maybeWakeSubAgentsForTelegram(now)
+
+    // One line per pass, ALWAYS -- including an empty pass. A summary that is
+    // only written when something happened cannot distinguish "the router did
+    // not run" from "it ran and had nothing to do", and that distinction is
+    // exactly what a stalled queue looks like from the outside.
+    logger.info({ tick, pendingSeen, delivered: deliveredPerAgent }, 'message-router: tick summary')
 }
 
 // ---- voice helpers (message-router level) ----------------------------------
