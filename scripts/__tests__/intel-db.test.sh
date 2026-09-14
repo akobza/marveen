@@ -16,6 +16,12 @@ INSTALL_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CLI="$INSTALL_DIR/scripts/intel_db.py"
 export INTEL_DB="$TMPDIR_BASE/intel.db"
 
+# Read the database the way the product does, not through a CLI that is not
+# installed. The sqlite3 binary is NOT an install dependency (card 252ab361), so
+# every `sqlite3 ...` below used to exit 127 and this file was permanently red --
+# which meant every later verdict had to step over a known failure first.
+sqldb() { node "$INSTALL_DIR/scripts/lib/sqlite-cli.mjs" "$@"; }
+
 echo "intel_db tests"
 echo "=============="
 
@@ -28,7 +34,7 @@ if echo "$OUT" | grep -q "OK"; then
 else
   fail "no-arg run output unexpected: $OUT"
 fi
-TABLES=$(sqlite3 "$INTEL_DB" ".tables")
+TABLES=$(sqldb "$INTEL_DB" ".tables")
 for t in known_facts_registry watchlist decision_log active_focus; do
   if echo "$TABLES" | grep -q "$t"; then
     pass "table $t exists"
@@ -59,8 +65,8 @@ fi
 echo ""
 echo "Test 4: repeat sighting is an update"
 ID2=$(python3 "$CLI" add-fact --title "T1b" --domain market --source "src" --tier 2 --content "price moved 5%" --status evolving)
-COUNT=$(sqlite3 "$INTEL_DB" "SELECT COUNT(*) FROM known_facts_registry")
-STATUS=$(sqlite3 "$INTEL_DB" "SELECT status FROM known_facts_registry WHERE id='$ID1'")
+COUNT=$(sqldb "$INTEL_DB" "SELECT COUNT(*) FROM known_facts_registry")
+STATUS=$(sqldb "$INTEL_DB" "SELECT status FROM known_facts_registry WHERE id='$ID1'")
 if [ "$ID1" = "$ID2" ] && [ "$COUNT" = "1" ] && [ "$STATUS" = "evolving" ]; then
   pass "same content upserted in place (1 row, status=evolving)"
 else
@@ -71,7 +77,7 @@ fi
 echo ""
 echo "Test 5: duplicate content under another id is a no-op"
 OUT=$(python3 "$CLI" add-fact --id other-id --title "T1c" --domain market --source "src" --tier 2 --content "price moved 5%")
-COUNT=$(sqlite3 "$INTEL_DB" "SELECT COUNT(*) FROM known_facts_registry")
+COUNT=$(sqldb "$INTEL_DB" "SELECT COUNT(*) FROM known_facts_registry")
 if echo "$OUT" | grep -q "DUPLICATE" && [ "$COUNT" = "1" ]; then
   pass "DUPLICATE reported, still 1 row, exit 0"
 else
@@ -85,7 +91,7 @@ python3 "$CLI" add-watch --title "raw material price" --domain market --directio
 python3 "$CLI" add-focus --topic "Q3 sourcing" --mode deep --days 30 > /dev/null
 python3 "$CLI" log-decision --recommendation "hold" --reasoning "band intact" > /dev/null
 for t in watchlist active_focus decision_log; do
-  N=$(sqlite3 "$INTEL_DB" "SELECT COUNT(*) FROM $t")
+  N=$(sqldb "$INTEL_DB" "SELECT COUNT(*) FROM $t")
   if [ "$N" = "1" ]; then
     pass "$t has 1 row"
   else
@@ -113,8 +119,8 @@ done
 # --- Test 8: expired focus and closed facts drop out of dump ---
 echo ""
 echo "Test 8: lifecycle filtering"
-sqlite3 "$INTEL_DB" "UPDATE known_facts_registry SET status='closed' WHERE id='$ID1'"
-sqlite3 "$INTEL_DB" "UPDATE active_focus SET expires_at=1"
+sqldb "$INTEL_DB" "UPDATE known_facts_registry SET status='closed' WHERE id='$ID1'"
+sqldb "$INTEL_DB" "UPDATE active_focus SET expires_at=1"
 OUT=$(python3 "$CLI" dump)
 if echo "$OUT" | python3 -c "
 import json,sys

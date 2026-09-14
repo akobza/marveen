@@ -10,7 +10,11 @@
 #
 # The script branches on `uname -s`, so a PATH shim fakes uname=Linux (plus
 # systemctl/tmux recorders); the test therefore runs on any host, macOS
-# included. sqlite3 and python3 are the real binaries.
+# included. node and python3 are the real binaries.
+#
+# The database is read through scripts/lib/sqlite-cli.mjs, not the sqlite3 CLI:
+# that binary is not an install dependency, and this file was permanently red
+# because of it (card 252ab361).
 
 set -u
 
@@ -21,14 +25,20 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+sqldb() { node "$REPO/scripts/lib/sqlite-cli.mjs" "$@"; }
 
 # --- throwaway install tree ---------------------------------------------------
 INSTALL="$TMP/install"
-mkdir -p "$INSTALL/scripts" "$INSTALL/store"
+mkdir -p "$INSTALL/scripts/lib" "$INSTALL/store"
 cp "$REPO/scripts/migrate-main-agent-id.sh" "$INSTALL/scripts/"
+# The script under test now reads the DB through this helper, which needs
+# node_modules reachable from its own path. A real install has both; the fixture
+# has to supply them, or node exits with ERR_MODULE_NOT_FOUND (measured).
+cp "$REPO/scripts/lib/sqlite-cli.mjs" "$INSTALL/scripts/lib/"
+ln -sfn "$REPO/node_modules" "$INSTALL/node_modules"
 echo 'BOT_NAME="Test Bot"' > "$INSTALL/.env"
 
-sqlite3 "$INSTALL/store/claudeclaw.db" <<'SQL'
+sqldb "$INSTALL/store/claudeclaw.db" <<'SQL'
 CREATE TABLE memories (agent_id TEXT);
 CREATE TABLE daily_logs (agent_id TEXT);
 CREATE TABLE agent_messages (from_agent TEXT, to_agent TEXT);
@@ -88,7 +98,7 @@ RC=$?
 grep -q '^MAIN_AGENT_ID=test-bot$' "$INSTALL/.env" \
   && pass ".env got MAIN_AGENT_ID=test-bot" || fail ".env got MAIN_AGENT_ID=test-bot"
 
-DB_SLUG=$(sqlite3 "$INSTALL/store/claudeclaw.db" "SELECT assignee FROM kanban_cards")
+DB_SLUG=$(sqldb "$INSTALL/store/claudeclaw.db" "SELECT assignee FROM kanban_cards")
 [ "$DB_SLUG" = "test-bot" ] && pass "DB rows rewritten to the new slug" || fail "DB rows rewritten (got '$DB_SLUG')"
 
 OLD_LEFT=$(find "$UNITS" -maxdepth 1 -name 'marveen-*' | wc -l | tr -d ' ')
@@ -135,7 +145,7 @@ for unit in dashboard.service channels.service morning.service morning.timer hos
 done
 printf '[Unit]\nOnFailure=marveen-notify@%%n.service\n' > "$UNITS/marveen-dashboard.service.d/onfailure.conf"
 printf '[Unit]\nOnFailure=marveen-notify@%%n.service\n' > "$UNITS/marveen-channels.service.d/onfailure.conf"
-sqlite3 "$INSTALL/store/claudeclaw.db" "UPDATE kanban_cards SET assignee='marveen'"
+sqldb "$INSTALL/store/claudeclaw.db" "UPDATE kanban_cards SET assignee='marveen'"
 sed -i.bak '/^MAIN_AGENT_ID=/d' "$INSTALL/.env"
 : > "$LOG"
 
