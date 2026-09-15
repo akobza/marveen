@@ -144,6 +144,33 @@ describe('⛔ VISELKEDESI par a kapu HARMADIK helyere: a kill-ag EL SEM ERHETO (
     expect(jelek).toEqual([])
   })
 
+  // ⛔ A FENTI ESET A HATAST MERI, NEM A BEKOTEST -- es a ketto kulon bizonyitando.
+  // Mert eset (2026-09-15, mutacios kor): kivettem az `assertWebPortUsable()` hivast az
+  // `index.ts` `acquireLock()`-jabol, es a fenti teszt ⛔ ZOLD MARADT. Nem hibas: a teszt
+  // MAGA hivja meg a kaput, tehat azt bizonyitja, hogy HA a kapu a zar ELOTT fut, a kill-ag
+  // elerhetetlen -- azt NEM, hogy az `index.ts` tenylegesen meghivja. Egy viselkedesi teszt
+  // nem latja a hivot, aki abbahagyta a hivast.
+  // Ezert all itt egy MASODIK, FORRAS-szintu allitas: a sorrend a VALODI hivasi helyen.
+  it('⛔ BEKOTES: az index.ts acquireLock()-ja HIVJA a kaput, meg a port-zar ELOTT', () => {
+    const src = readFileSync(join(SRC, 'index.ts'), 'utf8')
+    const i = src.indexOf('function acquireLock')
+    expect(i).toBeGreaterThan(-1)
+    // A regio a fuggveny torzse: a kovetkezo top-level `\nfunction ` / `\nasync function` -ig.
+    const utana = src.slice(i)
+    const veg = utana.search(/\n(?:async )?function /)
+    const torzs = veg > 0 ? utana.slice(0, veg) : utana
+    // ⛔ A KOMMENTEKET KI KELL SZEDNI: a fuggveny 357. soraban egy MAGYARAZO komment
+    // emliti az `acquirePortLock()`-ot -- a kapu ELOTT. Az elso alakom arra illeszkedett,
+    // es a teszt TISZTAN IS piros lett. Egy emlites nem hivas; a horgony maga is minta.
+    const kod = torzs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+    const kapuAt = kod.indexOf('assertWebPortUsable()')
+    const zarAt = kod.indexOf('await acquirePortLock(')
+    expect(kapuAt).toBeGreaterThan(-1)
+    expect(zarAt).toBeGreaterThan(-1)
+    // ⛔ A SORREND a lenyeg: egy kapu a zar UTAN mar nem akadalyozza meg a kill-agat.
+    expect(kapuAt).toBeLessThan(zarAt)
+  })
+
   it('⛔ NEGATIV KONTROLL: ervenyes ertek mellett a kill-ag ELERHETO (kulonben a fenti ures allitas lenne)', async () => {
     vi.resetModules()
     process.env.WEB_PORT = '39876'
