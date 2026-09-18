@@ -3,6 +3,7 @@
 # Run: bash scripts/__tests__/intel-db.test.sh
 
 set -e
+. "$(dirname "$0")/lib/sqlite3-shim.sh"   # sqlite3 CLI nelkul is fusson (252ab361)
 
 PASS=0
 FAIL=0
