@@ -119,9 +119,30 @@ def main():
     if _is_ack(text):
         sys.exit(0)
 
+    # Quiet hours (card 30d968cd; restored 2026-09-22 21:2xZ after the fix was
+    # overwritten): inside the chat's window never block, and do not count the
+    # stop. A message that ARRIVED in a window ages from the window END, so it is
+    # still enforced after the window closes instead of going stale overnight.
+    anchor = created_at
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+        import telegram_quiet_hours as _q
+        _sd = os.environ.get("TELEGRAM_STATE_DIR") or os.path.join(
+            os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), ".claude", "channels", "telegram")
+        if _q.in_quiet(_sd, chat_id):
+            sys.exit(0)
+        if created_at is not None:
+            _end = _q.quiet_window_end(_sd, chat_id, int(created_at))
+            if _end:
+                anchor = _end
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
     # Too old -> don't nag forever (abandoned / deliberately-unanswered message).
     try:
-        if created_at is not None and (int(time.time()) - int(created_at)) > STALE_SECONDS:
+        if anchor is not None and (int(time.time()) - int(anchor)) > STALE_SECONDS:
             sys.exit(0)
     except Exception:
         sys.exit(0)
