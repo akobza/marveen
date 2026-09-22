@@ -150,6 +150,24 @@ ok("NEGATIV KONTROLL: a mero tuzelne a regi alakra",
 pg_src = io.open(os.path.join(HOOKS, "telegram_progress.py"), encoding="utf-8").read()
 ok("a submit-hook sajat konyvtarbol importal",
    "dirname(os.path.abspath(__file__))" in pg_src and "telegram_quiet_hours" in pg_src)
+ok("a submit-hook jelzi a csendes-ellenorzes hibajat", "quiet check failed" in pg_src)
+
+print("\n=== E) A STOP-FALLBACK AG (ez kuldte ki a mai uzenetet) NEM LEHET NEMA")
+# Teszteri talalat, 2026-09-22 (msg 30686): ebben a fajlban a csendes-ellenorzes hibaja
+# TELJESEN nema volt -- meg a masik ketto altalanos logolasa sem volt meg. Ha PONTOSAN a
+# 09-12-i regresszio ismetlodne, ez az egy fajl nyom nelkul maradt volna.
+pc_src = io.open(os.path.join(HOOKS, "telegram_progress_clear.py"), encoding="utf-8").read()
+ok("a Stop-fallback sajat konyvtarbol importal",
+   "dirname(os.path.abspath(__file__))" in pc_src and "telegram_quiet_hours" in pc_src)
+ok("a hianyzo MODULT jelzi", "import telegram_quiet_hours failed" in pc_src)
+ok("a hianyzo/olvashatatlan CONFIGOT jelzi", "config_state" in pc_src and "NOT ENFORCED" in pc_src)
+ok("a futasideju hibat is jelzi", "in_quiet raised" in pc_src)
+# NEGATIV KONTROLL: a regi, NEMA alak nem allhat vissza. A mero arra a pontos alakra tuzel,
+# ami 2026-09-22-ig ott allt: egy csupasz except, ami csak ures halmazt ad es nem naploz.
+nema_alak = "    except Exception:\n        quiet = set()"
+ok("NEGATIV KONTROLL: a regi NEMA alak nincs a fajlban", nema_alak not in pc_src)
+ok("NEGATIV KONTROLL: a mero tuzelne ra (a mintat onmagara probalva)",
+   nema_alak in ("x\n" + nema_alak))
 
 print("\n=> OSSZESEN: %d/%d ZOLD" % (sum(E), len(E)))
 sys.exit(0 if all(E) else 1)
