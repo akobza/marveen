@@ -105,14 +105,19 @@ print("\n=== D) SZERKEZETI: a kapu a KULDES ELOTT all, es nincs tobbe ~/.claude/
 import ast
 wd_src = io.open(os.path.join(HOOKS, "telegram_progress_watchdog.py"), encoding="utf-8").read()
 fa = ast.parse(wd_src)
-kapu_sor = wd_src.index("if _quiet_chats(state_dir, pend):")
-kapu_lineno = wd_src[:kapu_sor].count("\n") + 1
+# A HIANY NEM DOBHAT KIVETELT, HANEM NEVESITETT PIROSAT KELL ADNIA: az elso alak
+# `.index()`-szel dolgozott, es a kapu kivetelekor ValueError-traceback jott, nem bukas --
+# egy crash a jelentesben nem ugyanaz, mint egy piros teszt (merve: 2026-09-22).
+kapu_sor = wd_src.find("if _quiet_chats(state_dir, pend):")
+kapu_lineno = (wd_src[:kapu_sor].count("\n") + 1) if kapu_sor >= 0 else -1
 api_sorok = [n.lineno for n in ast.walk(fa)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "api"]
 handle_dir = [n for n in ast.walk(fa)
               if isinstance(n, (ast.FunctionDef,)) and n.name == "handle_dir"]
 ok("a handle_dir megvan", bool(handle_dir))
-if handle_dir:
+ok("a csendes kapu LETEZIK a watchdogban", kapu_lineno > 0,
+   "HIANYZIK -- a watchdog csendes ablakban is kezbesitene")
+if handle_dir and kapu_lineno > 0:
     hd = handle_dir[0]
     # A kapu minden TARTALMAT KULDO utat elozzon meg. A `deliver()` az EGYETLEN ilyen ut;
     # a delete-only agak nem kuldenek uzenetet. A 24 oras STALE ag torlese SZANDEKOSAN a kapu
