@@ -149,3 +149,52 @@ describe('the default: nothing bound', () => {
     await expect(postAs(handle, 'cloud-bridge', TOKEN)).rejects.toThrow(/prepare/)
   })
 })
+
+// teszter-2 M-1 (msg 32815, report 2026-09-23-32156973-a): the tests above only sent the exact 'cloud-bridge',
+// so they stayed green if the route handed the RAW from to the gate (their M5): the spellings that normalize to the
+// bound id then passed on the shared token. The route hands sanitizeAgentIdent(from); this block pins that.
+describe('the route normalizes the sender before the binding (teszter-2 M-1 / M5)', () => {
+  const ZW = String.fromCharCode(0x200b)
+  const SPELLINGS = ['cloud-bridge', ' cloud-bridge ', '@cloud-bridge.', `cloud-bridge${ZW}`, `cloud${ZW}-bridge`,
+    'Cloud-Bridge', 'CLOUD-BRIDGE', 'cloud-bridge\n', 'cloud_bridge']
+
+  it('refuses every spelling on the shared token; the ones that normalize to the bound id, by the binding', async () => {
+    const { handle } = await loadWith(SENDERS + 'SENDER_DEVICE_KEYS=cloud-bridge:5\n')
+    for (const from of SPELLINGS) {
+      const { status, body } = await postAs(handle, from, TOKEN)
+      expect(status, JSON.stringify(from)).toBe(403)
+      if (sanitizeAgentIdent(from) === 'cloud-bridge') {
+        expect(String(body?.error), JSON.stringify(from)).toMatch(/bound to its own device key/)
+      }
+    }
+  })
+
+  it('CONTROL: a spelling that normalizes to the bound id passes on the bound key', async () => {
+    const { handle } = await loadWith(SENDERS + 'SENDER_DEVICE_KEYS=cloud-bridge:5\n')
+    await expect(postAs(handle, '@cloud-bridge.', dev(5))).rejects.toThrow(/prepare/)
+  })
+})
+
+// teszter-2 M-1 (M6/M7): the startup lines also state the gate's LIMITS. A malformed entry binds nothing and
+// logger.error says so; the SYSTEM_SENDER_IDS left unbound are named in the logger.info line.
+describe('the startup lines say what the gate does NOT cover (teszter-2 M-1 / M6-M7)', () => {
+  it('logs malformed entries as an error and names the unbound SYSTEM_SENDER_IDS', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sender-device-binding-log-'))
+    writeFileSync(join(dir, '.env'), SENDERS + 'SENDER_DEVICE_KEYS=cloud-bridge:5,codex-proxy,x:abc\n')
+    process.env.CLAUDECLAW_ENV_DIR = dir
+    vi.resetModules()
+    const { logger } = await import('../logger.js')
+    const err = vi.spyOn(logger, 'error').mockImplementation(() => undefined as never)
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined as never)
+    try {
+      await import('../web/routes/messages.js')
+      const errCall = err.mock.calls.find((c) => String(c[1] ?? '').includes('SENDER_DEVICE_KEYS'))
+      expect(errCall?.[0]).toEqual({ invalid: ['codex-proxy', 'x:abc'] })
+      const infoCall = info.mock.calls.find((c) => c[1] === 'sender/device-key bindings loaded')
+      expect(infoCall?.[0]).toEqual({ bound: ['cloud-bridge:5'], unboundSystemSenders: ['codex-proxy'] })
+    } finally {
+      err.mockRestore()
+      info.mockRestore()
+    }
+  })
+})
