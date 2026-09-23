@@ -14,6 +14,10 @@ import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildMainSessionRespawnCmd, mainChannelStateEnv } from '../web/channel-monitor.js'
+import { FLEET_OAUTH_TOKEN_PATH } from '../web/agent-process.js'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { execFileSync } from 'node:child_process'
 import { mainConfigDecisionForTest } from '../web/main-config-decision.js'
 import { detectPaneState } from '../pane-state.js'
 
@@ -106,5 +110,41 @@ describe('89c95eaf: a prefixed spinner line reads busy', () => {
       .map((l) => (l.includes('Wibbling') ? 'Note (running late · 5s total) was fine' : l))
       .join('\n')
     expect(detectPaneState(pane)).not.toBe('busy')
+  })
+})
+
+// 89c95eaf, measured 2026-09-23 14:5xZ: the respawned main agent ran on the FLEET token (store/.claude-oauth-token)
+// although .env carries its own CLAUDE_CODE_OAUTH_TOKEN, because the respawn exported the fleet file unconditionally
+// while channels.sh:48-57 reads .env first. These tests RUN the generated shell fragment against temp files.
+describe('89c95eaf: the respawn takes the token from .env first, like channels.sh', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resp-tok-'))
+  const fleet = join(dir, 'fleet-token')
+  writeFileSync(fleet, 'FLEETTOKEN\n')
+  const run = (envFile: string): string => {
+    const cmd = buildMainSessionRespawnCmd({ ...OPTS, config: mainConfigDecisionForTest({ fleetToken: true }), envFile })
+    const fragment = cmd.split(' && claude ')[0].split(FLEET_OAUTH_TOKEN_PATH).join(fleet)
+    return execFileSync('bash', ['-c', `${fragment} && printf %s "$CLAUDE_CODE_OAUTH_TOKEN"`], { encoding: 'utf8' })
+  }
+
+  it('.env has the line -> the .env token wins over the fleet file', () => {
+    const env = join(dir, 'with.env')
+    writeFileSync(env, 'FOO=1\nCLAUDE_CODE_OAUTH_TOKEN=OWNTOKEN\nBAR=2\n')
+    expect(run(env)).toBe('OWNTOKEN')
+  })
+
+  it('.env without the line -> the fleet file is the fallback', () => {
+    const env = join(dir, 'without.env')
+    writeFileSync(env, 'FOO=1\n')
+    expect(run(env)).toBe('FLEETTOKEN')
+  })
+
+  it('no .env at all -> the fleet file is the fallback', () => {
+    expect(run(join(dir, 'missing.env'))).toBe('FLEETTOKEN')
+  })
+
+  it('the token value never appears in the command text (read at launch)', () => {
+    const cmd = buildMainSessionRespawnCmd({ ...OPTS, config: mainConfigDecisionForTest({ fleetToken: true }), envFile: join(dir, 'with.env') })
+    expect(cmd).not.toContain('OWNTOKEN')
+    expect(cmd).not.toContain('FLEETTOKEN')
   })
 })
