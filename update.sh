@@ -347,6 +347,92 @@ fi
 # the upstream change conflicts with the stash, we drop the stash and
 # emit a warning so the operator does not lose work silently -- the
 # stash entry is also kept in `git stash list` for manual recovery.
+# ---------------------------------------------------------------------------
+# Auto-stash safety.
+#
+# `git stash push -u` writes the untracked files into the new entry FIRST and
+# only then deletes them from the working tree. If a single deletion fails, git
+# returns an error with the entry already written and most untracked files
+# already gone -- and it does not get as far as resetting the tracked changes
+# (measured on git 2.53). Exiting at that point leaves the working tree emptied
+# of its untracked files, with the only copy inside the stash entry.
+#
+# Two layers, and both are needed:
+#   (a) a GATE before the stash proves that every path the stash would remove
+#       is removable, and stops loudly with the tree untouched if not;
+#   (b) a NET after a failed stash restores the untracked files from the new
+#       entry's third parent without overwriting anything, keeps the entry,
+#       and exits loudly. The gate only knows today's cause; the net protects
+#       the invariant (the tree after == the tree before) whatever the cause.
+# ---------------------------------------------------------------------------
+
+# Prints every path `git stash push -u` would remove but the running user
+# cannot delete, one per line.
+# Exit: 0 = all removable, 1 = at least one is not, 2 = could not measure.
+#
+# Deletability is a property of the PARENT directory: it needs write and
+# search permission, and under a sticky parent the path must also be owned by
+# us (or the parent must be, or we are root). It is NOT the path's own owner or
+# mode: another user's file in a writable directory is removable, and our own
+# file in a read-only directory is not.
+# Directories count as well: once its files are gone, git removes an untracked
+# directory itself, and that fails when ITS parent is not writable (measured).
+autostash_undeletable_paths() {
+  local list dirs p parent last_parent="" last_ok=0 uid found=0
+  uid=$(id -u)
+  list=$(mktemp "${TMPDIR:-/tmp}/marveen-autostash.XXXXXX") || return 2
+  dirs=$(mktemp "${TMPDIR:-/tmp}/marveen-autostash.XXXXXX") || { rm -f "$list"; return 2; }
+  # A failure to LIST is not an empty list: stop instead of passing.
+  if ! git ls-files --others --exclude-standard -z > "$list" \
+     || ! git ls-files --others --exclude-standard --directory -z > "$dirs"; then
+    rm -f "$list" "$dirs"; return 2
+  fi
+  # Every directory inside an untracked directory is removed too, so its
+  # parent has to be writable as well. "./" keeps a leading "-" from being
+  # read as an option by find.
+  while IFS= read -r -d '' p; do
+    case "$p" in */) ;; *) continue ;; esac
+    if ! find "./${p%/}" -type d -print0 >> "$list"; then rm -f "$list" "$dirs"; return 2; fi
+  done < "$dirs"
+  while IFS= read -r -d '' p; do
+    case "$p" in */*) parent="${p%/*}" ;; *) parent="." ;; esac
+    if [ "$parent" != "$last_parent" ]; then
+      last_parent="$parent"
+      if [ -w "$parent" ] && [ -x "$parent" ]; then last_ok=1; else last_ok=0; fi
+    fi
+    if [ "$last_ok" = 1 ] && { [ ! -k "$parent" ] || [ "$uid" = 0 ] || [ -O "$p" ] || [ -O "$parent" ]; }; then
+      continue
+    fi
+    printf '%s\n' "$p"
+    found=1
+  done < "$list"
+  rm -f "$list" "$dirs"
+  if [ "$found" = 0 ]; then return 0; fi
+  return 1
+}
+
+# Restores the untracked files of stash entry $1 (its third parent) into the
+# working tree WITHOUT overwriting anything present now, and never pops or
+# drops the entry. Then MEASURES the result instead of trusting exit codes.
+# Exit: 0 = every path of the entry exists again, 1 = something is missing.
+autostash_restore_untracked() {
+  local st="$1" names f missing=0 keep="--skip-old-files"
+  git rev-parse -q --verify "${st}^3" >/dev/null 2>&1 || return 1
+  # GNU tar skips existing files silently with --skip-old-files; BSD tar does
+  # the same with -k. Only the GNU branch is exercised on a Linux host.
+  tar --version 2>/dev/null | grep -q "GNU tar" || keep="-k"
+  git archive --format=tar "${st}^3" | tar -x "$keep" -f - || true
+  names=$(mktemp "${TMPDIR:-/tmp}/marveen-autostash.XXXXXX") || return 1
+  if ! git ls-tree -r -z --name-only "${st}^3" > "$names"; then rm -f "$names"; return 1; fi
+  while IFS= read -r -d '' f; do
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then missing=$((missing + 1)); fi
+  done < "$names"
+  rm -f "$names"
+  AUTOSTASH_RESTORE_MISSING=$missing
+  if [ "$missing" = 0 ]; then return 0; fi
+  return 1
+}
+
 STASHED_AUTO=0
 # HEARTBEAT.md is rewritten by the agent every heartbeat tick (self-modifying).
 # Exclude it from the dirty check; the preflight ignores it too. It will be
@@ -354,12 +440,49 @@ STASHED_AUTO=0
 DIRTY=$(git status --porcelain --untracked-files=no | grep -vE ' HEARTBEAT\.md$' | head -n 1)
 if [ -n "$DIRTY" ]; then
   if [ "${AUTO_STASH:-0}" = "1" ]; then
-    echo -e "  Lokalis valtozasok stash-elve (auto-stash)..."
-    if ! git stash push -u -m "marveen-update-auto-stash $(date +%Y%m%d-%H%M%S)"; then
-      if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
-        echo -e "${RED}ERROR:${NC} Auto-stash failed. Check: git status"
+    # (a) GATE, before anything is touched. `set -e` is on, so the status of the
+    # substitution is caught explicitly -- otherwise a non-zero return would end
+    # the script right here, before the loud message.
+    AUTOSTASH_GATE_RC=0
+    AUTOSTASH_UNDELETABLE=$(autostash_undeletable_paths) || AUTOSTASH_GATE_RC=$?
+    if [ "$AUTOSTASH_GATE_RC" != 0 ]; then
+      if [ "$AUTOSTASH_GATE_RC" = 1 ]; then
+        RESULT_MSG="Auto-stash megallitva a stash ELOTT: $(printf '%s\n' "$AUTOSTASH_UNDELETABLE" | wc -l | tr -d ' ') nem kovetett ut nem torolheto a futo felhasznalonak (a szulo-konyvtar nem irhato). A munkafa ERINTETLEN, stash nem keszult. Elso: $(printf '%s\n' "$AUTOSTASH_UNDELETABLE" | head -n 1)"
       else
-        echo -e "${RED}HIBA:${NC} Auto-stash sikertelen. Nézd meg: git status"
+        RESULT_MSG="Auto-stash megallitva a stash ELOTT: a nem kovetett fajlok torolhetosege nem volt merheto. A munkafa ERINTETLEN, stash nem keszult."
+      fi
+      if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+        echo -e "${RED}ERROR:${NC} Auto-stash refused BEFORE stashing: some untracked paths cannot be removed by this user (their parent directory is not writable). The working tree is untouched."
+      else
+        echo -e "${RED}HIBA:${NC} Az auto-stash a stash ELŐTT megállt: néhány nem követett útvonalat a futó felhasználó nem tud törölni (a szülő-könyvtár nem írható). A munkafa érintetlen."
+      fi
+      if [ -n "$AUTOSTASH_UNDELETABLE" ]; then printf '%s\n' "$AUTOSTASH_UNDELETABLE" | head -n 20 | sed 's/^/         /'; fi
+      exit 3
+    fi
+    echo -e "  Lokalis valtozasok stash-elve (auto-stash)..."
+    AUTOSTASH_TOP_BEFORE=$(git rev-parse -q --verify refs/stash 2>/dev/null || true)
+    if ! git stash push -u -m "marveen-update-auto-stash $(date +%Y%m%d-%H%M%S)"; then
+      AUTOSTASH_TOP_AFTER=$(git rev-parse -q --verify refs/stash 2>/dev/null || true)
+      AUTOSTASH_RESTORE_MISSING=""
+      if [ -n "$AUTOSTASH_TOP_AFTER" ] && [ "$AUTOSTASH_TOP_AFTER" != "$AUTOSTASH_TOP_BEFORE" ]; then
+        # (b) NET: an entry was written, so untracked files may already be gone.
+        if autostash_restore_untracked "$AUTOSTASH_TOP_AFTER"; then
+          RESULT_MSG="Auto-stash sikertelen, DE a mar torolt nem kovetett fajlok visszaallitva a stash-bol, feluliras nelkul. A stash-bejegyzes MEGMARADT: ${AUTOSTASH_TOP_AFTER}. Nezd: git stash list"
+        else
+          RESULT_MSG="Auto-stash sikertelen, es a nem kovetett fajlok visszaallitasa NEM teljes (hianyzik: ${AUTOSTASH_RESTORE_MISSING:-ismeretlen}). A stash-bejegyzes MEGMARADT: ${AUTOSTASH_TOP_AFTER}. Kezi visszaallitas feluliras nelkul: git archive ${AUTOSTASH_TOP_AFTER}^3 | tar -x --skip-old-files"
+        fi
+        # The tracked changes are normally still in the tree (git stops before
+        # resetting them). If they are not, say so: the entry is their only copy.
+        if git diff --quiet HEAD -- 2>/dev/null && ! git diff --quiet "${AUTOSTASH_TOP_AFTER}^1" "${AUTOSTASH_TOP_AFTER}" -- 2>/dev/null; then
+          RESULT_MSG="${RESULT_MSG} FIGYELEM: a kovetett modositasok a munkafabol eltuntek, csak a stash-ben vannak: git stash apply ${AUTOSTASH_TOP_AFTER}"
+        fi
+      else
+        RESULT_MSG="Auto-stash sikertelen; uj stash-bejegyzes nem keletkezett, a munkafa nem valtozott."
+      fi
+      if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+        echo -e "${RED}ERROR:${NC} Auto-stash failed. ${RESULT_MSG}"
+      else
+        echo -e "${RED}HIBA:${NC} Auto-stash sikertelen. ${RESULT_MSG}"
       fi
       exit 3
     fi
