@@ -13,6 +13,22 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 STORE="$REPO/store"
+
+# Checksum tool, resolved ONCE and never assumed. sha256sum is GNU coreutils and
+# does not exist on macOS, where the same job is `shasum -a 256`. This repo has
+# learned that twice already -- limit-monitor.sh carries a comment about a bare
+# md5sum returning an EMPTY hash there, and github-pr-monitor.sh one about BSD
+# grep having no -P -- and this script still shipped the third instance: every
+# manifest line here was written with an empty checksum on a mac while the run
+# reported success. Empty is the dangerous shape, not absent: a manifest full of
+# blank sums still looks like a manifest.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  SHA_CMD=""
+fi
 BKDIR="$STORE/backups"
 KEEP=10
 LABEL="${1:-manual}"
@@ -96,6 +112,7 @@ mkdir -p "$PERSONAL_DIR"
 : > "$PERSONAL_DIR/MANIFEST.txt"
 PERSONAL_MISSING=0
 PERSONAL_SAVED=0
+PERSONAL_NOSUM=0
 
 if [ -f "$PERSONAL_LIST" ]; then
   PERSONAL_FILES="$(grep -vE '^\s*(#|$)' "$PERSONAL_LIST")"
@@ -108,7 +125,17 @@ for rel in $PERSONAL_FILES; do
   if [ -f "$REPO/$rel" ]; then
     mkdir -p "$PERSONAL_DIR/$(dirname "$rel")"
     cp -p "$REPO/$rel" "$PERSONAL_DIR/$rel" 2>/dev/null
-    printf '%s  %s\n' "$(sha256sum "$REPO/$rel" | cut -d' ' -f1)" "$rel" >> "$PERSONAL_DIR/MANIFEST.txt"
+    sum=""
+    [ -n "$SHA_CMD" ] && sum="$($SHA_CMD "$REPO/$rel" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$sum" ]; then
+      printf '%s  %s\n' "$sum" "$rel" >> "$PERSONAL_DIR/MANIFEST.txt"
+    else
+      # The copy is safe; only the drift check is lost. Say WHICH, in the file
+      # itself: a blank checksum column reads as a manifest, an explicit NOSUM
+      # does not.
+      printf 'NOSUM  %s\n' "$rel" >> "$PERSONAL_DIR/MANIFEST.txt"
+      PERSONAL_NOSUM=$((PERSONAL_NOSUM + 1))
+    fi
     PERSONAL_SAVED=$((PERSONAL_SAVED + 1))
   else
     # Only reachable via an explicit list: a named file that is already gone is
@@ -122,6 +149,13 @@ if [ "$PERSONAL_MISSING" -gt 0 ]; then
 else
   echo "  personal-scripts: $PERSONAL_SAVED saved + manifest"
 fi
+if [ "$PERSONAL_NOSUM" -gt 0 ]; then
+  if [ -z "$SHA_CMD" ]; then
+    echo "  personal-scripts: WARNING no checksum tool found (neither sha256sum nor shasum) -- $PERSONAL_NOSUM path(s) recorded as NOSUM"
+  else
+    echo "  personal-scripts: WARNING $PERSONAL_NOSUM path(s) could not be checksummed with '$SHA_CMD' -- recorded as NOSUM"
+  fi
+fi
 
 # Code rollback reference (the code itself lives in git).
 git -C "$REPO" rev-parse HEAD          > "$DEST/git-HEAD.txt"    2>/dev/null
@@ -134,22 +168,29 @@ if [ -d "$BKDIR" ]; then
   done
 fi
 
-# Manifest for the WHOLE snapshot: one line per file with size and sha256.
+# Manifest for the WHOLE snapshot: one line per file with sha256, size and path.
 # Without it, "does this backup contain the database?" is a directory walk and a
 # judgement call; with it, it is one grep. That question is not hypothetical: the
 # defect this script just stopped having produced exactly that situation, and the
 # only way to answer it for an OLD backup is a record written at the time.
+# Portable for the same reason as the personal-scripts manifest above: the sum
+# goes through $SHA_CMD and is written as NOSUM when no tool exists (never as an
+# empty column), the size through `wc -c`, and the listing through plain find and
+# sed, because `find -printf` and `stat -c` are GNU-only as well.
 MANIFEST="$DEST/MANIFEST.sha256"
 (
   cd "$DEST" || exit 1
-  find . -type f ! -name 'MANIFEST.sha256' -printf '%P\n' 2>/dev/null | LC_ALL=C sort | while read -r rel; do
-    printf '%s  %s  %s\n' "$(sha256sum "$rel" | cut -d' ' -f1)" "$(stat -c %s "$rel")" "$rel"
+  find . -type f ! -name 'MANIFEST.sha256' 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort | while read -r rel; do
+    sum=""
+    [ -n "$SHA_CMD" ] && sum="$($SHA_CMD "$rel" 2>/dev/null | cut -d' ' -f1)"
+    printf '%s  %s  %s\n' "${sum:-NOSUM}" "$(wc -c < "$rel" | tr -d ' ')" "$rel"
   done
 ) > "$MANIFEST"
+SNAPSHOT_NOSUM="$(grep -c '^NOSUM  ' "$MANIFEST" || true)"
 
 # The database is the reason this script exists, so its presence is asserted, not
 # assumed: a manifest that silently lacks it would be the same quiet failure in a
-# new place.
+# new place. A NOSUM line still lists it: that case is the lighter one below.
 if [ -f "$STORE/claudeclaw.db" ] && ! grep -q '  claudeclaw\.db$' "$MANIFEST"; then
   echo "pre-modify-backup: FATAL -- the manifest does not list claudeclaw.db." >&2
   mv "$DEST" "${DEST}-INCOMPLETE" 2>/dev/null
@@ -157,5 +198,21 @@ if [ -f "$STORE/claudeclaw.db" ] && ! grep -q '  claudeclaw\.db$' "$MANIFEST"; t
 fi
 
 SIZE="$(du -sh "$DEST" 2>/dev/null | cut -f1)"
-echo "  manifest: $(wc -l < "$MANIFEST") file(s) listed with size + sha256"
+echo "  manifest: $(wc -l < "$MANIFEST" | tr -d ' ') file(s) listed with sha256 + size"
+
+# TWO events of different weight, kept apart. The snapshot above either happened
+# or did not; the manifest is what makes a LATER comparison possible. A missing
+# checksum must not throw away a good snapshot -- but it must not be reported as
+# a clean run either, and until now it was: the run printed 18 "command not
+# found" lines to stderr, then "backup ok" and exit 0. A scheduled caller reads
+# the exit code, not the stderr, so every round would have looked perfect while
+# the drift check quietly did not exist. Both manifests count: a snapshot file
+# without a sum is the same lost drift check as a personal script without one.
+if [ "$PERSONAL_NOSUM" -gt 0 ] || [ "$SNAPSHOT_NOSUM" -gt 0 ]; then
+  echo "backup INCOMPLETE: $DEST ($SIZE, retain newest $KEEP)"
+  echo "  the snapshot IS written, but $((PERSONAL_NOSUM + SNAPSHOT_NOSUM)) manifest path(s) carry NO checksum:"
+  echo "  the post-update comparison can only prove EXISTENCE for those, not content."
+  exit 3
+fi
 echo "backup ok: $DEST ($SIZE, retain newest $KEEP)"
+exit 0
