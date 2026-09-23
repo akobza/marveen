@@ -175,6 +175,49 @@ export function parseSystemSenderIds(raw: string | undefined, normalize: (s: str
   )
 }
 
+// Sender -> device-key binding (32156973, 2026-09-23). SYSTEM_SENDER_IDS above
+// only exempts an id from the known-agent check; any credential may then claim
+// it, the shared dashboard token included, and every sub-agent can read that
+// token. A binding makes the KEY the proof of the sender (the HANGCSATORNA918
+// device lane, made per sender): a bound sender is accepted on /api/messages
+// only from one of its own device keys, and a bound key may write only as its
+// own sender. Comma-separated `sender:deviceKeyId` pairs in .env, e.g.
+//   SENDER_DEVICE_KEYS=cloud-bridge:5
+// A sender may list several keys (rotation overlap). An unlisted sender is
+// unchanged, which is what lets the gate be switched on sender by sender: a
+// sender whose client has no key of its own yet must stay unlisted, or its
+// channel is cut. Empty by default. Read at module load -- a change needs a
+// dashboard restart.
+export const SENDER_DEVICE_KEYS = env['SENDER_DEVICE_KEYS'] ?? ''
+
+// Pure parse rule for SENDER_DEVICE_KEYS. Senders are normalized with the SAME
+// function the route matches on (see parseSystemSenderIds). A malformed entry
+// is NOT dropped silently: it is returned in `invalid`, so the loader can say
+// so -- a typo here would otherwise leave a sender ungated without a word.
+export function parseSenderDeviceKeys(
+  raw: string | undefined,
+  normalize: (s: string) => string,
+): { bindings: Map<string, Set<number>>; invalid: string[] } {
+  const bindings = new Map<string, Set<number>>()
+  const invalid: string[] = []
+  for (const part of (raw ?? '').split(',')) {
+    const entry = part.trim()
+    if (!entry) continue
+    const at = entry.lastIndexOf(':')
+    const sender = at > 0 ? normalize(entry.slice(0, at).trim()) : ''
+    const idText = at > 0 ? entry.slice(at + 1).trim() : ''
+    const id = /^[0-9]+$/.test(idText) ? Number(idText) : NaN
+    if (!sender || !Number.isSafeInteger(id) || id <= 0) {
+      invalid.push(entry)
+      continue
+    }
+    const ids = bindings.get(sender) ?? new Set<number>()
+    ids.add(id)
+    bindings.set(sender, ids)
+  }
+  return { bindings, invalid }
+}
+
 // Pure resolution rule for BRAND_NAME, so the default (brandEnv unset =>
 // botName) is provable without a live .env. brandEnv is the raw env value
 // (undefined / empty when unset). Mirrors the `env['BRAND_NAME'] ?? BOT_NAME`

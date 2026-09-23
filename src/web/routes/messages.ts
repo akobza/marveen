@@ -14,7 +14,8 @@ import { COORDINATOR_AGENT_ID, VOICE_CHANNEL_AGENT_ID } from '../../channel-coor
 import { SYSTEM_DIRECTIVE_SENDER } from '../system-directive.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { isKnownAgent } from '../agent-config.js'
-import { MAIN_AGENT_ID, OWNER_NAME, SYSTEM_SENDER_IDS, parseSystemSenderIds } from '../../config.js'
+import { MAIN_AGENT_ID, OWNER_NAME, SYSTEM_SENDER_IDS, parseSystemSenderIds, SENDER_DEVICE_KEYS, parseSenderDeviceKeys } from '../../config.js'
+import { senderDeviceKeyDenial } from '../sender-device-binding.js'
 import { isAgentRunning } from '../agent-process.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
@@ -50,6 +51,24 @@ export function shouldNotifyDelegator(fromAgent: string, toAgent: string, conten
 
 // Frozen at module load, like the config constant it derives from.
 const SYSTEM_SENDERS = parseSystemSenderIds(SYSTEM_SENDER_IDS, sanitizeAgentIdent)
+
+// Frozen at module load too (32156973). Said out loud at startup, both halves: a malformed
+// entry binds nothing, and a SYSTEM_SENDERS id without a binding is still claimable with
+// the shared token -- an operator must be able to see which senders the gate does NOT cover.
+const SENDER_DEVICE_BINDINGS = (() => {
+  const { bindings, invalid } = parseSenderDeviceKeys(SENDER_DEVICE_KEYS, sanitizeAgentIdent)
+  if (invalid.length) {
+    logger.error({ invalid }, 'SENDER_DEVICE_KEYS has malformed entries (expected <sender>:<device key id>) -- they bind NOTHING')
+  }
+  logger.info(
+    {
+      bound: [...bindings].map(([sender, ids]) => `${sender}:${[...ids].join('|')}`),
+      unboundSystemSenders: [...SYSTEM_SENDERS].filter((sender) => !bindings.has(sender)),
+    },
+    'sender/device-key bindings loaded',
+  )
+  return bindings
+})()
 
 /**
  * How much of a `result` travels inside the completion notification, and what the recipient
@@ -192,6 +211,19 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
         'Rejected /api/messages POST as voice channel without a device key',
       )
       json(res, { error: `from '${VOICE_CHANNEL_AGENT_ID}' requires an enrolled device key, not the shared dashboard token` }, 403)
+      return true
+    }
+    // Sender -> device-key binding (32156973): the device lane above, made PER SENDER.
+    // SYSTEM_SENDER_IDS lets an external notifier past the known-agent check, but then any
+    // credential may claim it -- the shared token too. A bound sender needs its own key, and a
+    // bound key may speak only as its sender (sender-device-binding.ts). Unbound: unchanged.
+    const bindingDenial = senderDeviceKeyDenial(sanitizeAgentIdent(from), ctx.auth, SENDER_DEVICE_BINDINGS)
+    if (bindingDenial) {
+      logger.warn(
+        { from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none', deviceId: ctx.auth?.deviceId },
+        'Rejected /api/messages POST by the sender/device-key binding',
+      )
+      json(res, { error: bindingDenial }, 403)
       return true
     }
     // Federation spoof guard: a slash-qualified from ("teodor/teodor") is the
