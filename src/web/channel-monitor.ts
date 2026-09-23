@@ -53,7 +53,7 @@ import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { recordChannelEvent } from './channel-event-log.js'
 import { notifyChannel } from '../notify.js'
 import { sendRoutineAlert } from './routine-alert.js'
-import { getProvider, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
+import { getProvider, channelStateDir, channelStateDirEnvVar, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
 import {
@@ -782,7 +782,24 @@ export function buildMainSessionRespawnCmd(opts: {
    * non-primary channel after a recovery respawn -- see that helper's comment.
    */
   extraPluginIds?: string[]
+  /**
+   * The channel plugin's state dir, exported as <PROVIDER>_STATE_DIR -- parity
+   * with channels.sh:878-879 (`export "$STATE_ENV_VAR"="$MAIN_CHAN_DIR"`).
+   * Build it with mainChannelStateEnv(). 89c95eaf, measured 2026-09-23 12:52Z:
+   * without it the respawned plugin falls back to the legacy
+   * ~/.claude/channels/<provider>, which the #915 migration emptied, logs
+   * "TELEGRAM_BOT_TOKEN required" and exits without writing bot.pid; the
+   * channels.sh watchdog then waits its 180 s grace and restarts the whole
+   * session a second time (~4 minutes of channel silence).
+   */
+  channelStateEnv?: { envVar: string; dir: string }
 }): string {
+  const stateEnv = opts.channelStateEnv
+  // The var name is spliced into shell text unquoted, so only a plain
+  // upper-case identifier is accepted; the dir is one inert quoted word.
+  const stateExport = stateEnv && /^[A-Z][A-Z0-9_]*$/.test(stateEnv.envVar) && stateEnv.dir
+    ? [`&& export ${stateEnv.envVar}=${shSingleQuote(stateEnv.dir)}`]
+    : []
   return [
     'export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"',
     // MCP startup-batch tuning (parity with channels.sh + startAgentProcess):
@@ -794,6 +811,7 @@ export function buildMainSessionRespawnCmd(opts: {
     // env as the channels.sh boot path, else a recovery respawn comes up
     // un-tuned and can re-starve under load.
     '&& export MCP_SERVER_CONNECTION_BATCH_SIZE=10 MCP_CONNECTION_NONBLOCKING=1 MCP_TIMEOUT=60000',
+    ...stateExport,
     // macOS main-agent config isolation -- parity with channels.sh CFG_ENV. The
     // token is read at launch via $(cat) so the secret never lands in argv/`ps`.
     // An own-credential dir (explicit or a rotated claude-plans entry) gets NO
@@ -818,6 +836,13 @@ export function buildMainSessionRespawnCmd(opts: {
     ...(opts.model ? ['--model', shSingleQuote(opts.model)] : []),
     [`--channels plugin:${opts.pluginId}`, ...(opts.extraPluginIds ?? []).map((p) => `plugin:${p}`)].join(' '),
   ].join(' ')
+}
+
+/** The main agent's channel state export for buildMainSessionRespawnCmd: the same
+ *  <install>/.claude/channels/<provider> dir channels.sh exports (channelStateDir
+ *  resolves it the way the plugin, its hooks and this server read it). */
+export function mainChannelStateEnv(providerType: ChannelProviderType): { envVar: string; dir: string } {
+  return { envVar: channelStateDirEnvVar(providerType), dir: channelStateDir(providerType) }
 }
 
 // FRESH respawn of the main channels session, for hosts with no launchd.
@@ -858,6 +883,7 @@ export function respawnMainSessionFresh(): void {
     // point of the nightly restart (drop the accumulated context).
     continueSession: false,
     config: resolveMainConfigDecision(),
+    channelStateEnv: mainChannelStateEnv(provider.type),
   })
   execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
   // Stamp IMMEDIATELY after the respawn, before the scheduling follow-ups.
@@ -929,6 +955,7 @@ export async function resumeMarveenSession(): Promise<boolean> {
       // rotating Keychain and 401s. Returns null when isolation is off/no token,
       // preserving the prior shared-root behaviour.
       config: resolveMainConfigDecision(),
+      channelStateEnv: mainChannelStateEnv(provider.type),
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
 
@@ -1186,6 +1213,7 @@ function respawnMarveenSessionFresh(): boolean {
       // respawn also skips channels.sh, so it must carry the isolated config
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
       config: resolveMainConfigDecision(),
+      channelStateEnv: mainChannelStateEnv(provider.type),
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
