@@ -83,13 +83,14 @@ def resolve_root(explicit):
 
 
 def load_identifiers(root):
-    """Union of every allowFrom[] and every principals{} key. Returns (ids, report_lines).
+    """Union of every allowFrom[] and every principals{} key.
+    Returns (ids, report_lines, source_count, unreadable_sources).
 
     Each channel-owning agent keeps its OWN access.json, so a single hardcoded path is not
     enough: an id paired on a sub-agent channel but not yet in principals.json would be
     invisible, and the scan would pass while the id sits in the diff.
     """
-    report, ids = [], set()
+    report, ids, unreadable = [], set(), []
     pattern = os.path.join(root, "**", ".claude", "channels", "*", "access.json")
     sources = sorted(glob.glob(pattern, recursive=True))
     for path in sources:
@@ -97,6 +98,7 @@ def load_identifiers(root):
             data = json.load(io.open(path, encoding="utf-8"))
         except Exception as exc:
             report.append("  UNREADABLE %s (%s)" % (os.path.relpath(path, root), type(exc).__name__))
+            unreadable.append(os.path.relpath(path, root))
             continue
         allow = [str(x).strip() for x in (data.get("allowFrom") or []) if str(x).strip()]
         ids |= set(allow)
@@ -109,9 +111,11 @@ def load_identifiers(root):
         ids |= set(keys)
         report.append("  %-58s principals: %d" % ("store/principals.json", len(keys)))
     except Exception as exc:
+        # A MISSING principals.json is unreadable too: it is a required source, not an optional one.
         report.append("  UNREADABLE store/principals.json (%s)" % type(exc).__name__)
+        unreadable.append("store/principals.json")
 
-    return ids, report, len(sources)
+    return ids, report, len(sources), unreadable
 
 
 def build_matcher(ids):
@@ -171,7 +175,7 @@ def main():
     args = ap.parse_args()
 
     root, tried = resolve_root(args.root)
-    ids, report, source_count = load_identifiers(root)
+    ids, report, source_count, unreadable = load_identifiers(root)
     if len(tried) > 1:
         print("root resolution: %s" % " -> ".join(tried))
     print("identifier sources under %s" % root)
@@ -180,6 +184,11 @@ def main():
     if source_count == 0:
         unmeasured("no access.json found under %s (tried: %s) -- wrong root, or the "
                    "configuration moved" % (root, ", ".join(tried)))
+    if unreadable:
+        # A PARTIAL list is as dangerous as an empty one: the ids of the unreadable source are unknown, so a
+        # diff carrying one of them would come back "clean" (tester verdict 31718 / 16721 on 3646faec).
+        unmeasured("unreadable identifier source(s): %s -- the list is partial, its missing ids would "
+                   "pass as clean" % ", ".join(unreadable))
     if not ids:
         unmeasured("the identifier list is empty -- every scan would pass vacuously")
     print("  => %d distinct identifiers (values are never printed)\n" % len(ids))

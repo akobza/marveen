@@ -35,7 +35,7 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 
 def make_root(tmp: str, *, allow_main=None, allow_sub=None, principals=None,
-              corrupt=False) -> str:
+              corrupt=False, principals_corrupt=False) -> str:
     root = Path(tmp)
     main = root / ".claude" / "channels" / "telegram"
     sub = root / "agents" / "sub" / ".claude" / "channels" / "telegram"
@@ -48,7 +48,9 @@ def make_root(tmp: str, *, allow_main=None, allow_sub=None, principals=None,
         (main / "access.json").write_text(json.dumps({"allowFrom": allow_main}), encoding="utf-8")
     if allow_sub is not None:
         (sub / "access.json").write_text(json.dumps({"allowFrom": allow_sub}), encoding="utf-8")
-    if principals is not None:
+    if principals_corrupt:
+        (store / "principals.json").write_text("{ not json either", encoding="utf-8")
+    elif principals is not None:
         (store / "principals.json").write_text(json.dumps({"principals": principals}),
                                                encoding="utf-8")
     return str(root)
@@ -161,6 +163,29 @@ def main() -> int:
         rc2, out2 = run(only_sub, DIFF_HIT)
         check("CONTROL: without that source it is NOT found (so F proves the union)",
               "*******003" not in out2, "rc=%d" % rc2)
+
+    print("\nG) a PARTIAL configuration error is UNMEASURED, not clean (tester verdict 31718 / 16721)")
+    # 9990000004 is known ONLY to principals.json; 9990000002 ONLY to the main access.json
+    diff_p = DIFF_HIT.replace("9990000002", "9990000004").replace("9990000003", "9990000004")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(tmp, allow_main=[FIXTURE_IDS[0]], allow_sub=[FIXTURE_IDS[2]])   # principals.json MISSING
+        rc, out = run(root, diff_p)
+        check("principals.json MISSING -> exit 2, not clean", rc == 2 and "clean:" not in out, "rc=%d" % rc)
+        check("the missing source is named", "store/principals.json" in out and "UNMEASURED" in out)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(tmp, allow_main=[FIXTURE_IDS[0]], allow_sub=[FIXTURE_IDS[2]], principals_corrupt=True)
+        rc, out = run(root, diff_p)
+        check("principals.json CORRUPT -> exit 2, not clean", rc == 2 and "clean:" not in out, "rc=%d" % rc)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(tmp, corrupt=True, allow_sub=[FIXTURE_IDS[2]], principals={FIXTURE_IDS[3]: "staff"})
+        rc, out = run(root, DIFF_HIT.replace("9990000003", "9990000002"))   # the id lives only in the broken main
+        check("one of two access.json CORRUPT -> exit 2, not clean", rc == 2 and "clean:" not in out, "rc=%d" % rc)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(tmp, allow_main=[FIXTURE_IDS[0]], allow_sub=[FIXTURE_IDS[2]],
+                         principals={FIXTURE_IDS[3]: "staff"})
+        rc, out = run(root, diff_p)
+        check("CONTROL: every source readable -> the principals-only id IS found (exit 1)",
+              rc == 1 and "*******004" in out, "rc=%d" % rc)
 
     total = len(RESULTS)
     print("\n=> %d/%d ok" % (sum(RESULTS), total))
