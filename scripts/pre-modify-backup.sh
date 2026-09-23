@@ -31,6 +31,7 @@ else
 fi
 BKDIR="$STORE/backups"
 KEEP=10
+KEEP_INCOMPLETE=3
 LABEL="${1:-manual}"
 TS="$(date +%Y%m%d-%H%M%S)"
 DEST="$BKDIR/${TS}-${LABEL}"
@@ -161,13 +162,6 @@ fi
 git -C "$REPO" rev-parse HEAD          > "$DEST/git-HEAD.txt"    2>/dev/null
 git -C "$REPO" branch --show-current   > "$DEST/git-branch.txt"  2>/dev/null
 
-# Rotate: keep the newest $KEEP snapshot dirs, remove older ones.
-if [ -d "$BKDIR" ]; then
-  ls -1dt "$BKDIR"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
-    rm -rf "$old" && echo "  pruned old snapshot: $(basename "$old")"
-  done
-fi
-
 # Manifest for the WHOLE snapshot: one line per file with sha256, size and path.
 # Without it, "does this backup contain the database?" is a directory walk and a
 # judgement call; with it, it is one grep. That question is not hypothetical: the
@@ -195,6 +189,21 @@ if [ -f "$STORE/claudeclaw.db" ] && ! grep -q '  claudeclaw\.db$' "$MANIFEST"; t
   echo "pre-modify-backup: FATAL -- the manifest does not list claudeclaw.db." >&2
   mv "$DEST" "${DEST}-INCOMPLETE" 2>/dev/null
   exit 1
+fi
+
+# Rotate only here, once this run has produced a usable snapshot: a run that failed
+# above has already exited without pruning anything. The newest $KEEP USABLE
+# snapshots are kept, and -INCOMPLETE directories do not count among them;
+# otherwise a series of failed runs pushes every good backup out (measured on card
+# 252ab361: 3 good + 9 incomplete, then one successful run deleted all 3 good).
+# The -INCOMPLETE ones are kept apart, the newest $KEEP_INCOMPLETE, for diagnosis.
+if [ -d "$BKDIR" ]; then
+  ls -1dt "$BKDIR"/*/ 2>/dev/null | grep -v -- '-INCOMPLETE/$' | tail -n +$((KEEP + 1)) | while read -r old; do
+    rm -rf "$old" && echo "  pruned old snapshot: $(basename "$old")"
+  done
+  ls -1dt "$BKDIR"/*-INCOMPLETE/ 2>/dev/null | tail -n +$((KEEP_INCOMPLETE + 1)) | while read -r old; do
+    rm -rf "$old" && echo "  pruned old incomplete snapshot: $(basename "$old")"
+  done
 fi
 
 SIZE="$(du -sh "$DEST" 2>/dev/null | cut -f1)"

@@ -120,6 +120,73 @@ MARKED="$(ls -1d "$FAKE/store/backups"/*-INCOMPLETE/ 2>/dev/null | wc -l | tr -d
 assert_eq "no directory is left that looks like a usable snapshot" "0" "$USABLE"
 assert_eq "the failed directory is marked -INCOMPLETE" "1" "$MARKED"
 
+# ---------------------------------------------------------------------------
+# 3. Retention: failed runs must not push good snapshots out.
+# ---------------------------------------------------------------------------
+echo ""
+echo "(3) Retention: -INCOMPLETE directories do not count against the good ones"
+rm -rf "$FAKE/store/backups"; mkdir -p "$FAKE/store/backups"
+for i in 1 2 3; do
+  d="$FAKE/store/backups/2026010${i}-000000-good${i}"; mkdir -p "$d"; touch -t "20260101010${i}" "$d"
+done
+for i in 1 2 3 4 5 6 7 8 9; do
+  d="$FAKE/store/backups/2026020${i}-000000-bad${i}-INCOMPLETE"; mkdir -p "$d"; touch -t "2026020${i}0000" "$d"
+done
+OUT="$(PATH="$NOCLI" /usr/bin/env bash "$FAKE/scripts/pre-modify-backup.sh" retention 2>&1)"; RC=$?
+assert_eq "the run succeeds" "0" "$RC"
+GOOD_LEFT="$(ls -1d "$FAKE/store/backups"/*-good*/ 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "all 3 older good snapshots survive 9 incomplete ones" "3" "$GOOD_LEFT"
+INC_LEFT="$(ls -1d "$FAKE/store/backups"/*-INCOMPLETE/ 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "incomplete directories are capped apart (the newest 3 are kept)" "3" "$INC_LEFT"
+
+# ---------------------------------------------------------------------------
+# 4. A snapshot file without a sum makes the run INCOMPLETE on its own.
+# ---------------------------------------------------------------------------
+echo ""
+echo "(4) No checksum tool and no personal scripts: the snapshot manifest alone decides"
+# An empty explicit list keeps PERSONAL_NOSUM at 0, so only the snapshot manifest
+# can turn this run into exit 3.
+NOSUMPATH="$TMP/bin-nosum"
+curated_path "$NOSUMPATH" bash python3 find mv tr cp mkdir grep cut date du ls tail rm dirname basename git wc sed awk head sort uname
+if PATH="$NOSUMPATH" command -v sha256sum >/dev/null 2>&1 || PATH="$NOSUMPATH" command -v shasum >/dev/null 2>&1; then
+  fail "the curated PATH really has no checksum tool"
+else
+  pass "the curated PATH really has no checksum tool"
+fi
+rm -rf "$FAKE/store/backups"; : > "$FAKE/store/personal-scripts.txt"
+OUT="$(PATH="$NOSUMPATH" /usr/bin/env bash "$FAKE/scripts/pre-modify-backup.sh" nosum 2>&1)"; RC=$?
+SNAP="$(ls -1dt "$FAKE/store/backups"/*/ 2>/dev/null | head -1)"
+assert_eq "exit 3" "3" "$RC"
+assert_contains "it says the backup is INCOMPLETE" "$OUT" "backup INCOMPLETE"
+assert_not_contains "no personal-scripts warning, the list is empty" "$OUT" "personal-scripts: WARNING"
+assert_contains "the snapshot manifest records NOSUM" "$(cat "${SNAP}MANIFEST.sha256" 2>/dev/null)" "NOSUM  "
+
+# ---------------------------------------------------------------------------
+# 5. A run that fails its manifest check prunes nothing.
+# ---------------------------------------------------------------------------
+echo ""
+echo "(5) A failed run prunes no older snapshot"
+# No `find` on PATH: the database snapshot succeeds, but the snapshot manifest
+# comes out empty, so the run must stop at "the manifest does not list
+# claudeclaw.db". Rotation used to run BEFORE that check, and pruned good backups
+# on a run that then failed.
+rm -rf "$FAKE/store/backups"; mkdir -p "$FAKE/store/backups"
+for i in 01 02 03 04 05 06 07 08 09 10 11; do
+  d="$FAKE/store/backups/202601${i}-000000-old${i}"; mkdir -p "$d"; touch -t "202601${i}0000" "$d"
+done
+NOFIND="$TMP/bin-nofind"
+curated_path "$NOFIND" bash python3 mv tr cp mkdir grep cut date du ls tail rm dirname basename git wc sed awk head sort uname sha256sum shasum
+if PATH="$NOFIND" command -v find >/dev/null 2>&1; then
+  fail "the curated PATH really has no find"
+else
+  pass "the curated PATH really has no find"
+fi
+OUT="$(PATH="$NOFIND" /usr/bin/env bash "$FAKE/scripts/pre-modify-backup.sh" nofind 2>&1)"; RC=$?
+assert_eq "exit 1: the manifest cannot list the database" "1" "$RC"
+assert_contains "it says why" "$OUT" "the manifest does not list claudeclaw.db"
+OLD_LEFT="$(ls -1d "$FAKE/store/backups"/*-old*/ 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "all 11 older snapshots are still there" "11" "$OLD_LEFT"
+
 echo ""
 echo "==================================="
 echo "PASS: $PASS  FAIL: $FAIL"
