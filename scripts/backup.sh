@@ -39,6 +39,9 @@ set -euo pipefail
 umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Literal membership test for the archive verification below (card a8a92d55).
+# shellcheck source=lib/archive-list-has.sh
+. "${REPO_ROOT}/scripts/lib/archive-list-has.sh"
 # Overridable so a test can build a throwaway archive without touching the
 # real backup directory (and its retention sweep).
 BACKUP_DIR="${BACKUP_DIR:-${REPO_ROOT}/backups}"
@@ -265,8 +268,9 @@ while IFS= read -r want; do
   case "${want}" in repo/*|home/*) ;; *) continue ;; esac
   # A directory entry is listed once in the manifest and expands to many paths
   # in the archive, so match on the prefix, and anchor it so "store/x" cannot
-  # be satisfied by "store/xyz".
-  if ! grep -qE "^${want}(/|$)" "${ARCHIVE_LIST}"; then
+  # be satisfied by "store/xyz". LITERALLY (card a8a92d55): as a regex, a route
+  # dir like `[id]` never matched itself and failed a complete backup.
+  if ! archive_list_has "${ARCHIVE_LIST}" "${want}"; then
     echo "backup: MISSING from the archive: ${want}" >&2
     missing=$((missing + 1))
   fi
@@ -276,7 +280,7 @@ done < <(sed -e 's/  *(.*)$//' "${MANIFEST}")
 # the memory directories and the local-commit bundle on 2026-09-04, the
 # credential-carrying store/ files by the whitelist that preceded it.
 for marker in "repo/store/claudeclaw.db" "home/.claude/skills" "home/.claude/scheduled-tasks"; do
-  grep -qE "^${marker}(/|$)" "${ARCHIVE_LIST}" || {
+  archive_list_has "${ARCHIVE_LIST}" "${marker}" || {
     echo "backup: MISSING load-bearing item: ${marker}" >&2
     missing=$((missing + 1))
   }
@@ -299,8 +303,13 @@ if [[ "${missing}" -gt 0 ]]; then
   # queue, where it survives the agent being asleep at 04:30 and gets read on
   # the next turn. Best-effort: a messaging problem must not change the exit
   # code or mask the real failure.
+  # To the install's own main agent (MAIN_AGENT_ID in .env, as the channel
+  # scripts read it), never a fixed name: an id that does not exist on this
+  # install makes the alert go nowhere (card a8a92d55).
+  MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "${REPO_ROOT}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  MAIN_AGENT_ID="${MAIN_AGENT_ID:-marveen}"
   if [[ -x "${REPO_ROOT}/scripts/agent-msg.sh" ]]; then
-    bash "${REPO_ROOT}/scripts/agent-msg.sh" halpali halpali \
+    bash "${REPO_ROOT}/scripts/agent-msg.sh" "${MAIN_AGENT_ID}" "${MAIN_AGENT_ID}" \
       "[MENTES] A napi mentes ellenorzese ELBUKOTT ${STAMP}-kor: ${missing} tetel hianyzik az archivumbol (reszletek: logs/backup.log). Az archivum NEM tekintheto jo masolatnak." \
       >/dev/null 2>&1 || true
   fi
