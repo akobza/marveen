@@ -74,7 +74,29 @@ n=$(grep -c 'archive_list_has "${ARCHIVE_LIST}"' "$B")
 if [ "$n" -eq 2 ]; then pass "backup.sh checks the manifest and the markers through the helper"; else fail "backup.sh helper call sites: expected 2, got $n"; fi
 if grep -qE 'grep -qE "\^\$\{(want|marker)\}' "$B"; then fail "backup.sh still matches a manifest path as a regex"; else pass "no regex match on manifest paths is left"; fi
 if grep -q 'agent-msg.sh" "${MAIN_AGENT_ID}" "${MAIN_AGENT_ID}"' "$B"; then pass "the alert is addressed to MAIN_AGENT_ID, not a fixed id"; else fail "the alert is not addressed to MAIN_AGENT_ID"; fi
-if grep -q "grep -E '^MAIN_AGENT_ID=' \"\${REPO_ROOT}/.env\"" "$B"; then pass "the alert recipient comes from MAIN_AGENT_ID in .env"; else fail "the alert recipient is not read from .env"; fi
+# The recipient is the MAIN_AGENT_ID resolved once near the top: exactly two
+# assignments (the default and the .env override), both before the alert.
+assign_lines=$(grep -nE '^[[:space:]]*(\[\[ -n "\$\{_mid\}" \]\] && )?MAIN_AGENT_ID=' "$B" | cut -d: -f1 | tr '\n' ' ')
+alert_line=$(grep -n 'agent-msg.sh" "${MAIN_AGENT_ID}" "${MAIN_AGENT_ID}"' "$B" | head -1 | cut -d: -f1)
+set -- $assign_lines
+if [ "$#" -eq 2 ] && [ -n "$alert_line" ] && [ "$2" -lt "$alert_line" ]; then pass "MAIN_AGENT_ID is assigned twice, both before the alert (lines: $assign_lines)"; else fail "MAIN_AGENT_ID assignments: [$assign_lines], alert at ${alert_line:-none}"; fi
+set --
+# ...and that resolution reads .env the way the app does (card a95cada0: a second,
+# simpler parse took the first definition, kept the quotes, and aborted under
+# pipefail when the line was missing). The block runs as written, in isolation.
+BLOCK="$TMP/resolve.sh"
+sed -n '/^MAIN_AGENT_ID="marveen"$/,/^fi$/p' "$B" > "$BLOCK"
+# A trailing no-op: the block's last command is `[[ -n "$_mid" ]] && ...`, which is
+# non-zero when the line is missing; in the script that is harmless (a failure inside
+# an && list does not trigger errexit), but `.` would return it. A real abort inside
+# the block still exits the shell before this line is reached.
+echo ':' >> "$BLOCK"
+resolve() { bash -c 'set -euo pipefail; REPO_ROOT="$1"; . "$2"; printf "%s" "$MAIN_AGENT_ID"' x "$1" "$BLOCK"; }
+mkdir -p "$TMP/envq" "$TMP/envnone"
+printf 'MAIN_AGENT_ID=first\nOTHER=1\nMAIN_AGENT_ID="quoted-main"\n' > "$TMP/envq/.env"
+printf 'OTHER=1\n' > "$TMP/envnone/.env"
+got=$(resolve "$TMP/envq" 2>&1); if [ "$got" = "quoted-main" ]; then pass "the last definition wins and its quotes are stripped"; else fail "resolved '$got', want 'quoted-main'"; fi
+got=$(resolve "$TMP/envnone" 2>&1); rc=$?; if [ "$rc" -eq 0 ] && [ "$got" = "marveen" ]; then pass "no MAIN_AGENT_ID line: default, and no abort under pipefail"; else fail "no MAIN_AGENT_ID line: rc=$rc, resolved '$got'"; fi
 
 echo
 echo "passed: $PASS, failed: $FAIL"
