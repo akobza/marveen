@@ -121,6 +121,22 @@ describe('clear-replay hook (SessionStart)', () => {
     expect(ctx).toContain(transcript)
   })
 
+  it('names no single owner over the carried prompts (card 7c813be5)', () => {
+    // The heading used to read "<OWNER_NAME> UTOLSO KERESEI", so every carried
+    // prompt -- another owner's channel message included -- was attributed to
+    // the one configured owner. Each prompt keeps its own header instead.
+    capture()
+    const out = JSON.parse(execFileSync('python3', [REPLAY], {
+      input: JSON.stringify({ source: 'clear', cwd: AGENT_CWD }),
+      encoding: 'utf-8',
+      env: { ...process.env, CLEARSTATE_DIR: store, OWNER_NAME: 'Gyula' },
+    }))
+    const ctx = out.hookSpecificOutput.additionalContext as string
+    expect(ctx).toContain('AZ ELOZO SZAL UTOLSO BEJOVO UZENETEI')
+    expect(ctx).not.toContain('Gyula')
+    expect(ctx).not.toContain('UTOLSO KERESEI')
+  })
+
   it('replays once: the record is dropped after a successful injection', () => {
     capture()
     expect(replay()).not.toBe('')
