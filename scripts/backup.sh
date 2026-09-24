@@ -300,11 +300,13 @@ if [[ "${missing}" -gt 0 ]]; then
   # queue, where it survives the agent being asleep at 04:30 and gets read on
   # the next turn. Best-effort: a messaging problem must not change the exit
   # code or mask the real failure.
-  # To the install's own main agent (MAIN_AGENT_ID in .env, as the channel
-  # scripts read it), never a fixed name: an id that does not exist on this
-  # install makes the alert go nowhere (card a8a92d55).
-  MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "${REPO_ROOT}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
-  MAIN_AGENT_ID="${MAIN_AGENT_ID:-marveen}"
+  # To the install's own main agent: MAIN_AGENT_ID as resolved near the top of
+  # this script (from .env the way the app reads it: last definition wins,
+  # quotes stripped, default "marveen"), never a fixed name -- an id that does
+  # not exist on this install makes the alert go nowhere (card a8a92d55). Do not
+  # re-read .env here: a second, simpler parse took the FIRST definition, kept
+  # the quotes, and without `|| true` aborted the script under pipefail on an
+  # install with no MAIN_AGENT_ID line (card a95cada0).
   if [[ -x "${REPO_ROOT}/scripts/agent-msg.sh" ]]; then
     bash "${REPO_ROOT}/scripts/agent-msg.sh" "${MAIN_AGENT_ID}" "${MAIN_AGENT_ID}" \
       "[MENTES] A napi mentes ellenorzese ELBUKOTT ${STAMP}-kor: ${missing} tetel hianyzik az archivumbol (reszletek: logs/backup.log). Az archivum NEM tekintheto jo masolatnak." \
