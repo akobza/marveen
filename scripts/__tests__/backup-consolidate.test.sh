@@ -146,6 +146,23 @@ for v in 0 abc 18446744073709551616 18446744073709551615 36893488147419103232 10
     '[[ $RC -eq 2 ]] && grep -q "KEEP must be an integer from 1 to 9999" "$R.out" && [[ $(count "$R.backups") -eq $before ]]'
 done
 
+echo "-- 4b. second guard: this run's archive survives even with the KEEP check removed"
+# A mutated copy of the script without the range check at the top: an overflowing
+# KEEP then reaches the rotation's arithmetic, and only the second guard stands.
+R="$TMP/r4b"; make_repo "$R"; run_backup "$R"; sleep 1; run_backup "$R"; before=$(count "$R.backups")
+python3 - "$R/scripts/backup.sh" <<'MUT'
+import sys
+p = sys.argv[1]; s = open(p).read()
+start = s.index('if ! [[ "${KEEP}" =~')
+end = s.index('fi\n', start) + 3
+open(p, 'w').write(s[:start] + s[end:])
+MUT
+check "the mutation removed the range check" '! grep -q "KEEP must be an integer from 1 to 9999" "$R/scripts/backup.sh"'
+sleep 1; run_backup "$R" BACKUP_KEEP=18446744073709551616
+check "overflowing KEEP without the range check: this run's archive is still there" \
+  '[[ $(count "$R.backups") -ge 1 ]] && grep -q "(this run.s archive is never pruned)" "$R.out"'
+check "control: the older archives were pruned (the mutation reached the rotation)" '[[ $(count "$R.backups") -lt $((before + 1)) ]]'
+
 echo "-- 5. the layer's BACKUP_DIR is honoured by the archive and the rotation alike"
 R="$TMP/r5"; make_repo "$R"; mkdir -p "$R.alt"
 printf 'BACKUP_DIR="%s"\nBACKUP_KEEP=1\n' "$R.alt" > "$R/store/backup.local.rc"
