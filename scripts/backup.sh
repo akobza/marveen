@@ -53,15 +53,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Literal membership test for the archive verification below (card a8a92d55).
 # shellcheck source=lib/archive-list-has.sh
 . "${REPO_ROOT}/scripts/lib/archive-list-has.sh"
-# Overridable so a test can build a throwaway archive without touching the
-# real backup directory (and its retention sweep).
-BACKUP_DIR="${BACKUP_DIR:-${REPO_ROOT}/backups}"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-ARCHIVE="${BACKUP_DIR}/claudeclaw-${STAMP}.tar.gz"
-# KEEP counts archives, not days, so a day of manual runs can prune a day of
-# history. An install raises it with BACKUP_KEEP (environment or the local layer
-# below); an age-based rule would be the real fix.
-KEEP="${BACKUP_KEEP:-14}"
 
 # --- Install-local layer (optional, untracked; kanban a95cada0) ---------------
 # An install keeps its own retention and store/ exclusions here instead of
@@ -70,21 +61,34 @@ KEEP="${BACKUP_KEEP:-14}"
 #   BACKUP_KEEP=<n>          archives to keep (default 14)
 #   STORE_SKIP_ADD="a b"     extra store/ entries to leave out of the archive
 #   STORE_SKIP_TAKE="a b"    default-skipped store/ entries to take anyway
+#   BACKUP_DIR=<dir>         where archives are written and rotated
 # It adjusts the default store/ skip list by name instead of replacing it, so a
 # default skip added here later still applies on an install that has a layer.
 # store/ is gitignored, so the file is never tracked, and the store/ rule below
 # archives it: a restore brings the layer back together with the data.
+# It is sourced before BACKUP_DIR, ARCHIVE and KEEP are resolved, so whatever it
+# sets is honoured by the archive and the rotation alike.
 BACKUP_LOCAL_RC="${BACKUP_LOCAL_RC:-${REPO_ROOT}/store/backup.local.rc}"
 if [[ -f "${BACKUP_LOCAL_RC}" ]]; then
   # shellcheck source=/dev/null
   . "${BACKUP_LOCAL_RC}"
   echo "backup: local layer sourced: ${BACKUP_LOCAL_RC}"
 fi
-KEEP="${BACKUP_KEEP:-${KEEP}}"
-# A non-numeric or zero KEEP would make the rotation at the end delete every
-# archive, this run's included: refuse before anything is written.
-if ! [[ "${KEEP}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "backup: ERROR -- KEEP must be a positive integer, got '${KEEP}'" >&2
+
+# Overridable so a test can build a throwaway archive without touching the
+# real backup directory (and its retention sweep).
+BACKUP_DIR="${BACKUP_DIR:-${REPO_ROOT}/backups}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+ARCHIVE="${BACKUP_DIR}/claudeclaw-${STAMP}.tar.gz"
+# KEEP counts archives, not days, so a day of manual runs can prune a day of
+# history. An install raises it with BACKUP_KEEP (environment or the local layer
+# above); an age-based rule would be the real fix.
+KEEP="${BACKUP_KEEP:-14}"
+# A zero, non-numeric or oversized KEEP would make the rotation at the end delete
+# every archive, this run's included: the rotation counts in bash arithmetic,
+# where 2^64 wraps to 0. Refuse before anything is written; 1..9999 is plenty.
+if ! [[ "${KEEP}" =~ ^[1-9][0-9]{0,3}$ ]]; then
+  echo "backup: ERROR -- KEEP must be an integer from 1 to 9999, got '${KEEP}'" >&2
   exit 2
 fi
 
@@ -164,8 +168,14 @@ add_if() {
 #   (measured 2026-09-16: these two were 788 MB of a 948 MB archive; excluding them
 #    leaves ~150 MB. STORE_SKIP does not delete anything -- the files stay on disk.)
 STORE_SKIP=" whisper health cowork venv-garmin venv-pdf dhl-chrome-profile fedex-labels fedex-vam archery-basis backups darwin-relay scheduled-runs "
-for _n in ${STORE_SKIP_ADD:-}; do STORE_SKIP="${STORE_SKIP}${_n} "; done
-for _n in ${STORE_SKIP_TAKE:-}; do STORE_SKIP="${STORE_SKIP// ${_n} / }"; done
+# read -a splits on blanks WITHOUT pathname expansion, and the name is quoted in
+# the pattern: an entry like "*" stays a literal name, never the repo root's file
+# list or a match-everything pattern. The ${a[@]+...} form keeps an empty list
+# safe under set -u on bash 3.2.
+read -r -a _skip_add <<<"${STORE_SKIP_ADD:-}"
+read -r -a _skip_take <<<"${STORE_SKIP_TAKE:-}"
+for _n in ${_skip_add[@]+"${_skip_add[@]}"}; do STORE_SKIP="${STORE_SKIP}${_n} "; done
+for _n in ${_skip_take[@]+"${_skip_take[@]}"}; do STORE_SKIP="${STORE_SKIP// "${_n}" / }"; done
 if [[ -d store ]]; then
   while IFS= read -r _entry; do
     _name="$(basename "${_entry}")"
@@ -297,7 +307,8 @@ agents_prune_expr() {
   for d in "${AGENTS_EXCLUDE_PATHS[@]}"; do printf '%s\n' '!' '-path' "${d}"; done
 }
 if [[ -d agents ]]; then
-  mapfile -t AGENTS_FIND_ARGS < <(agents_prune_expr)
+  AGENTS_FIND_ARGS=()   # while-read, not mapfile: bash 3.2 (macOS) has no mapfile
+  while IFS= read -r _arg; do AGENTS_FIND_ARGS+=("${_arg}"); done < <(agents_prune_expr)
   find agents "${AGENTS_FIND_ARGS[@]}" -type f -print >> "${REPOLIST}"
 fi
 

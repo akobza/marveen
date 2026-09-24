@@ -3,6 +3,7 @@
 # consistent database snapshot and its machine-readable status line, the
 # agents/ and file-based memory coverage, the default store/ skips, and the
 # optional install-local layer (store/backup.local.rc) with its KEEP guard.
+# Also pinned: the script runs on a bash without mapfile (macOS ships bash 3.2).
 # Run: bash scripts/__tests__/backup-consolidate.test.sh
 #
 # Hermetic: every run uses a throwaway repo, HOME and BACKUP_DIR under one
@@ -18,7 +19,8 @@ check() { if eval "$2"; then pass "$1"; else fail "$1"; fi; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+WAL_PID=""
+trap '[[ -n "$WAL_PID" ]] && kill "$WAL_PID" 2>/dev/null; rm -rf "$TMP"' EXIT
 for t in python3 git tar; do
   command -v "$t" >/dev/null 2>&1 || { echo "SKIP: $t missing"; exit 0; }
 done
@@ -28,7 +30,8 @@ make_repo() {
   local R="$1"
   mkdir -p "$R/scripts/lib" "$R/store/backups" "$R/store/scheduled-runs" "$R/store/keepme" \
            "$R/agents/a/tools" "$R/agents/a/reports" "$R/agents/a/node_modules/x" \
-           "$R/agents/a/.claude-config/projects/p/memory" "$R/.channels-config/projects/p/memory"
+           "$R/agents/a/.claude-config/projects/p/memory" "$R/.channels-config/projects/p/memory" \
+           "$R/backups"
   cp "$REPO/scripts/backup.sh" "$R/scripts/backup.sh"
   cp "$REPO/scripts/lib/archive-list-has.sh" "$R/scripts/lib/archive-list-has.sh"
   echo old-copy > "$R/store/backups/old.db"
@@ -54,6 +57,23 @@ PY
       && git -c user.name=t -c user.email=t@example.invalid commit -qm init )
 }
 
+# hold_wal DB: a writer that commits one more row and keeps its connection open,
+# so the row lives only in the -wal while the backup runs (a live dashboard).
+hold_wal() {
+  python3 - "$1" <<'PY' &
+import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA journal_mode=WAL")
+con.execute("PRAGMA wal_autocheckpoint=0")
+con.execute("insert into t values ('row-in-wal')")
+con.commit()
+time.sleep(120)
+PY
+  WAL_PID=$!
+  for _ in $(seq 1 50); do [[ -s "$1-wal" ]] && break; sleep 0.1; done
+}
+release_wal() { [[ -n "$WAL_PID" ]] && kill "$WAL_PID" 2>/dev/null; wait "$WAL_PID" 2>/dev/null; WAL_PID=""; }
+
 # run_backup DIR [VAR=value ...]: one run with its own HOME and BACKUP_DIR; output in DIR.out, rc in RC.
 run_backup() {
   local R="$1"; shift
@@ -65,21 +85,25 @@ run_backup() {
     bash "$R/scripts/backup.sh" > "$R.out" 2>&1
   RC=$?
 }
-newest() { ls -1t "$1.backups"/claudeclaw-*.tar.gz 2>/dev/null | head -1; }
-listing() { tar -tzf "$(newest "$1")" 2>/dev/null; }
+newest() { ls -1t "$1"/claudeclaw-*.tar.gz 2>/dev/null | head -1; }
+count() { ls -1 "$1"/claudeclaw-*.tar.gz 2>/dev/null | wc -l | tr -d ' '; }
+listing() { tar -tzf "$(newest "$1.backups")" 2>/dev/null; }
 has() { listing "$1" | grep -qxF "$2"; }
 has_under() { listing "$1" | grep -q "^$(printf '%s' "$2" | sed 's/[.[\*^$/]/\\&/g')"; }
+mode() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$1"; }
 
 echo "backup.sh: consolidated contract (a95cada0)"
 echo "============================================"
 
-echo "-- 1. default run"
-R="$TMP/r1"; make_repo "$R"; run_backup "$R"
+echo "-- 1. default run, with a live writer holding the WAL open"
+R="$TMP/r1"; make_repo "$R"; hold_wal "$R/store/claudeclaw.db"
+check "fixture: the -wal holds data while the backup runs" '[[ -s "$R/store/claudeclaw.db-wal" ]]'
+run_backup "$R"; release_wal
 check "rc 0" '[[ $RC -eq 0 ]]'
 check "status line: db-snapshot=consistent" 'grep -qx "backup: db-snapshot=consistent" "$R.out"'
 check "verification ran and passed" 'grep -qE "verified [0-9]+ manifest entries" "$R.out"'
-A="$(newest "$R")"
-check "archive written, mode 600" '[[ -n "$A" && "$(stat -c %a "$A")" == 600 ]]'
+A="$(newest "$R.backups")"
+check "archive written, mode 600" '[[ -n "$A" && "$(mode "$A")" == 600 ]]'
 check "the database is in the archive" 'has "$R" repo/store/claudeclaw.db'
 check "no -wal/-shm next to a consistent snapshot" '! has "$R" repo/store/claudeclaw.db-wal && ! has "$R" repo/store/claudeclaw.db-shm'
 check "store/backups skipped by default (decision D)" '! has_under "$R" repo/store/backups/'
@@ -92,8 +116,8 @@ check "main-agent memory FILE taken (.channels-config)" 'has "$R" repo/.channels
 check "no UNCOVERED.txt when every agents/ file matched a rule" '! has "$R" UNCOVERED.txt'
 mkdir -p "$TMP/x1" && tar -xzf "$A" -C "$TMP/x1" MANIFEST.txt repo/store/claudeclaw.db 2>/dev/null
 check "MANIFEST records the snapshot" 'grep -qx "db-snapshot: consistent" "$TMP/x1/MANIFEST.txt"'
-check "the archived database is intact and holds the row" \
-  '[[ "$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(\"pragma integrity_check\").fetchone()[0], c.execute(\"select x from t\").fetchone()[0])" "$TMP/x1/repo/store/claudeclaw.db")" == "ok row-1" ]]'
+check "the archived database is intact and holds the row that was only in the -wal" \
+  '[[ "$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(\"pragma integrity_check\").fetchone()[0], c.execute(\"select count(*) from t where x in (\x27row-1\x27,\x27row-in-wal\x27)\").fetchone()[0])" "$TMP/x1/repo/store/claudeclaw.db")" == "ok 2" ]]'
 
 echo "-- 2. install-local layer"
 R="$TMP/r2"; make_repo "$R"
@@ -112,22 +136,44 @@ check "the layer file itself is archived" 'has "$R" repo/store/backup.local.rc'
 
 echo "-- 3. KEEP from the layer rotates the archives"
 for _ in 1 2; do sleep 1; run_backup "$R"; done
-check "three runs, KEEP=2: two archives left" '[[ $(ls -1 "$R.backups"/claudeclaw-*.tar.gz | wc -l) -eq 2 ]]'
+check "three runs, KEEP=2: two archives left" '[[ $(count "$R.backups") -eq 2 ]]'
 
 echo "-- 4. a bad KEEP is refused before anything is written"
-R="$TMP/r4"; make_repo "$R"; run_backup "$R"; before=$(ls -1 "$R.backups"/claudeclaw-*.tar.gz | wc -l)
-sleep 1; run_backup "$R" BACKUP_KEEP=0
-check "BACKUP_KEEP=0: rc 2" '[[ $RC -eq 2 ]]'
-check "BACKUP_KEEP=0: says why" 'grep -q "KEEP must be a positive integer" "$R.out"'
-check "BACKUP_KEEP=0: no archive deleted or added" '[[ $(ls -1 "$R.backups"/claudeclaw-*.tar.gz | wc -l) -eq $before ]]'
-run_backup "$R" BACKUP_KEEP=abc
-check "BACKUP_KEEP=abc: rc 2" '[[ $RC -eq 2 ]]'
+R="$TMP/r4"; make_repo "$R"; run_backup "$R"; before=$(count "$R.backups")
+for v in 0 abc 18446744073709551616 18446744073709551615 36893488147419103232 10000; do
+  sleep 1; run_backup "$R" BACKUP_KEEP="$v"
+  check "BACKUP_KEEP=$v: rc 2, says why, no archive deleted or added" \
+    '[[ $RC -eq 2 ]] && grep -q "KEEP must be an integer from 1 to 9999" "$R.out" && [[ $(count "$R.backups") -eq $before ]]'
+done
 
-echo "-- 5. no database on the install"
+echo "-- 5. the layer's BACKUP_DIR is honoured by the archive and the rotation alike"
+R="$TMP/r5"; make_repo "$R"; mkdir -p "$R.alt"
+printf 'BACKUP_DIR="%s"\nBACKUP_KEEP=1\n' "$R.alt" > "$R/store/backup.local.rc"
+run_backup "$R"; sleep 1; run_backup "$R"
+check "rc 0" '[[ $RC -eq 0 ]]'
+check "archives go to the layer's directory, the rotation keeps KEEP=1 there" '[[ $(count "$R.alt") -eq 1 ]]'
+check "nothing written to the environment's BACKUP_DIR" '[[ $(count "$R.backups") -eq 0 ]]'
+
+echo "-- 6. a glob character in the layer's names stays literal"
+R="$TMP/r6"; make_repo "$R"
+printf 'STORE_SKIP_TAKE="*"\nSTORE_SKIP_ADD="*"\n' > "$R/store/backup.local.rc"
+run_backup "$R"
+check "rc 0" '[[ $RC -eq 0 ]]'
+check 'TAKE="*" does not bring store/backups back' '! has_under "$R" repo/store/backups/'
+check 'ADD="*" does not skip every store/ entry' 'has "$R" repo/store/keepme/k.txt'
+
+echo "-- 7. a bash without mapfile (macOS ships bash 3.2)"
+printf 'enable -n mapfile readarray\n' > "$TMP/nomapfile.env"
+check "control: the env file really disables mapfile" '! BASH_ENV="$TMP/nomapfile.env" bash -c "mapfile -t x < /dev/null" 2>/dev/null'
+R="$TMP/r7"; make_repo "$R"; run_backup "$R" BASH_ENV="$TMP/nomapfile.env"
+check "rc 0 without mapfile" '[[ $RC -eq 0 ]]'
+check "status line and verification without mapfile" 'grep -qx "backup: db-snapshot=consistent" "$R.out" && grep -qE "verified [0-9]+ manifest entries" "$R.out"'
+
+echo "-- 8. no database on the install"
 # Only the status line is pinned here: the verification's load-bearing list still
 # names repo/store/claudeclaw.db unconditionally (unchanged by this card), so a
 # DB-less run reports no-database and then fails verification.
-R="$TMP/r5"; make_repo "$R" nodb; run_backup "$R"
+R="$TMP/r8"; make_repo "$R" nodb; run_backup "$R"
 check "status line: db-snapshot=no-database" 'grep -qx "backup: db-snapshot=no-database" "$R.out"'
 
 echo ""
