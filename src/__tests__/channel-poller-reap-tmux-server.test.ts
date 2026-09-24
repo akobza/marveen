@@ -36,6 +36,7 @@ import {
   selectReapTargets,
   commandForLog,
   reapChannelOrphans,
+  reapDetachedChannelClaudes,
   type ProcRow,
 } from '../web/channel-poller-reap.js'
 import { channelStateDir } from '../channel-provider.js'
@@ -204,5 +205,51 @@ describe('cc4d0ddd reapChannelOrphans on real processes', () => {
     expect(r.reaped).not.toContain(pane)
     expect(alive(server)).toBe(true)
     expect(alive(pane)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Card 217d8669 (teszter-2's cc4d0ddd verdict, 20395): reapDetachedChannelClaudes
+// filters its orphans through the same never-signal set, but no test held that
+// filter -- a mutant without it stayed green. Its orphan rule already requires
+// argv[0] == claude, so the tmux server cannot be a candidate there; the one
+// shape where the filter decides is a `claude --channels` process that is the
+// PARENT of a live pane: walking UP from it never meets the pane, so it counts as
+// detached, while the parent-of-a-live-pane rule protects it.
+// SAFETY: with a fake tmux, every real `claude --channels` process on the host
+// would look detached. The needle below exists only in the test process's argv,
+// so nothing else can match; argv[0] is set with bash `exec -a`.
+describe('217d8669 reapDetachedChannelClaudes on real processes', () => {
+  const needle = (tag: string) => `plugin:telegram@infra3-217d8669-${tag}-${process.pid}-${Date.now()}`
+  // A bash re-executed under the name "claude": it starts a child and waits.
+  async function claudeWithChild(tag: string, n: string): Promise<{ claude: number; child: number }> {
+    const childFile = join(tmp, `dc-${tag}.pid`)
+    const claude = spawnWithEnv('/bin/bash', ['-c',
+      `exec -a claude /bin/bash -c 'sleep 300 & echo $! > ${childFile}; wait' x --channels ${n}`], {})
+    for (let i = 0; i < 40 && !existsSync(childFile); i++) await sleep(50)
+    const child = parseInt(readFileSync(childFile, 'utf-8').trim(), 10)
+    kids.push(child)
+    return { claude, child }
+  }
+
+  it('spares a detached `claude --channels` process that is the parent of a live pane', async () => {
+    const n = needle('parent')
+    const { claude, child } = await claudeWithChild('parent', n)
+    fakeTmuxPrints(`echo ${child}`)
+    const reaped = reapDetachedChannelClaudes({ tmuxPath: fakeTmux, channelNeedle: n })
+    await sleep(800)
+    expect(reaped).not.toContain(claude)
+    expect(alive(claude)).toBe(true)
+    expect(alive(child)).toBe(true)
+  })
+
+  it('positive control: the same process is reaped when its child is not a live pane', async () => {
+    const n = needle('control')
+    const { claude } = await claudeWithChild('control', n)
+    fakeTmuxPrints('echo 4242')
+    const reaped = reapDetachedChannelClaudes({ tmuxPath: fakeTmux, channelNeedle: n })
+    await sleep(800)
+    expect(reaped).toEqual([claude])
+    expect(alive(claude)).toBe(false)
   })
 })
