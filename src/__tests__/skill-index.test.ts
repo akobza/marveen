@@ -183,3 +183,72 @@ describe('skill-index.sh -- graceful handling of missing global dir', () => {
     }
   })
 })
+
+describe('skill-index.sh -- the 120-byte description cut stays valid UTF-8 (SKILLINDEXUTF8)', () => {
+  // The description is cut at 120 BYTES. GNU `cut -c` counts bytes, so a multibyte character straddling
+  // byte 120 used to keep only its first byte(s), and a strict UTF-8 read of the whole index failed.
+  const strict = new TextDecoder('utf-8', { fatal: true })
+  const STRADDLE_2 = 'a'.repeat(119) + 'é' + ' tail' // é = C3 A9 at bytes 120-121
+  const STRADDLE_3 = 'a'.repeat(118) + '€' + ' tail' // € = E2 82 AC at bytes 119-121
+  const STRADDLE_4 = 'a'.repeat(117) + '😀' + ' tail' // 😀 = F0 9F 98 80 at bytes 118-121
+  const FITS_2 = 'a'.repeat(118) + 'é' + ' tail' // é ends exactly at byte 120: kept whole
+  const LONG_ASCII = 'b'.repeat(130)
+  const SHORT_ACCENTED = 'Rövid leírás ékezettel, a vágás alatt'
+  let tmpHome: string
+
+  function addSkill(root: string, name: string, description: string): void {
+    mkdirSync(join(root, '.claude', 'skills', name), { recursive: true })
+    writeFileSync(join(root, '.claude', 'skills', name, 'SKILL.md'), makeSkillMd(name, description))
+  }
+
+  function indexBytes(path: string): Buffer {
+    return readFileSync(path)
+  }
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'skill-index-utf8-'))
+    addSkill(tmpHome, 'straddle-two', STRADDLE_2)
+    addSkill(tmpHome, 'straddle-three', STRADDLE_3)
+    addSkill(tmpHome, 'straddle-four', STRADDLE_4)
+    addSkill(tmpHome, 'fits-two', FITS_2)
+    addSkill(tmpHome, 'long-ascii', LONG_ASCII)
+    addSkill(tmpHome, 'short-accented', SHORT_ACCENTED)
+  })
+
+  afterEach(() => {
+    rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  it('NEGATIVE: the global index is strict UTF-8 even when a character straddles byte 120', () => {
+    runScript([], { HOME: tmpHome })
+    const bytes = indexBytes(join(tmpHome, '.claude', 'skills', '.skill-index.md'))
+    expect(() => strict.decode(bytes)).not.toThrow()
+  })
+
+  it('NEGATIVE: the incomplete character is dropped whole, so each cut ends on a character boundary', () => {
+    runScript([], { HOME: tmpHome })
+    const content = strict.decode(indexBytes(join(tmpHome, '.claude', 'skills', '.skill-index.md')))
+    expect(content).toContain('| `straddle-two` | ' + 'a'.repeat(119) + ' |')
+    expect(content).toContain('| `straddle-three` | ' + 'a'.repeat(118) + ' |')
+    expect(content).toContain('| `straddle-four` | ' + 'a'.repeat(117) + ' |')
+  })
+
+  it('CONTROL: a character ending exactly at byte 120, a long ASCII text and a short accented text are unchanged', () => {
+    // Read leniently on purpose: this test is about ITS OWN lines, which old and new code must write identically.
+    // (The straddling lines in the same index would make a strict read fail on the old code for another reason.)
+    runScript([], { HOME: tmpHome })
+    const content = readFileSync(join(tmpHome, '.claude', 'skills', '.skill-index.md'), 'utf-8')
+    expect(content).toContain('| `fits-two` | ' + 'a'.repeat(118) + 'é |')
+    expect(content).toContain('| `long-ascii` | ' + 'b'.repeat(120) + ' |')
+    expect(content).toContain('| `short-accented` | ' + SHORT_ACCENTED + ' |')
+  })
+
+  it('NEGATIVE: the merged per-agent index uses the same cut and is strict UTF-8 too', () => {
+    const agentDir = join(tmpHome, 'agents', 'agent-utf8')
+    addSkill(agentDir, 'agent-straddle', STRADDLE_2)
+    runScript([agentDir], { HOME: tmpHome })
+    const content = strict.decode(indexBytes(join(agentDir, '.claude', 'skills', '.skill-index.md')))
+    expect(content).toContain('| `agent-straddle` | ' + 'a'.repeat(119) + ' | agent |')
+    expect(content).toContain('| `straddle-two` | ' + 'a'.repeat(119) + ' | global |')
+  })
+})

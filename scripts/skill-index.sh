@@ -50,6 +50,13 @@ fi
 
 SKILL_COUNT=0
 
+# The description is cut at 120 bytes, and `cut -c` counts BYTES in GNU coreutils: a multibyte character
+# straddling byte 120 kept only its first byte(s) and made the whole index invalid UTF-8 (SKILLINDEXUTF8).
+# This pattern matches an incomplete UTF-8 sequence at the end of the cut: a lead byte followed by fewer
+# continuation bytes than it announces. The sed below drops exactly that and nothing else, so complete
+# characters and ASCII are unchanged. It works on raw byte ranges, hence LC_ALL=C for that sed.
+UTF8_INCOMPLETE_TAIL=$'([\xC0-\xDF]|[\xE0-\xEF][\x80-\xBF]?|[\xF0-\xF7][\x80-\xBF]{0,2})$'
+
 index_skills_dir() {
   local dir="$1"
   local scope="$2"  # only used when MERGED=1
@@ -65,7 +72,7 @@ index_skills_dir() {
     fi
 
     local desc
-    desc=$(grep -m1 "^description:" "$skill_md" 2>/dev/null | sed 's/^description: *//' | tr -d '"' | tr -d "'" | cut -c1-120)
+    desc=$(grep -m1 "^description:" "$skill_md" 2>/dev/null | sed 's/^description: *//' | tr -d '"' | tr -d "'" | cut -c1-120 | LC_ALL=C sed -E "s/$UTF8_INCOMPLETE_TAIL//")
     if [ -z "$desc" ]; then
       desc="(nincs leírás)"
     fi
