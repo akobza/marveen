@@ -30,12 +30,15 @@ const fakeTmux = join(tmp, 'fake-tmux')
 const kids: number[] = []
 
 // A long-lived process that matches BOTH candidate sources: bot.pid (written
-// below) and the env-var scan (TELEGRAM_STATE_DIR in its environment).
+// below) and the env-var scan (TELEGRAM_STATE_DIR in its environment). Since
+// cc4d0ddd a candidate must also be a plugin process (CLAUDE_PLUGIN_ROOT of the
+// provider); a process that only inherited the state dir is spared by design
+// (see channel-poller-reap-tmux-server.test.ts), so the victim carries both.
 function victim(): number {
   const p = spawn('/bin/sleep', ['300'], {
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, TELEGRAM_STATE_DIR: chanDir },
+    env: { ...process.env, TELEGRAM_STATE_DIR: chanDir, CLAUDE_PLUGIN_ROOT: join(tmp, 'plugins', 'telegram', '0.0.1') },
   })
   p.unref()
   kids.push(p.pid!)
