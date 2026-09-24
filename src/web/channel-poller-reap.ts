@@ -21,6 +21,24 @@
 //      was started against this channel state dir is in scope, regardless
 //      of how its argv was rendered. macOS BSD ps emits each process's full
 //      environment when invoked with `e`; we grep that.
+//
+// NARROWED 2026-09-24 (card cc4d0ddd): "any process that was started against
+// this channel state dir" turned out to be far too wide. The state-dir variable
+// is exported by the session launcher, so EVERY descendant of the owning agent
+// inherits it: the agent's own claude, its Bash tools, builds, test databases,
+// watchers -- and, when scripts/channels.sh starts the tmux server, the tmux
+// SERVER itself. On 2026-09-24 12:23:28Z a stage-3 recovery reap on the main
+// channel dir killed that tmux server (a fromEnvScan hit that was no pane
+// leader), and with it every agent session on the host. Measured the same day
+// on the live host: of the processes carrying TELEGRAM_STATE_DIR, all 10 real
+// pollers also carried CLAUDE_PLUGIN_ROOT=.../telegram/<ver>, and none of the
+// 27 others (bash, sleep, claude, postgres, node builds, watchers) did.
+// So a candidate now needs BOTH markers (parseStateDirPollerPids), bot.pid is
+// honoured only while that pid is still a plugin process (after a reboot a
+// stale bot.pid can name a reused pid), and whatever the markers say, the tmux
+// server, every live pane leader and the parent of every live pane leader are
+// never signalled (protectedPidsForReap). Every signalled pid is logged with its
+// command line (argv only, never the environment; secret-looking values masked).
 
 import { execFileSync, execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
@@ -63,13 +81,65 @@ export function parsePollerPidsFromPs(
   return out
 }
 
-function listPollerPidsByStateDir(envVar: string, chanDir: string): number[] {
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// The CLAUDE_PLUGIN_ROOT anchor for one provider: the env literal, then the
+// provider dir segment ending on a path/version/space boundary, so `/telegram`
+// does not match a longer sibling like `/telegram-inline`. Claude Code sets this
+// variable only for the plugin server it spawns (and that server's children).
+function pluginRootRegex(pluginRootNeedle: string): RegExp {
+  return new RegExp(`CLAUDE_PLUGIN_ROOT=\\S*${escapeRe(pluginRootNeedle)}(?:[/@ ]|$)`)
+}
+
+/**
+ * cc4d0ddd: the poller candidates of ONE channel state dir. A `ps eww -e` row
+ * counts only if it carries BOTH the state-dir literal `<envVar>=<chanDir>`
+ * (ending on whitespace or end of line, so `/x/telegram` does not also match
+ * `/x/telegram-old`) AND the provider's CLAUDE_PLUGIN_ROOT anchor. The state-dir
+ * variable alone is inherited by everything the owning agent starts (see the
+ * header), so on its own it selects the agent's whole process tree, not its
+ * poller. Exported for testability.
+ */
+export function parseStateDirPollerPids(
+  psEwwOutput: string,
+  envVar: string,
+  chanDir: string,
+  pluginRootNeedle: string,
+): number[] {
+  const rootRe = pluginRootRegex(pluginRootNeedle)
+  const dirRe = new RegExp(`(?:^|\\s)${escapeRe(envVar)}=${escapeRe(chanDir)}(?:\\s|$)`)
+  const out: number[] = []
+  for (const line of psEwwOutput.split('\n')) {
+    if (!dirRe.test(line) || !rootRe.test(line)) continue
+    const m = line.match(/^\s*(\d+)\s/)
+    if (!m) continue
+    const pid = parseInt(m[1]!, 10)
+    if (pid > 1) out.push(pid)
+  }
+  return out
+}
+
+/**
+ * cc4d0ddd: is `pid`, in the same `ps eww -e` snapshot, a plugin process of the
+ * provider (CLAUDE_PLUGIN_ROOT anchor present)? bot.pid is only trusted through
+ * this check: after a reboot the file can still name a pid the kernel has since
+ * handed to an unrelated process. Exported for testability.
+ */
+export function isPluginPollerPid(psEwwOutput: string, pid: number, pluginRootNeedle: string): boolean {
+  const rootRe = pluginRootRegex(pluginRootNeedle)
+  for (const line of psEwwOutput.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s/)
+    if (m && parseInt(m[1]!, 10) === pid) return rootRe.test(line)
+  }
+  return false
+}
+
+function psEwwSnapshot(chanDir: string): string {
   try {
-    const out = execSync('/bin/ps eww -e', { timeout: 5000, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 })
-    return parsePollerPidsFromPs(out, envVar, chanDir)
+    return execSync('/bin/ps eww -e', { timeout: 5000, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 })
   } catch (err) {
     logger.warn({ err, chanDir }, 'channel-poller-reap: ps scan failed')
-    return []
+    return ''
   }
 }
 
@@ -98,6 +168,16 @@ export interface ReapResult {
   // True when the tmux server itself matched the candidate sources and was
   // spared (TMUXSERVERREAP929). Killing it takes every agent session down.
   skippedTmuxServer?: boolean
+  // cc4d0ddd: candidates spared as protected. Since TMUXSERVERREAP929 the
+  // reapChannelOrphans guard is the tmux server check, so this holds the server
+  // pid when it was a candidate (the 2026-09-24 12:23Z signature).
+  skippedProtected: number[]
+  // cc4d0ddd: processes that carry the state-dir variable but are not plugin
+  // processes (the owning agent's own tree), plus a stale bot.pid. Spared by
+  // design; the count is logged so the narrowing stays visible.
+  skippedNotPoller: number[]
+  // cc4d0ddd: every signalled pid with its command line (argv, masked, bounded).
+  reapedDetail: { pid: number; command: string }[]
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +276,9 @@ export function collectPollerEvidence(
   return buildPollerEvidence(
     snapshotProcs(),
     readBotPid(chanDir),
-    listPollerPidsByStateDir(STATE_ENV_VAR[provider], chanDir),
+    // Evidence only, nothing is signalled here: kept on the state-dir-only
+    // match it always used (cc4d0ddd narrowed the REAP paths, not this one).
+    parsePollerPidsFromPs(psEwwSnapshot(chanDir), STATE_ENV_VAR[provider], chanDir),
     claudePid,
   )
 }
@@ -215,9 +297,15 @@ export function reapChannelOrphans(
 ): ReapResult {
   const chanDir = channelStateDir(provider, agentDirPath)
   const envVar = STATE_ENV_VAR[provider]
+  const needle = PLUGIN_ROOT_NEEDLE[provider]
 
-  const fromBotPid = readBotPid(chanDir)
-  const fromEnvScan = listPollerPidsByStateDir(envVar, chanDir)
+  // cc4d0ddd: both sources are narrowed to plugin processes (see the header).
+  const psEww = psEwwSnapshot(chanDir)
+  const botPid = readBotPid(chanDir)
+  const fromBotPid = botPid !== null && isPluginPollerPid(psEww, botPid, needle) ? botPid : null
+  const fromEnvScan = parseStateDirPollerPids(psEww, envVar, chanDir, needle)
+  const skippedNotPoller = parsePollerPidsFromPs(psEww, envVar, chanDir).filter((pid) => !fromEnvScan.includes(pid))
+  if (botPid !== null && fromBotPid === null && !skippedNotPoller.includes(botPid)) skippedNotPoller.push(botPid)
 
   // Deduplicate while preserving order so the bot.pid path is logged first.
   const candidates: number[] = []
@@ -248,6 +336,11 @@ export function reapChannelOrphans(
   // exists to fix. So an unresolved live-pane set aborts the kill entirely,
   // mirroring reapDetachedChannelClaudes's own fail-safe (`live.size === 0` ->
   // reap nothing) instead of contradicting it.
+  //
+  // cc4d0ddd had its own server guard here (selectReapTargets: the parents of live
+  // pane leaders and every tmux binary). TMUXSERVERREAP929 below resolves the server
+  // pid from tmux itself and supersedes it on this path; the helpers stay exported
+  // (reapDetachedChannelClaudes still filters through protectedPidsForReap).
   const live = livePanePids(opts.tmuxPath ?? 'tmux')
   const liveQueryFailed = live.size === 0
   const skippedLivePane = liveQueryFailed ? [] : candidates.filter((pid) => live.has(pid))
@@ -282,6 +375,11 @@ export function reapChannelOrphans(
       'channel-poller-reap: candidate IS the tmux server, sparing it (killing it would take down every agent session)')
   }
 
+  // cc4d0ddd: the process table, taken BEFORE any signal, only for the logged
+  // command lines (argv, masked); skippedProtected reports the spared server.
+  const procs = all.length > 0 || skippedTmuxServer ? snapshotProcs() : []
+  const skippedProtected = skippedTmuxServer && serverPid !== null ? [serverPid] : []
+
   // SIGTERM, give bun/node ~300ms to flush, then SIGKILL stragglers.
   for (const pid of all) {
     try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
@@ -293,14 +391,89 @@ export function reapChannelOrphans(
     }
   }
 
+  const commandOf = new Map(procs.map((p) => [p.pid, p.command] as const))
+  const detail = (pid: number) => ({ pid, command: commandForLog(commandOf.get(pid) ?? '?') })
+  const reapedDetail = all.map(detail)
   if (all.length > 0) {
-    logger.info({ provider, chanDir, reaped: all, fromBotPid, fromEnvScan }, 'channel-poller-reap: orphans killed')
+    logger.info({ provider, chanDir, reaped: all, reapedDetail, fromBotPid, fromEnvScan }, 'channel-poller-reap: orphans killed')
   }
   if (skippedLivePane.length > 0) {
     logger.warn({ provider, chanDir, skippedLivePane, fromBotPid, fromEnvScan },
       'channel-poller-reap: candidate IS a live pane leader, sparing it (respawn-pane will replace it)')
   }
-  return { reaped: all, source: { fromBotPid, fromEnvScan }, skippedLivePane, skippedTmuxServer }
+  if (skippedNotPoller.length > 0) {
+    logger.info({ provider, chanDir, skippedNotPoller: skippedNotPoller.length },
+      'channel-poller-reap: spared processes that carry the state dir but are not plugin processes (cc4d0ddd)')
+  }
+  return {
+    reaped: all,
+    source: { fromBotPid, fromEnvScan },
+    skippedLivePane,
+    skippedTmuxServer,
+    skippedProtected,
+    skippedNotPoller,
+    reapedDetail,
+  }
+}
+
+/**
+ * cc4d0ddd: pids a channel reap must never signal, whatever their environment
+ * or argv say:
+ *   - every live tmux pane leader (the 08a02137 rule; the caller's
+ *     `respawn-pane -k` replaces those cleanly),
+ *   - the parent of every live pane leader: that is the tmux server (2026-09-24
+ *     12:23Z: it inherited TELEGRAM_STATE_DIR from channels.sh, the env scan
+ *     matched it, and killing it took down every session on the host),
+ *   - every process whose argv[0] basename is `tmux` (a server whose panes could
+ *     not be listed, or a client).
+ * Exported for testability.
+ */
+export function protectedPidsForReap(procs: ProcRow[], livePanePids: Set<number>): Set<number> {
+  const byPid = new Map(procs.map((p) => [p.pid, p] as const))
+  const out = new Set<number>(livePanePids)
+  for (const pane of livePanePids) {
+    const parent = byPid.get(pane)?.ppid
+    if (parent !== undefined && parent > 1) out.add(parent)
+  }
+  for (const p of procs) {
+    if (argv0Base(p.command) === 'tmux') out.add(p.pid)
+  }
+  return out
+}
+
+/**
+ * cc4d0ddd: split the candidates into the ones to signal and the ones spared.
+ * An empty live-pane set or an empty process table means a query failed (a real
+ * host always has both), so nothing is reaped: without them the protected set
+ * cannot be built. Exported for testability.
+ */
+export function selectReapTargets(
+  candidates: number[],
+  procs: ProcRow[],
+  livePanePids: Set<number>,
+): { reap: number[]; skippedLivePane: number[]; skippedProtected: number[]; failSafe: boolean } {
+  if (livePanePids.size === 0 || procs.length === 0) {
+    return { reap: [], skippedLivePane: [], skippedProtected: [], failSafe: true }
+  }
+  const prot = protectedPidsForReap(procs, livePanePids)
+  return {
+    reap: candidates.filter((pid) => !prot.has(pid)),
+    skippedLivePane: candidates.filter((pid) => livePanePids.has(pid)),
+    skippedProtected: candidates.filter((pid) => prot.has(pid) && !livePanePids.has(pid)),
+    failSafe: false,
+  }
+}
+
+/**
+ * cc4d0ddd: a command line fit for the dashboard log: argv only (callers pass
+ * `ps -o command`, never the environment), secret-looking assignments and
+ * bearer values masked, bounded. Exported for testability.
+ */
+export function commandForLog(command: string): string {
+  return command
+    .replace(/((?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|AUTH)[A-Z0-9_]*=)\S+/gi, '$1<redacted>')
+    .replace(/(Bearer\s+)\S+/gi, '$1<redacted>')
+    .slice(0, 240)
 }
 
 // ---------------------------------------------------------------------------
@@ -333,10 +506,13 @@ export interface ProcRow { pid: number; ppid: number; command: string }
 
 // argv[0] basename === 'claude' (the binary), so the tmux server row whose argv
 // merely *contains* the claude command string is excluded.
-function isClaudeBinary(command: string): boolean {
+function argv0Base(command: string): string {
   const argv0 = command.trim().split(/\s+/, 1)[0] ?? ''
-  const base = argv0.split('/').pop() ?? ''
-  return base === 'claude'
+  return argv0.split('/').pop() ?? ''
+}
+
+function isClaudeBinary(command: string): boolean {
+  return argv0Base(command) === 'claude'
 }
 
 /**
@@ -454,7 +630,11 @@ export function reapDetachedChannelClaudes(opts: { channelNeedle?: string; tmuxP
     logger.warn('channel-poller-reap: no live panes resolved, skipping detached-claude reap (fail-safe)')
     return []
   }
-  const orphans = findOrphanChannelClaudes(procs, live, opts.channelNeedle)
+  // cc4d0ddd: the same never-signal set as reapChannelOrphans. The orphan test
+  // already requires argv[0] == claude, so the tmux server cannot be selected
+  // today; this keeps it that way if the selection ever widens.
+  const prot = protectedPidsForReap(procs, live)
+  const orphans = findOrphanChannelClaudes(procs, live, opts.channelNeedle).filter((pid) => !prot.has(pid))
   for (const pid of orphans) {
     killBunChildren(pid)
     try { process.kill(pid, 'SIGTERM') } catch { /* gone */ }
@@ -464,7 +644,9 @@ export function reapDetachedChannelClaudes(opts: { channelNeedle?: string; tmuxP
     for (const pid of orphans) {
       try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch { /* gone */ }
     }
-    logger.info({ reaped: orphans, channelNeedle: opts.channelNeedle ?? '(all)' }, 'channel-poller-reap: detached channel claudes killed')
+    const commandOf = new Map(procs.map((p) => [p.pid, p.command] as const))
+    const reapedDetail = orphans.map((pid) => ({ pid, command: commandForLog(commandOf.get(pid) ?? '?') }))
+    logger.info({ reaped: orphans, reapedDetail, channelNeedle: opts.channelNeedle ?? '(all)' }, 'channel-poller-reap: detached channel claudes killed')
   }
   return orphans
 }
@@ -524,11 +706,7 @@ export function parseMainDirPollerPids(
   pluginRootNeedle: string, // e.g. '/telegram'
   stateEnvVar: string,      // e.g. 'TELEGRAM_STATE_DIR'
 ): number[] {
-  const escaped = pluginRootNeedle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  // Anchor on the CLAUDE_PLUGIN_ROOT env literal, then the provider dir segment
-  // ending on a path/version/space boundary so `/telegram` does not match a
-  // longer sibling like `/telegram-inline`.
-  const rootRe = new RegExp(`CLAUDE_PLUGIN_ROOT=\\S*${escaped}(?:[/@ ]|$)`)
+  const rootRe = pluginRootRegex(pluginRootNeedle)
   const out: number[] = []
   for (const line of psEwwOutput.split('\n')) {
     if (!rootRe.test(line)) continue
