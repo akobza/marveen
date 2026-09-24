@@ -35,9 +35,12 @@ run_hook() {
     shift 2
     # OWNER_NAME is pinned to 'Gyula' so the replay's inbound prefix is
     # deterministic regardless of the install's .env (assertions below grep for
-    # "Gyula:"). Same reasoning as pinning MAIN_AGENT_ID.
+    # "Gyula (chat ...):"). Same reasoning as pinning MAIN_AGENT_ID.
+    # LEDGER_PRINCIPALS_PATH defaults to a file that does not exist, i.e. a
+    # single-owner install (card 7c813be5): otherwise the result would depend on
+    # whether the checkout happens to carry a store/principals.json.
     LEDGER_DB_PATH="$db" LEDGER_OWNER_CHAT="10000000001" MAIN_AGENT_ID="marveen" \
-        OWNER_NAME="Gyula" \
+        OWNER_NAME="Gyula" LEDGER_PRINCIPALS_PATH="${LEDGER_PRINCIPALS_PATH:-$TMPDIR_BASE/no-principals.json}" \
         python3 "$HOOKS_DIR/$hook" "$@"
 }
 
@@ -263,15 +266,15 @@ else
     fail "replay: missing open-question block"
 fi
 
-# Context window is chronological and prefixed (Gyula: / Te:)
+# Context window is chronological and prefixed (Gyula (chat id): / Te -> Gyula (chat id):)
 DB_CW="$TMPDIR_BASE/cw.db"
 emit_inbound 10000000001 1 "ELSO_UZENET"  | run_hook ledger-capture.py  "$DB_CW"
 emit_reply   10000000001   "VALASZ_KOZEP" | run_hook ledger-outbound.py "$DB_CW"
 emit_inbound 10000000001 2 "MASODIK_UZENET" | run_hook ledger-capture.py "$DB_CW"
 emit_session | run_hook ledger-replay.py "$DB_CW" > "$TMPDIR_BASE/cw.json"
 CW_CTX="$(ctx_of "$TMPDIR_BASE/cw.json")"
-if printf '%s' "$CW_CTX" | grep -q "Gyula:" && printf '%s' "$CW_CTX" | grep -q "Te:"; then
-    pass "replay: turns carry Gyula:/Te: prefixes"
+if printf '%s' "$CW_CTX" | grep -q "Gyula (chat 10000000001):" && printf '%s' "$CW_CTX" | grep -q "Te -> Gyula (chat 10000000001):"; then
+    pass "replay: turns carry the sender name and chat id (single-owner install: OWNER_NAME)"
 else
     fail "replay: missing direction prefixes"
 fi
@@ -290,6 +293,72 @@ sys.exit(0 if (a != -1 and b != -1 and c != -1 and a < b < c) else 1)
     pass "replay: context window is in chronological order"
 else
     fail "replay: context window not in chronological order"
+fi
+
+# --- Card 7c813be5: the sender label comes from principals.json by the chat id ---
+# The measured defect: every inbound turn carried the ONE configured owner name,
+# so a second and a third owner's messages read as the first owner's (six cases
+# by 2026-09-24; a fresh session could answer the wrong person). Three owners
+# write in turn and the agent answers the second: each line must carry its OWN
+# sender's name and id, never OWNER_NAME ('Gyula'); an id outside
+# principals.json reads as unknown, and so does the open question it raises.
+PRINC3="$TMPDIR_BASE/principals-3.json"
+cat > "$PRINC3" <<'EOF'
+{"principals": {
+  "20000000001": {"name": "Aladár", "role": "sysadmin_owner"},
+  "20000000002": {"name": "Bendegúz", "role": "owner"},
+  "20000000003": {"name": "Cecília", "role": "owner"}
+}}
+EOF
+DB_P3="$TMPDIR_BASE/principals3.db"
+export LEDGER_PRINCIPALS_PATH="$PRINC3"
+emit_inbound 20000000001 11 "ELSO_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
+emit_inbound 20000000002 12 "MASODIK_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
+emit_reply 20000000002 "VALASZ_A_MASODIKNAK" | run_hook ledger-outbound.py "$DB_P3"
+emit_inbound 20000000003 13 "HARMADIK_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
+emit_inbound 29999999999 14 "IDEGEN_UZENET" | run_hook ledger-capture.py "$DB_P3"
+age_rows "$DB_P3" 3600
+emit_session | run_hook ledger-replay.py "$DB_P3" > "$TMPDIR_BASE/principals3.json"
+P3_CTX="$(ctx_of "$TMPDIR_BASE/principals3.json")"
+p3_line() { # label marker
+    if printf '%s' "$P3_CTX" | grep -qF "$1: \"$2"; then pass "7c813be5: $2 is labelled '$1'"; else fail "7c813be5: $2 is not labelled '$1'"; fi
+}
+p3_line "Aladár (chat 20000000001)" "ELSO_TULAJ_KERESE"
+p3_line "Bendegúz (chat 20000000002)" "MASODIK_TULAJ_KERESE"
+p3_line "Te -> Bendegúz (chat 20000000002)" "VALASZ_A_MASODIKNAK"
+p3_line "Cecília (chat 20000000003)" "HARMADIK_TULAJ_KERESE"
+p3_line "ismeretlen feladó (chat 29999999999)" "IDEGEN_UZENET"
+if printf '%s' "$P3_CTX" | grep -qF "Gyula"; then
+    fail "7c813be5: OWNER_NAME leaked into a block of an install that has principals.json"
+else
+    pass "7c813be5: OWNER_NAME is not used once principals.json exists"
+fi
+if printf '%s' "$P3_CTX" | grep -qF "ismeretlen feladó utolsó üzenete (chat 29999999999"; then
+    pass "7c813be5: the open question names its own (unknown) sender"
+else
+    fail "7c813be5: the open question does not name its own sender"
+fi
+# The open question of a KNOWN second owner carries that owner's name, not the first one's.
+DB_P3B="$TMPDIR_BASE/principals3b.db"
+emit_inbound 20000000003 21 "CSAK_A_HARMADIK" | run_hook ledger-capture.py "$DB_P3B"
+age_rows "$DB_P3B" 3600
+emit_session | run_hook ledger-replay.py "$DB_P3B" > "$TMPDIR_BASE/principals3b.json"
+P3B_CTX="$(ctx_of "$TMPDIR_BASE/principals3b.json")"
+if printf '%s' "$P3B_CTX" | grep -qF "Cecília utolsó üzenete (chat 20000000003"; then
+    pass "7c813be5: a known owner's open question carries that owner's name"
+else
+    fail "7c813be5: a known owner's open question is mislabelled"
+fi
+# An unreadable principals file must not fall back to the owner name either.
+printf '{broken' > "$TMPDIR_BASE/principals-broken.json"
+export LEDGER_PRINCIPALS_PATH="$TMPDIR_BASE/principals-broken.json"
+emit_session | run_hook ledger-replay.py "$DB_P3" > "$TMPDIR_BASE/principals3c.json"
+unset LEDGER_PRINCIPALS_PATH
+P3C_CTX="$(ctx_of "$TMPDIR_BASE/principals3c.json")"
+if printf '%s' "$P3C_CTX" | grep -qF "ismeretlen feladó (chat 20000000001)" && ! printf '%s' "$P3C_CTX" | grep -qF "Gyula"; then
+    pass "7c813be5: a broken principals.json labels everyone unknown, never the owner"
+else
+    fail "7c813be5: a broken principals.json mislabels"
 fi
 
 # Empty ledger -> no output (no-op)

@@ -112,7 +112,7 @@ def _snippet(text, limit):
     return s
 
 
-def _build_output(transcript, open_q, owner):
+def _build_output(transcript, open_q, open_q_name):
     """Assemble the final SessionStart hook payload dict from the (already
     snippet-trimmed, oldest-first) transcript lines + optional open question.
 
@@ -148,7 +148,7 @@ def _build_output(transcript, open_q, owner):
         chat_id, message_id, text, ts, att_kind, att_file_id = open_q[:6]
         snippet = _snippet(text, _max_snippet())
         parts.append(
-            f'NYITOTT KÉRDÉS (még NEM válaszoltad meg): {owner} utolsó üzenete '
+            f'NYITOTT KÉRDÉS (még NEM válaszoltad meg): {open_q_name} utolsó üzenete '
             f'(chat {chat_id}, message_id {message_id}): "{snippet}". Válaszolj rá '
             f'MOST a telegram reply tool (mcp__plugin_telegram_telegram__reply) '
             f'meghívásával a megfelelő chat_id-re, a lenti kontextusból folytatva.'
@@ -187,17 +187,17 @@ def _payload_bytes(out):
     return len(json.dumps(out, ensure_ascii=False).encode("utf-8"))
 
 
-def _fit_output(transcript, open_q, owner, byte_budget):
+def _fit_output(transcript, open_q, open_q_name, byte_budget):
     """Build the payload and keep it under `byte_budget` by dropping the OLDEST
     turn and re-measuring, iteratively (build -> measure -> trim -> repeat). The
     freshest END survives, the oldest turns fall off first. At least one turn is
     kept when any exist (its snippet is already bounded by _max_snippet, so a
     lone freshest turn still fits)."""
     transcript = list(transcript)
-    out = _build_output(transcript, open_q, owner)
+    out = _build_output(transcript, open_q, open_q_name)
     while len(transcript) > 1 and _payload_bytes(out) > byte_budget:
         transcript.pop(0)
-        out = _build_output(transcript, open_q, owner)
+        out = _build_output(transcript, open_q, open_q_name)
     return out
 
 
@@ -217,12 +217,21 @@ def main():
     if not rows and not open_q:
         sys.exit(0)  # nothing to replay
 
+    # Card 7c813be5: every inbound turn used to carry the ONE configured owner
+    # name, whoever had sent it, so a fresh session read another owner's
+    # requests as the sysadmin's (six measured cases by 2026-09-24). The name now
+    # comes from store/principals.json by the chat id, the id is printed next to
+    # it, an unknown id reads as unknown, and an outbound turn says who it went
+    # to. OWNER_NAME remains only for an install that has no principals file.
     owner = ledger_lib.owner_name()
+    names = ledger_lib.load_principal_names()
+    open_q_name = ledger_lib.sender_name(open_q[0], names, owner) if open_q else owner
 
     max_snippet = _max_snippet()
     transcript = []
     for direction, chat_id, text, ts, att_kind, att_file_id in rows:
-        who = owner if direction == "in" else "Te"
+        name = ledger_lib.sender_name(chat_id, names, owner)
+        who = f"{name} (chat {chat_id})" if direction == "in" else f"Te -> {name} (chat {chat_id})"
         snippet = _snippet(text, max_snippet)
         # A transcript-less voice turn carries its file_id so the fresh session
         # can still fetch the audio content instead of seeing an opaque
@@ -243,7 +252,7 @@ def main():
     # Authoritative guard: keep the FINAL payload's real UTF-8 byte size under the
     # harness's injection cap, dropping oldest turns and re-measuring until it
     # fits (freshest END survives).
-    out = _fit_output(transcript, open_q, owner, _byte_budget())
+    out = _fit_output(transcript, open_q, open_q_name, _byte_budget())
 
     print(json.dumps(out, ensure_ascii=False))
     sys.exit(0)

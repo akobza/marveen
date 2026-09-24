@@ -11,6 +11,7 @@ Generic across all three channel agents (marveen / dia / erno-ba): agent_id is
 derived from the running session's cwd so each session only ever sees its OWN
 chat. Pure stdlib (sqlite3) -- no node startup, no jq.
 """
+import json
 import os
 import sqlite3
 import time
@@ -100,6 +101,51 @@ def owner_name():
     except Exception:
         pass
     return "A felhasználó"
+
+
+# The label a turn gets when its chat id is not a known principal (card 7c813be5). Never the owner's
+# name: a wrong name is worse than none, because a session that believes it answers the wrong person.
+UNKNOWN_SENDER = "ismeretlen feladó"
+
+
+def principals_path():
+    """<install>/store/principals.json, the install's sender-id -> person registry.
+    LEDGER_PRINCIPALS_PATH overrides it (tests), like LEDGER_DB_PATH does the ledger."""
+    return os.environ.get("LEDGER_PRINCIPALS_PATH") or os.path.join(
+        _install_dir(), "store", "principals.json")
+
+
+def load_principal_names():
+    """{sender id: name} from principals.json (card 7c813be5).
+
+    None when the install has no such file: a single-owner install, where the
+    caller keeps labelling with OWNER_NAME. An unreadable file gives {} instead,
+    so every chat reads as unknown rather than as the owner -- the defect this
+    exists for is exactly that every inbound turn was labelled with the one
+    owner name, whoever had sent it.
+    """
+    try:
+        with open(principals_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {}
+    out = {}
+    principals = data.get("principals") if isinstance(data, dict) else None
+    for sid, rec in (principals or {}).items():
+        if isinstance(rec, dict) and isinstance(rec.get("name"), str) and rec["name"].strip():
+            out[str(sid)] = rec["name"].strip()
+    return out
+
+
+def sender_name(chat_id, names, owner):
+    """The name for a turn in this chat: from `names` (load_principal_names()) by
+    the chat id; UNKNOWN_SENDER for an id it does not hold; `owner` only when the
+    install has no principals file at all (names is None)."""
+    if names is None:
+        return owner
+    return names.get(str(chat_id), UNKNOWN_SENDER)
 
 
 def agent_id_from_payload(payload):
