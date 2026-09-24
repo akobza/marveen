@@ -18,7 +18,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import clearstate_lib  # noqa: E402
-import ledger_lib  # noqa: E402
 
 
 def main():
@@ -43,8 +42,7 @@ def main():
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": clearstate_lib.build_injection(
-                record, ledger_lib.owner_name()),
+            "additionalContext": clearstate_lib.build_injection(record),
         }
     }, ensure_ascii=False))
     sys.stdout.flush()
