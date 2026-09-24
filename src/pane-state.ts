@@ -148,7 +148,15 @@ const BUSY_INDICATORS: RegExp[] = [
   // box during a real turn, so the bottom-region scope still catches it.
   //
   // Tokens-down-arrow counter: "(52s · ↓ 2.6k tokens ...", "(1m 16s · ↓ 4.0k tokens)"
-  new RegExp(String.raw`\(\s*${TURN_ELAPSED}\s*·\s*↓\s*\d`),
+  // and, since at least Claude Code 2.1.280, with a status segment in front:
+  // "(running UserPromptSubmit hooks… 13/15 · 46m 37s · ↓ 145.9k tokens)".
+  // 89c95eaf, measured 2026-09-23 12:52Z: that prefixed line did NOT match the
+  // old `\(\s*<elapsed>` shape, the pane read 'idle', and the context-guard
+  // restarted a session 46 minutes into a live turn -- the two channel
+  // messages queued in that claude process were lost with it. The optional
+  // segment is bounded (no parens, no `·`, one line) and the `· ↓N` chrome
+  // tail is still required, so prose cannot produce it.
+  new RegExp(String.raw`\((?:[^()·\n]*·\s*)?\s*${TURN_ELAPSED}\s*·\s*↓\s*\d`),
   // Known spinner labels paired with the turn-scoped `(Ns · ↓` tail on
   // the same line. The tail requirement kills the "Thinking…" prose
   // false positive. Non-exhaustive by design; the bare tokens pattern
