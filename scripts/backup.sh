@@ -762,8 +762,12 @@ echo "backup: WARNING -- archive contains sensitive tokens; keep ${BACKUP_DIR} o
 
 # Keep the newest ${KEEP} archives, drop the rest. while-read (not mapfile)
 # for macOS bash 3.2 compatibility.
+# Second guard, independent of the KEEP check at the top: this run's archive is
+# never pruned, whatever the arithmetic below yields (an overflowing KEEP once
+# made tail list every archive, the new one included).
 ls -1t "${BACKUP_DIR}"/claudeclaw-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
   [[ -z "${f}" ]] && continue
+  [[ "${f}" == "${ARCHIVE}" ]] && { echo "backup: kept $(basename "${f}") (this run's archive is never pruned)" >&2; continue; }
   rm -f "${f}"
   echo "backup: pruned $(basename "${f}")"
 done
