@@ -679,7 +679,8 @@ export async function runMessageRouterTick(): Promise<void> {
       // serializes it with every other writer. Session existence and the abandon rule
       // above still apply, and a worksource agent's STOP goes to its queue like any row.
       const isStop = isStopMessage(msg, MAIN_AGENT_ID)
-      if (!worksourceServing && !(await isSessionReadyForPrompt(session, host)) && !isStop) {
+      const paneNotReady = !worksourceServing && !(await isSessionReadyForPrompt(session, host))
+      if (paneNotReady && !isStop) {
         // A self-drafted feedback modal ("Bug report drafted ... 0 to dismiss")
         // holds the pane in a not-ready state, and the pre-flight dismissal in
         // sendPromptToSession never runs because this gate short-circuits
@@ -754,8 +755,10 @@ export async function runMessageRouterTick(): Promise<void> {
         continue
       }
 
-      // Session is ready — clear stuck tracking.
-      agentStuckSince.delete(msg.to_agent)
+      // Session is ready — clear stuck tracking. A STOP that passed a not-ready pane leaves the
+      // stuck clock running: the pane is still not ready, and clearing it delayed the
+      // [session-stuck] alert by a window per STOP (71263d15 (C), teszter-2 22097 S5).
+      if (!paneNotReady) agentStuckSince.delete(msg.to_agent)
 
       // Classify (channel-inbound / trusted-peer / untrusted) + reject an empty
       // from_agent -- SINGLE SOURCE in agent-message-wrap so the router and the

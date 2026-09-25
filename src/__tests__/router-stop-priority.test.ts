@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 const mockGetPendingMessages = vi.fn()
 const mockMarkDelivered = vi.fn((..._a: unknown[]) => true)
 const mockSendPrompt = vi.fn(async (..._a: unknown[]) => 'sent' as const)
+const mockCreateMessage = vi.fn((..._a: unknown[]) => ({ id: 999 }))
 const ready = new Map<string, boolean>()
 const liveStatus = new Map<number, string | null>()
 
@@ -30,7 +31,7 @@ vi.mock('../db.js', () => ({
   markMessageDone: (..._a: unknown[]) => true,
   markPendingFederatedFailed: (..._a: unknown[]) => true,
   setMessageResult: (..._a: unknown[]) => true,
-  createAgentMessage: (..._a: unknown[]) => ({ id: 999 }),
+  createAgentMessage: (...a: unknown[]) => mockCreateMessage(...a),
   countNewerMessagesFromSameSender: (..._a: unknown[]) => 0,
   stampMessageTrace: (..._a: unknown[]) => false,
   upsertOtelSpan: (..._a: unknown[]) => undefined,
@@ -172,5 +173,45 @@ describe('one router tick with a busy recipient (71263d15 C)', () => {
     expect(text).not.toContain('payload 85')
     expect(mockMarkDelivered.mock.calls.map((c) => c[0])).toEqual([83])
     expect([81, 84, 85].map((id) => liveStatus.get(id))).toEqual(['pending', 'pending', 'pending'])
+  })
+})
+
+describe('a STOP to a not-ready pane leaves the stuck clock running (71263d15 C, teszter-2 22097 S5)', () => {
+  const env = { ...process.env }
+  const MIN = 60_000
+  const T0 = Date.UTC(2026, 8, 25, 10, 0, 0)
+  let rows: AgentMessage[] = []
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.clearAllMocks(); liveStatus.clear(); ready.clear()
+    rows = []
+    mockGetPendingMessages.mockImplementation(() => rows)
+    mockMarkDelivered.mockReturnValue(true)
+    mockSendPrompt.mockImplementation(async () => 'sent' as const)
+    process.env.ROUTER_BATCH_INJECT_AGENTS = 'nobody-opted-in'
+  })
+  afterEach(() => { vi.useRealTimers(); process.env = { ...env } })
+
+  function queue(...rs: AgentMessage[]): void { for (const r of rs) { rows.push(r); liveStatus.set(r.id, 'pending') } }
+  async function tickAt(ms: number): Promise<void> { vi.setSystemTime(ms); await runMessageRouterTick() }
+  const stuckAlerts = (agent: string) => mockCreateMessage.mock.calls
+    .filter((c) => c[1] === 'orin' && String(c[2]).startsWith('[session-stuck]') && String(c[2]).includes(`'${agent}'`))
+
+  it('(c5-control) without a STOP, a pane not ready for over 10 minutes raises one [session-stuck] alert', async () => {
+    queue(row(91, 'fay'))
+    await tickAt(T0)
+    await tickAt(T0 + 9 * MIN)
+    await tickAt(T0 + 10 * MIN + 1_000)
+    expect(stuckAlerts('fay')).toHaveLength(1)
+  })
+
+  it('(c5) ⛔ a STOP that passes the not-ready pane at +9 min does not restart the clock: the alert still comes at +10 min', async () => {
+    queue(row(95, 'gus'))
+    await tickAt(T0)
+    queue(stop(96, 'gus'))
+    await tickAt(T0 + 9 * MIN)
+    expect(mockMarkDelivered.mock.calls.map((c) => c[0])).toEqual([96])
+    await tickAt(T0 + 10 * MIN + 1_000)
+    expect(stuckAlerts('gus')).toHaveLength(1)
   })
 })
