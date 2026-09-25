@@ -1,5 +1,5 @@
-import { CHANNEL_PROVIDER, CHANNEL_TOKEN } from './config.js'
-import { configuredOwnerChatFor, resolveOwnerChatId } from './owner-chat.js'
+import { CHANNEL_PROVIDER, CHANNEL_TOKEN, CHANNEL_CHAT_ID } from './config.js'
+import { resolveOwnerChatId } from './owner-chat.js'
 import { getProvider } from './channel-provider.js'
 import { logger } from './logger.js'
 import { markIfTestRun } from './test-run-marker.js'
@@ -9,10 +9,12 @@ import { markIfTestRun } from './test-run-marker.js'
  * resolver (the provider's configured id first, then the main agent's paired
  * access.json), not the CHANNEL_CHAT_ID frozen at boot. On 2026-09-16 the installer
  * placeholder (0) in the .env sent 470 alerts to nobody during an 18-hour fleet outage,
- * while the owner's chat was in access.json all along.
+ * while the owner's chat was in access.json all along. CHANNEL_CHAT_ID is already the
+ * provider's own configured key (getChannelChatId: ALLOWED_CHAT_ID for Telegram), the
+ * value configuredOwnerChatFor would pick.
  */
 export function resolveNotifyChatId(): string | null {
-  return resolveOwnerChatId(undefined, configuredOwnerChatFor(CHANNEL_PROVIDER), CHANNEL_PROVIDER)
+  return resolveOwnerChatId(undefined, CHANNEL_CHAT_ID, CHANNEL_PROVIDER)
 }
 
 // Card 3ed09d25: an alert with no resolvable owner chat is not dropped in silence. The

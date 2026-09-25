@@ -668,7 +668,7 @@ export async function runMessageRouterTick(): Promise<void> {
       // serializes it with every other writer. Session existence and the abandon rule
       // above still apply, and a worksource agent's STOP goes to its queue like any row.
       const isStop = isStopMessage(msg, MAIN_AGENT_ID)
-      if (!worksourceServing && !isStop && !(await isSessionReadyForPrompt(session, host))) {
+      if (!worksourceServing && !(await isSessionReadyForPrompt(session, host)) && !isStop) {
         // A self-drafted feedback modal ("Bug report drafted ... 0 to dismiss")
         // holds the pane in a not-ready state, and the pre-flight dismissal in
         // sendPromptToSession never runs because this gate short-circuits
