@@ -10,8 +10,10 @@
 #
 #   bash scripts/agent-inbox.sh <agent-id> [--all] [--limit N] [--max CHARS]
 #     default   the PENDING messages addressed to <agent-id>, oldest first, content in full
-#     --all     every status: the most recent --limit messages addressed to <agent-id>
-#     --limit   how many rows to ask the API for (default 50)
+#     --all     every status: the most recent --limit messages addressed to <agent-id>, looked up in
+#               one page of the API (both directions together, at most 200 rows); when that page may
+#               hold fewer incoming messages than asked, the cut is stated
+#     --limit   pending: how many rows to ask the API for; --all: how many incoming to show (default 50)
 #     --max     cut each content at CHARS characters, and say so on the same line:
 #               "[... +K karakter levágva; teljes: bash scripts/agent-msg-get.sh <id>]"
 set -euo pipefail
@@ -33,26 +35,46 @@ done
 TOKEN_FILE="${ROOT}/store/.dashboard-token"
 [[ -r "$TOKEN_FILE" ]] || { echo "FAIL: no dashboard token at ${TOKEN_FILE}" >&2; exit 3; }
 
-URL="http://localhost:3420/api/messages?agent=${AGENT}&limit=${LIMIT}"
-[[ -n "$STATUS" ]] && URL="${URL}&status=${STATUS}"
+# --all (71263d15 K6.12, K6.13): the API lists BOTH directions in one page and caps the page at 200
+# (src/web/routes/messages.ts), so the script asks for a full page and keeps the newest --limit
+# INCOMING rows itself; WANT=-1 is the pending mode, which the API does not cut.
+PAGE=200; WANT=-1
+if [[ -n "$STATUS" ]]; then
+  URL="http://localhost:3420/api/messages?agent=${AGENT}&limit=${LIMIT}&status=${STATUS}"
+else
+  URL="http://localhost:3420/api/messages?agent=${AGENT}&limit=${PAGE}"; WANT="$LIMIT"
+fi
 
 # The HTTP status is checked, not assumed: an error body would otherwise read as an empty inbox.
+# curl's own failure (no dashboard: exit 7) must reach the FAIL line as HTTP 000, not end the
+# script in silence under set -e (71263d15 K6.14).
 OUT="$(mktemp)"; trap 'rm -f "$OUT"' EXIT
-CODE="$(curl -s -o "$OUT" -w '%{http_code}' -H "Authorization: Bearer $(cat "$TOKEN_FILE")" "$URL")"
+CODE="$(curl -s -o "$OUT" -w '%{http_code}' -H "Authorization: Bearer $(cat "$TOKEN_FILE")" "$URL" || true)"
 if [[ "$CODE" != "200" ]]; then
   echo "FAIL: GET ${URL#http://localhost:3420} -> HTTP ${CODE}" >&2
   head -c 400 "$OUT" >&2; echo >&2
   exit 4
 fi
 
-python3 - "$OUT" "$AGENT" "$MAX" <<'PY'
+python3 - "$OUT" "$AGENT" "$MAX" "$WANT" "$PAGE" <<'PY'
 import datetime, json, sys
 path, agent, cut = sys.argv[1], sys.argv[2], int(sys.argv[3])
+want = int(sys.argv[4]) if len(sys.argv) > 4 else -1
+page = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 d = json.load(open(path, encoding='utf-8'))
-rows = d if isinstance(d, list) else d.get('messages', [])
+listed = d if isinstance(d, list) else d.get('messages', [])
 # The list endpoint returns both directions for an agent; an inbox is what came IN.
-rows = sorted((m for m in rows if m.get('to_agent') == agent), key=lambda m: m.get('id') or 0)
+rows = sorted((m for m in listed if m.get('to_agent') == agent), key=lambda m: m.get('id') or 0)
+cut_note = None
+if want >= 0:
+    if len(rows) > want:
+        rows = rows[len(rows) - want:]
+    elif len(rows) < want and len(listed) >= page:
+        cut_note = (f"# a lista vágva lehet: a szerver egy lapon legfeljebb {page} sort ad, a két irányt együtt, "
+                    f"és ezen a lapon {len(rows)} bejövő fért el a kért {want} helyett; régebbi bejövő is lehet")
 print(f"# {len(rows)} message(s) to {agent}")
+if cut_note:
+    print(cut_note)
 for m in rows:
     content = m.get('content') or ''
     ts = m.get('created_at')
