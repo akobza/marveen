@@ -557,6 +557,17 @@ export async function runMessageRouterTick(): Promise<void> {
       agentWasAbsent.delete(agent)
       agentAbsentSince.delete(agent)
     }
+    // Card 71263d15 (A), S1 (teszter-2 22097): the clock stands for absence seen at EVERY
+    // tick. A receiver with no row in this tick's window was not looked at, so whether it
+    // came back in the meantime is unknown: its clock is dropped, and restarts at the next
+    // tick that sees it absent. Without this, a receiver whose rows had all been abandoned
+    // or closed kept its old clock while it was back and working, and a fresh message met a
+    // 5 s blip as "absent for the whole window". The round-robin window looks at every
+    // receiver with a pending row (up to MAX_MESSAGES_PER_TICK of them), so a receiver that
+    // still has work waiting keeps its clock.
+    for (const agent of agentAbsentSince.keys()) {
+      if (!receiversInTick.has(agent)) agentAbsentSince.delete(agent)
+    }
 
     // Federated (slash-qualified) recipients delivered over the HTTPS bridge,
     // on their own budget so neither queue starves the other.

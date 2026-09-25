@@ -207,6 +207,40 @@ describe('71263d15 (A): the absence clock decides, not the message age', () => {
     await tickAt(T0 + 61 * MIN)
     expect(noticesTo('geri')).toHaveLength(0)
   })
+  it('(a8) ⛔ S1: after an abandon, a recipient that came back unobserved does not keep the old clock', async () => {
+    // teszter-2 22097 S1a: its rows were all abandoned, so no tick looked at the recipient any more;
+    // hours later a FRESH message met a 5 s blip and failed at once, as "absent for the whole window".
+    queue(row(801, 'hal', 'geri', T0))
+    present.set('agent-hal', false)
+    await tickAt(T0)
+    await tickAt(T0 + 61 * MIN)
+    expect(failedIds()).toContain(801)      // the real 61-minute absence still fails
+    present.set('agent-hal', true)          // back, with nothing pending: no tick looks at it
+    await tickAt(T0 + 90 * MIN)
+    queue(row(802, 'hal', 'geri', T0 + 300 * MIN))
+    present.set('agent-hal', false)         // a restart blip, seconds long
+    await tickAt(T0 + 300 * MIN + 5_000)
+    expect(failedIds()).not.toContain(802)
+    expect(liveStatus.get(802)).toBe('pending')
+    // The clock is not switched off: it restarted at the blip, and 61 minutes on it fails.
+    await tickAt(T0 + 361 * MIN + 5_001)
+    expect(failedIds()).toContain(802)
+  })
+
+  it('(a9) ⛔ S1: a row closed from outside while its recipient was absent leaves no clock behind', async () => {
+    // teszter-2 22097 S1b: absent on one tick only, the row closed through the status endpoint.
+    queue(row(901, 'ida', 'geri', T0))
+    present.set('agent-ida', false)
+    await tickAt(T0)
+    liveStatus.set(901, 'done')
+    present.set('agent-ida', true)
+    await tickAt(T0 + 1 * MIN)
+    queue(row(902, 'ida', 'geri', T0 + 120 * MIN))
+    present.set('agent-ida', false)
+    await tickAt(T0 + 120 * MIN + 5_000)
+    expect(failedIds()).not.toContain(902)
+    expect(liveStatus.get(902)).toBe('pending')
+  })
 })
 
 describe('71263d15 (A): who may get a sender notice, and what it says', () => {
