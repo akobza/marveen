@@ -41,7 +41,15 @@ vi.mock('../db.js', async (orig) => ({
 
 /** State the resolver reads. Only the two lookups are faked -- the verdict
  *  itself runs for real, so a wrong decision still fails here. */
-let fakeState = { isolatedConfigDir: null as string | null, fleetToken: false, isolatedDirExists: false }
+/** 80d46c59: the setting with its source. MISSING (registry default) is what every
+ *  pre-80d46c59 case here meant, so those cases keep their expectations. */
+const MISSING = { value: '0' as string | number, source: 'default' as 'override' | 'env' | 'default' }
+let fakeState = {
+  isolatedConfigDir: null as string | null,
+  fleetToken: false,
+  isolatedDirExists: false,
+  isolationSetting: MISSING,
+}
 vi.mock('../web/agent-process.js', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   ensureMainAgentIsolatedConfigDir: () => fakeState.isolatedConfigDir,
@@ -59,7 +67,7 @@ beforeEach(() => {
   ROOT = mkdtempSync(join(tmpdir(), 'mcguard-'))
   require('node:fs').mkdirSync(join(ROOT, 'store'), { recursive: true })
   sent.length = 0
-  fakeState = { isolatedConfigDir: null, fleetToken: false, isolatedDirExists: false }
+  fakeState = { isolatedConfigDir: null, fleetToken: false, isolatedDirExists: false, isolationSetting: MISSING }
 })
 afterEach(() => { rmSync(ROOT, { recursive: true, force: true }) })
 
@@ -68,7 +76,7 @@ describe('THE HEALTHY LAUNCH LEAVES A TRACE TOO', () => {
     // Without this line the guard's silence would mean either "all well" or
     // "never ran", and on 2026-08-04 it meant the second while looking like the
     // first for four hours.
-    fakeState = { isolatedConfigDir: '/srv/m/.channels-config', fleetToken: true, isolatedDirExists: true }
+    fakeState = { isolatedConfigDir: '/srv/m/.channels-config', fleetToken: true, isolatedDirExists: true, isolationSetting: MISSING }
     const d = resolveMainConfigDecision()
     expect(d.trigger).toBeNull()
     expect(log()).toContain('isolated CLAUDE_CONFIG_DIR=/srv/m/.channels-config')
@@ -85,7 +93,7 @@ describe('THE HEALTHY LAUNCH LEAVES A TRACE TOO', () => {
 
 describe('THE REGRESSION LAUNCH BOTH LOGS AND TELLS SOMEBODY', () => {
   it('warns in the log AND messages the main agent when isolation was lost', () => {
-    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: true }
+    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: true, isolationSetting: MISSING }
     const d = resolveMainConfigDecision()
     expect(d.trigger).toBe('isolation-lost')
     expect(log()).toContain('WARN isolation-lost')
@@ -96,7 +104,7 @@ describe('THE REGRESSION LAUNCH BOTH LOGS AND TELLS SOMEBODY', () => {
   })
 
   it('warns for an unused fleet token as well', () => {
-    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: false }
+    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: false, isolationSetting: MISSING }
     expect(resolveMainConfigDecision().trigger).toBe('fleet-token-unused')
     expect(sent).toHaveLength(1)
   })
@@ -105,12 +113,40 @@ describe('THE REGRESSION LAUNCH BOTH LOGS AND TELLS SOMEBODY', () => {
     // The hard restart can fire repeatedly on a wedged session. One notice per
     // attempt would bury the first -- the shape of the 2026-08-10 handoff chain.
     // The log line is not suppressed: it costs nothing and it is the series.
-    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: true }
+    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: true, isolationSetting: MISSING }
     resolveMainConfigDecision()
     resolveMainConfigDecision()
     expect(sent).toHaveLength(1)
     expect(log().match(/WARN isolation-lost/g) ?? []).toHaveLength(2)
     expect(log()).toContain('notice suppressed')
+  })
+})
+
+// 80d46c59: what the operator READS. An explicit 0 must not be told it is "not set", and a 1
+// that resolved to nothing must not be told to set it to 1.
+describe('THE NOTICE SAYS WHAT IS TRUE ABOUT THE SETTING', () => {
+  it('an explicit 0 (override) with a fleet token: the declined notice, never "nincs beallitva"', () => {
+    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: false, isolationSetting: { value: '0', source: 'override' } }
+    expect(resolveMainConfigDecision().trigger).toBe('isolation-declined')
+    expect(log()).toContain('WARN isolation-declined')
+    expect(sent).toHaveLength(1)
+    expect(sent[0][2]).toContain('KIFEJEZETTEN nem 1')
+    expect(sent[0][2]).not.toContain('nincs beallitva')
+    expect(sent[0][2]).not.toContain('elveszett')
+  })
+
+  it('a 1 that resolved to nothing: the unresolved notice, which does not tell anyone to set it to 1', () => {
+    fakeState = { isolatedConfigDir: null, fleetToken: false, isolatedDirExists: false, isolationSetting: { value: '1', source: 'env' } }
+    expect(resolveMainConfigDecision().trigger).toBe('isolation-unresolved')
+    expect(sent).toHaveLength(1)
+    expect(sent[0][2]).toContain('MAIN_AGENT_ISOLATED_CONFIG=1: az izolalas be van kapcsolva')
+    expect(sent[0][2]).not.toContain('nincs beallitva')
+  })
+
+  it('CONTROL: the missing setting still gets the "nincs beallitva" notice -- the assertions above can fail', () => {
+    fakeState = { isolatedConfigDir: null, fleetToken: true, isolatedDirExists: false, isolationSetting: MISSING }
+    expect(resolveMainConfigDecision().trigger).toBe('fleet-token-unused')
+    expect(sent[0][2]).toContain('nincs beallitva')
   })
 })
 

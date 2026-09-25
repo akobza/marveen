@@ -22,10 +22,19 @@
 // right, and in particular that it stays SILENT on a stock install.
 
 import { describe, it, expect } from 'vitest'
-import { mainSharedConfigTrigger } from '../web/agent-process.js'
+import { mainSharedConfigTrigger, MAIN_ISOLATION_SETTING_MISSING } from '../web/agent-process.js'
 
-/** The three facts the decision reads, with the quiet default install as base. */
-const stock = { isolatedConfigDir: null, fleetToken: false, isolatedDirExists: false }
+/** The facts the decision reads, with the quiet default install as base: the setting
+ *  itself is MISSING (registry default '0'), which is what a stock install carries. */
+const stock = {
+  isolatedConfigDir: null,
+  fleetToken: false,
+  isolatedDirExists: false,
+  isolationSetting: MAIN_ISOLATION_SETTING_MISSING,
+}
+/** 80d46c59: the same '0', set on purpose -- by the dashboard override or by a .env key. */
+const override0 = { value: '0', source: 'override' as const }
+const env0 = { value: '0', source: 'env' as const }
 
 describe('the guard stays silent where silence is correct', () => {
   it('says nothing on a stock install: no isolation, no token, no dir', () => {
@@ -42,6 +51,7 @@ describe('the guard stays silent where silence is correct', () => {
       isolatedConfigDir: '/srv/marveen/.channels-config',
       fleetToken: true,
       isolatedDirExists: true,
+      isolationSetting: { value: '1', source: 'override' },
     })).toBeNull()
   })
 })
@@ -66,8 +76,37 @@ describe('the two triggers, and which one wins when both could apply', () => {
     // would send the operator to "turn isolation on" when the truth is "your
     // setting disappeared", which is a different investigation.
     expect(mainSharedConfigTrigger({
-      isolatedConfigDir: null, fleetToken: true, isolatedDirExists: true,
+      ...stock, fleetToken: true, isolatedDirExists: true,
     })).toBe('isolation-lost')
+  })
+})
+
+// 80d46c59: the value '0' says nothing about WHY it is '0'. These fail on the pre-80d46c59
+// decision, which read an explicit 0 as a missing setting and told the operator "nincs
+// beallitva" every 6 hours -- after they had turned isolation off on purpose.
+describe('an explicit 0 is a DECLINED isolation, and a 1 that resolved to nothing is its own state', () => {
+  it('explicit 0 from the dashboard override, with a fleet token: declined, not unset', () => {
+    expect(mainSharedConfigTrigger({ ...stock, fleetToken: true, isolationSetting: override0 })).toBe('isolation-declined')
+  })
+
+  it('explicit 0 from a .env key, with a .channels-config on disk: declined, not lost', () => {
+    expect(mainSharedConfigTrigger({ ...stock, isolatedDirExists: true, isolationSetting: env0 })).toBe('isolation-declined')
+  })
+
+  it('explicit 0 with no token and no dir stays silent, like the stock install', () => {
+    expect(mainSharedConfigTrigger({ ...stock, isolationSetting: override0 })).toBeNull()
+    expect(mainSharedConfigTrigger({ ...stock, isolationSetting: env0 })).toBeNull()
+  })
+
+  it('setting 1 but nothing resolved: unresolved, whether or not a token or a dir is there', () => {
+    for (const extra of [{}, { fleetToken: true }, { isolatedDirExists: true }]) {
+      expect(mainSharedConfigTrigger({ ...stock, ...extra, isolationSetting: { value: '1', source: 'env' } })).toBe('isolation-unresolved')
+    }
+  })
+
+  it('a MISSING setting keeps the two original triggers exactly as before', () => {
+    expect(mainSharedConfigTrigger({ ...stock, fleetToken: true })).toBe('fleet-token-unused')
+    expect(mainSharedConfigTrigger({ ...stock, isolatedDirExists: true })).toBe('isolation-lost')
   })
 })
 
@@ -78,7 +117,9 @@ describe('POSITIVE CONTROL', () => {
     const speaks = [
       mainSharedConfigTrigger({ ...stock, fleetToken: true }),
       mainSharedConfigTrigger({ ...stock, isolatedDirExists: true }),
+      mainSharedConfigTrigger({ ...stock, fleetToken: true, isolationSetting: override0 }),
+      mainSharedConfigTrigger({ ...stock, isolationSetting: { value: '1', source: 'override' } }),
     ].filter((t) => t !== null)
-    expect(speaks).toHaveLength(2)
+    expect(new Set(speaks)).toEqual(new Set(['fleet-token-unused', 'isolation-lost', 'isolation-declined', 'isolation-unresolved']))
   })
 })

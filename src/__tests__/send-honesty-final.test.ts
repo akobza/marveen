@@ -131,9 +131,13 @@ describe('generated prod-tree post-checkout hook: honest alert delivery', () => 
 
 describe('channels.sh guard POSTs: source-pinned honest delivery (unsafe to execute)', () => {
   const src = readFileSync(join(ROOT, 'scripts', 'channels.sh'), 'utf-8')
-  it('both guard POSTs capture the HTTP code and log a delivery failure', () => {
+  it('every guard POST captures the HTTP code and logs a delivery failure', () => {
+    // 80d46c59: the two trigger blocks became one verdict-driven block with ONE POST. The pin is
+    // the pairing (each guard POST has its honest-delivery line), not a hardcoded count of two.
+    const posts = src.match(/\\"from\\":\\"channels-sh-guard\\"/g) ?? []
     const matches = src.match(/guard alert POST failed/g) ?? []
-    expect(matches.length).toBe(2)
+    expect(posts.length).toBeGreaterThan(0)
+    expect(matches.length).toBe(posts.length)
     expect(src).not.toMatch(/api\/messages[\s\S]{0,400}>\/dev\/null 2>&1 \|\| true/)
   })
   it('KNOWN-POSITIVE for the pin: the pre-fix shape fails it', () => {

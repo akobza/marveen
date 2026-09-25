@@ -37,6 +37,7 @@ import {
   resolveMainAgentRotatedConfigDir,
   readMainSharedConfigState,
   mainSharedConfigTrigger,
+  MAIN_ISOLATION_SETTING_MISSING,
   type MainSharedConfigTrigger,
 } from './agent-process.js'
 
@@ -79,6 +80,11 @@ const HU_ADVICE: Record<Exclude<MainSharedConfigTrigger, null>, string> = {
     '[GUARD] A fo agens most a KOZOS ~/.claude alol indult ujra, pedig van flotta setup-token (store/.claude-oauth-token). A MAIN_AGENT_ISOLATED_CONFIG nincs beallitva, ezert az auth a rotalodo megosztott credentialbol megy: ez lejarhat, 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd a fo session ujrainditasa.',
   'isolation-lost':
     '[GUARD] A fo agens most a KOZOS ~/.claude alol indult ujra, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd a fo session ujrainditasa.',
+  // 80d46c59: the two states the texts above used to misname. Neither says "nincs beallitva".
+  'isolation-declined':
+    '[GUARD] A fo agens most a KOZOS ~/.claude alol indult ujra, mert a MAIN_AGENT_ISOLATED_CONFIG KIFEJEZETTEN nem 1 (dashboard-feluliras vagy .env kulcs allitja). Ez dontes, nem hianyzo beallitas: ha szandekos, nincs teendo. A kockazat ettol meg all: az auth a rotalodo megosztott credentialbol megy, ami lejarhat es 401-be viheti a csatornat. Ha nem szandekos: MAIN_AGENT_ISOLATED_CONFIG=1, majd a fo session ujrainditasa.',
+  'isolation-unresolved':
+    '[GUARD] A fo agens most a KOZOS ~/.claude alol indult ujra, pedig a MAIN_AGENT_ISOLATED_CONFIG=1: az izolalas be van kapcsolva, de a config dir feloldasa uresen jott vissza (nincs flotta setup-token a store/.claude-oauth-token-ben, vagy a dir nem hozhato letre). Az auth a rotalodo megosztott credentialbol megy, 401-veszely. Teendo: a store/.claude-oauth-token es a channels-failures.log izolacios sorainak ellenorzese, majd a fo session ujrainditasa.',
 }
 
 function line(text: string): void {
@@ -172,6 +178,8 @@ export function mainConfigDecisionForTest(
     isolatedConfigDir,
     ownCredentials,
     fleetToken,
-    trigger: partial.trigger ?? mainSharedConfigTrigger({ isolatedConfigDir, fleetToken, isolatedDirExists: false }),
+    trigger:
+      partial.trigger ??
+      mainSharedConfigTrigger({ isolatedConfigDir, fleetToken, isolatedDirExists: false, isolationSetting: MAIN_ISOLATION_SETTING_MISSING }),
   } as MainConfigDecision
 }

@@ -57,18 +57,31 @@ function coerce(def: SettingDefinition, raw: string | number): string | number {
   return String(raw)
 }
 
+/** Where an effective setting value came from (80d46c59). */
+export type SettingSource = 'override' | 'env' | 'default'
+
 // Resolves the effective value for a registered key: override > .env >
 // registry default. Reads .env fresh (cheap, scoped to one key) rather than
 // relying on the boot-time config.ts constants, so this resolution stays
 // correct independent of when the process last restarted.
-export function getEffectiveSettingValue(key: string): string | number {
+//
+// 80d46c59: the same resolution, with its SOURCE. A value equal to the registry
+// default can mean "never set" or "explicitly set to that value" -- for
+// MAIN_AGENT_ISOLATED_CONFIG a '0' is either a missing setting or a declined
+// isolation -- and only the source tells them apart. getEffectiveSettingValue
+// delegates here, so the resolution order lives in ONE place.
+export function getEffectiveSettingWithSource(key: string): { value: string | number; source: SettingSource } {
   ensureWatching()
   const def = getSettingDefinition(key)
   if (!def) throw new Error(`Unknown setting key: ${key}`)
-  if (key in cache) return coerce(def, cache[key])
+  if (key in cache) return { value: coerce(def, cache[key]), source: 'override' }
   const envValue = readEnvFile([key])[key]
-  if (envValue !== undefined) return coerce(def, envValue)
-  return def.default
+  if (envValue !== undefined) return { value: coerce(def, envValue), source: 'env' }
+  return { value: def.default, source: 'default' }
+}
+
+export function getEffectiveSettingValue(key: string): string | number {
+  return getEffectiveSettingWithSource(key).value
 }
 
 export interface SetOverrideResult {

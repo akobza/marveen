@@ -18,6 +18,16 @@
 // (agent-process.ts).
 //
 // Usage: node scripts/main-agent-isolated-config.mjs [provider]
+//        node scripts/main-agent-isolated-config.mjs --verdict
+//
+// --verdict (80d46c59): provisions NOTHING and prints only "shared\t<trigger>" --
+// the respawn guard's own decision (mainSharedConfigTrigger) about a launch that
+// resolved to the shared root: none | fleet-token-unused | isolation-lost |
+// isolation-declined | isolation-unresolved. channels.sh asks for it only when no
+// isolation applied, so its notice says what the respawn guard would say, from
+// the setting's source. Prints nothing if the verdict cannot be computed; the
+// caller then falls back to a text that does not guess. The default mode's output
+// contract below is unchanged, and the other two callers never pass the flag.
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { writeSync, fstatSync } from 'node:fs'
@@ -44,9 +54,16 @@ let CONTRACT_FD = 3
 try { fstatSync(CONTRACT_FD) } catch { CONTRACT_FD = 1 }
 const emitContract = (line) => writeSync(CONTRACT_FD, line)
 
-const { ensureMainAgentIsolatedConfigDir, resolveMainAgentConfigDir, resolveMainAgentRotatedConfigDir } = await import(
-  join(projectRoot, 'dist', 'web', 'agent-process.js')
-)
+const {
+  ensureMainAgentIsolatedConfigDir,
+  resolveMainAgentConfigDir,
+  resolveMainAgentRotatedConfigDir,
+  readMainSharedConfigState,
+  mainSharedConfigTrigger,
+} = await import(join(projectRoot, 'dist', 'web', 'agent-process.js'))
+
+const args = process.argv.slice(2)
+const verdictMode = args.includes('--verdict')
 
 // Output contract (consumed by scripts/channels.sh): "<mode>\t<path>", or nothing
 // at all when none of the three paths apply. The mode decides how the caller
@@ -62,16 +79,27 @@ const { ensureMainAgentIsolatedConfigDir, resolveMainAgentConfigDir, resolveMain
 // choice, never part of the rotation pool -- design 6.2). Rotated wins over
 // plain isolated because a recorded rotation is a stronger, more specific
 // signal than the generic flotta fallback.
-const explicit = resolveMainAgentConfigDir()
-if (explicit) {
-  emitContract(`explicit\t${explicit}\n`)
+if (verdictMode) {
+  // The caller only asks after nothing isolated applied, so the resolved dir is null here.
+  let verdict
+  try {
+    verdict = `shared\t${mainSharedConfigTrigger(readMainSharedConfigState(null)) ?? 'none'}\n`
+  } catch {
+    verdict = null
+  }
+  if (verdict) emitContract(verdict)
 } else {
-  const rotated = resolveMainAgentRotatedConfigDir()
-  if (rotated) {
-    emitContract(`rotated\t${rotated}\n`)
+  const explicit = resolveMainAgentConfigDir()
+  if (explicit) {
+    emitContract(`explicit\t${explicit}\n`)
   } else {
-    const provider = process.argv[2] || undefined
-    const dir = ensureMainAgentIsolatedConfigDir(provider)
-    if (dir) emitContract(`isolated\t${dir}\n`)
+    const rotated = resolveMainAgentRotatedConfigDir()
+    if (rotated) {
+      emitContract(`rotated\t${rotated}\n`)
+    } else {
+      const provider = args.find((a) => !a.startsWith('--')) || undefined
+      const dir = ensureMainAgentIsolatedConfigDir(provider)
+      if (dir) emitContract(`isolated\t${dir}\n`)
+    }
   }
 }

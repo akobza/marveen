@@ -60,7 +60,7 @@ import { decideContinueFlag, verifyContinueLaunch } from './channel-continue-pol
 import { measureClaudeCliVersion } from './claude-cli-version.js'
 import { getClaudePidForSession, probeChannelPluginLiveness } from '../channel-coordinator/liveness.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE } from '../config.js'
-import { getEffectiveSettingValue } from '../settings-store.js'
+import { getEffectiveSettingValue, getEffectiveSettingWithSource, type SettingSource } from '../settings-store.js'
 import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInherited } from './mcp-inheritance.js'
 import { readEnvFile } from '../env.js'
 import { loadProfileTemplate } from './profiles.js'
@@ -544,15 +544,29 @@ export function readExtraChannelPluginIds(): string[] {
  * stay silent, or the guard becomes noise on every stock install.
  */
 export type MainSharedConfigTrigger =
-  /** A fleet setup-token exists but the resolution came back empty: the setting
-   *  is missing, not declined. Shape of issue #835; the isolation-lost trigger
-   *  is structurally blind to it because there is no .channels-config dir yet. */
+  /** A fleet setup-token exists, the setting is MISSING (registry default) and
+   *  the resolution came back empty. Shape of issue #835; the isolation-lost
+   *  trigger is structurally blind to it because there is no .channels-config dir yet. */
   | 'fleet-token-unused'
-  /** This install HAS run isolated (its .channels-config is still on disk), yet
-   *  this launch resolved to the shared root -- so the setting was LOST, e.g.
-   *  store/config-overrides.json deleted with no .env key behind it. */
+  /** This install HAS run isolated (its .channels-config is still on disk), the
+   *  setting is MISSING, and this launch resolved to the shared root -- so the
+   *  setting was LOST, e.g. store/config-overrides.json deleted with no .env key behind it. */
   | 'isolation-lost'
+  /** 80d46c59: the setting is EXPLICITLY not 1 (an override or a .env key), with a
+   *  fleet token or a .channels-config on disk. A declined isolation, not a missing
+   *  one: calling it "unset" is false, and a false alarm every 6 hours teaches the
+   *  operator to skip the real one. */
+  | 'isolation-declined'
+  /** 80d46c59: the setting IS 1, yet the resolution came back empty (no fleet token,
+   *  or the dir could not be provisioned). Isolation was asked for and did not happen. */
+  | 'isolation-unresolved'
   | null
+
+/** The MAIN_AGENT_ISOLATED_CONFIG setting as the guard reads it: the value AND its source. */
+export type MainIsolationSetting = { value: string | number; source: SettingSource }
+
+/** The state a launch with no setting at all produces (registry default '0'). */
+export const MAIN_ISOLATION_SETTING_MISSING: MainIsolationSetting = { value: '0', source: 'default' }
 
 export function mainSharedConfigTrigger(state: {
   /** The resolved isolated CLAUDE_CONFIG_DIR, or null for the shared root. */
@@ -561,9 +575,21 @@ export function mainSharedConfigTrigger(state: {
   fleetToken: boolean
   /** PROJECT_ROOT/.channels-config exists on disk. */
   isolatedDirExists: boolean
+  /** 80d46c59: MAIN_AGENT_ISOLATED_CONFIG with its source (override / env / default). */
+  isolationSetting: MainIsolationSetting
 }): MainSharedConfigTrigger {
   // Running isolated -- the whole point of the guard is already satisfied.
   if (state.isolatedConfigDir) return null
+  // 80d46c59: the setting is 1 and still nothing came back -- asked for, not delivered.
+  // Fires without a token or dir too: a requested isolation that cannot happen is
+  // never the "plain default install" the silence rule below protects.
+  if (String(state.isolationSetting.value) === '1') return 'isolation-unresolved'
+  // 80d46c59: explicitly not 1 is a DECISION. It is only worth a notice where the
+  // missing-setting triggers would have fired (a token or a .channels-config), and
+  // then it must say what is true: declined, not "unset" and not "lost".
+  if (state.isolationSetting.source !== 'default') {
+    return state.isolatedDirExists || state.fleetToken ? 'isolation-declined' : null
+  }
   // Order matters, and it mirrors channels.sh: the dir on disk is the stronger
   // evidence (isolation demonstrably worked here once), so it wins when both
   // could apply. Swapping these would report a LOST setting as a fresh install
@@ -580,11 +606,25 @@ export function readMainSharedConfigState(isolatedConfigDir: string | null): {
   isolatedConfigDir: string | null
   fleetToken: boolean
   isolatedDirExists: boolean
+  isolationSetting: MainIsolationSetting
 } {
   return {
     isolatedConfigDir,
     fleetToken: hasFleetOauthToken(),
     isolatedDirExists: existsSync(join(PROJECT_ROOT, '.channels-config')),
+    isolationSetting: readMainIsolationSetting(),
+  }
+}
+
+/** 80d46c59: the setting with its source, through the settings-store's one resolution.
+ *  An unreadable store reads as MISSING: the guard then says what it said before this
+ *  change, and the failure is logged, never thrown into a restart. */
+function readMainIsolationSetting(): MainIsolationSetting {
+  try {
+    return getEffectiveSettingWithSource('MAIN_AGENT_ISOLATED_CONFIG')
+  } catch (err) {
+    logger.warn({ err }, 'main-config guard: MAIN_AGENT_ISOLATED_CONFIG could not be read, treating it as missing')
+    return MAIN_ISOLATION_SETTING_MISSING
   }
 }
 
