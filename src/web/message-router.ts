@@ -35,7 +35,7 @@ import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, isChannelInboundSender, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
 import { maybeWakeSubAgentsForTelegram } from './telegram-inbox-wake.js'
-import { selectTickWindow } from './message-router-window.js'
+import { isStopMessage, selectTickWindow } from './message-router-window.js'
 
 // A message that cannot be delivered within this window (target session never
 // exists / stays busy) is marked failed so it stops clogging the pending
@@ -662,7 +662,13 @@ export async function runMessageRouterTick(): Promise<void> {
         continue
       }
 
-      if (!worksourceServing && !(await isSessionReadyForPrompt(session, host))) {
+      // Card 71263d15 (C), 795d1f48: a STOP row does not wait for the pane to be ready.
+      // Typed into a busy pane and submitted, it is queued by Claude Code and surfaced at
+      // the next tool boundary ("while you were working"); the pane send lane still
+      // serializes it with every other writer. Session existence and the abandon rule
+      // above still apply, and a worksource agent's STOP goes to its queue like any row.
+      const isStop = isStopMessage(msg, MAIN_AGENT_ID)
+      if (!worksourceServing && !isStop && !(await isSessionReadyForPrompt(session, host))) {
         // A self-drafted feedback modal ("Bug report drafted ... 0 to dismiss")
         // holds the pane in a not-ready state, and the pre-flight dismissal in
         // sendPromptToSession never runs because this gate short-circuits
@@ -901,7 +907,10 @@ export async function runMessageRouterTick(): Promise<void> {
             if (mates.lastTraceCtx) traceCtxToRecord = mates.lastTraceCtx
             logger.info({ head: msg.id, to: msg.to_agent, batchSize: mates.items.length + 1, remaining: mates.remaining }, 'message-router: multi-envelope injection')
           } else {
-            await sendPromptToSession(session, prefix + wrapped, host)
+            // STOP: no idle wait (the 12 s budget exists to find an idle gap, and a STOP
+            // must not wait for one).
+            await sendPromptToSession(session, prefix + wrapped, host, isStop ? { waitForIdle: false } : undefined)
+            if (isStop) logger.info({ id: msg.id, to: msg.to_agent }, 'message-router: STOP row sent without waiting for an idle pane')
           }
         }
         if (!markMessageDelivered(msg.id)) {
@@ -985,6 +994,9 @@ function collectBatchMates(
   agentSessionCache: Map<string, {host: string | null, session: string, exists: boolean, worksource: boolean}>,
 ): { items: { prefix: string; wrapped: string }[]; rows: AgentMessage[]; remaining: number; lastTraceCtx: { trace_id: string; span_id: string } | null } {
   const empty = { items: [], rows: [], remaining: 0, lastTraceCtx: null }
+  // Card 71263d15 (C): a STOP head goes alone. Its mates would ride past the readiness
+  // gate into a busy pane with it, and ordinary rows must keep waiting for an idle one.
+  if (isStopMessage(head, MAIN_AGENT_ID)) return empty
   const cap = batchInjectCapFor(head.to_agent)
   if (cap < 2) return empty
   if (agentSessionCache.get(head.to_agent)?.worksource) return empty
