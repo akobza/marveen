@@ -10,9 +10,15 @@
 #
 # Usage:  bash scripts/agent-msg.sh <from> <to> "<content>"
 #   content: plain text (quotes / newlines OK) -- the body is built with json.dumps (no quoting pitfalls).
-#   large / multi-line content may come from STDIN when the 3rd arg is "-":
-#     echo "<long text>" | bash scripts/agent-msg.sh <from> <to> -
-# Output: success -> "OK id=<n>"; failure -> "FAIL <reason>" + a line in store/agent-msg-failures.log, exit 1.
+#   large / multi-line content may come from STDIN when the 3rd arg is "-", from a QUOTED heredoc
+#   (a backtick or $(...) inside double quotes runs in YOUR shell before this script sees the text):
+#     cat > msg.txt <<'MSG'
+#     <long text>
+#     MSG
+#     bash scripts/agent-msg.sh <from> <to> - < msg.txt
+# Output: success -> "OK id=<n>"; failure -> "FAIL <reason>" + a line in store/agent-msg-failures.log, exit 1;
+#   refused by the content gate (see below) -> "REFUSED: <reason>", nothing sent, nothing logged, exit 2.
+#   refused by the homoglyph gate (see below) -> nothing sent, exit 3; the homoglyph checker itself failed -> exit 4.
 #
 # LOG FORMAT, store/agent-msg-failures.log (tab-separated, one line per failure):
 #   <YYYY-MM-DD HH:MM:SS>  FAIL  from=<a>  to=<b>  url=<endpoint>  http=<code>  resp=<first 200 bytes>
@@ -42,7 +48,8 @@ URL="${API_BASE}/api/messages"
 LOG="$BASE/store/agent-msg-failures.log"
 
 FROM="${1:?from required}"; TO="${2:?to required}"; C="${3:?content required (or - for STDIN)}"
-[ "$C" = "-" ] && C="$(cat)"
+SRC=argv
+if [ "$C" = "-" ]; then C="$(cat)"; SRC=stdin; fi
 [ -r "$TOKEN_FILE" ] || { echo "FAIL: no token file at $TOKEN_FILE"; exit 1; }
 TOKEN="$(cat "$TOKEN_FILE")"
 
@@ -95,6 +102,84 @@ if [ -r "$HG" ] && command -v python3 >/dev/null 2>&1; then
 else
   echo "WARN: homoglyph checker not found at $HG -- sending UNCHECKED." >&2
 fi
+# ---- outgoing content gate (card d49acca6) -----------------------------------
+# ORDER, fixed (card d49acca6 on top of #1541): the homoglyph gate above runs FIRST,
+# this content gate second. A text that trips both is refused by the homoglyph gate
+# (exit 3) and this gate never runs; either refusal sends nothing, so the order only
+# decides which reason the sender reads first. A test pins it.
+# Measured 2026-09-05: a double-quoted body with a backtick in it did not lose a
+# word -- the CALLER's shell ran the command and pasted its OUTPUT into the
+# message: 38 420 characters, a whole work-tree diff and a settings file, into a
+# durable queue that travels with backups. The expansion happens before this
+# script runs, so it cannot be seen here; its result can. Three checks on that
+# result, none of them resting on the sender remembering a rule:
+#   - a body over ARGV_MAX characters that came on the command line is refused:
+#     that is the shape an expanded $(...) produces, and a long body belongs in
+#     a file on STDIN anyway;
+#   - a secret-shaped value is refused: the shapes of SECRET_PATTERNS in
+#     src/security/secret-gate.ts (a test pins the parity), and the dashboard
+#     token's own value;
+#   - a command-output signature (diff header, hunk header, index line) warns
+#     and still sends: a message may quote a diff on purpose.
+# A long base64 run is NOT refused: measured on 39 029 queued messages it matched
+# 26, every one legitimate (SSH fingerprints and public keys, paths carrying a
+# timestamp, a Message-Id) and none a secret.
+content_gate() {
+  C="$C" SRC="$SRC" TOKEN="$TOKEN" python3 - <<'GATE_PY'
+import os, re
+c = os.environ.get('C', '')
+tok = os.environ.get('TOKEN', '').strip()
+ARGV_MAX = 8000
+out = []
+if os.environ.get('SRC') == 'argv' and len(c) > ARGV_MAX:
+    out.append('REFUSE %d characters on the command line (limit %d), the shape an expanded $(...) or backtick'
+               ' produces. Send it from a file: bash scripts/agent-msg.sh <from> <to> - < <file>' % (len(c), ARGV_MAX))
+SECRET_PATTERNS = [
+    ('private key block', r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
+    ('Stripe secret/restricted key', r'\b(sk|rk)_(live|test)_[A-Za-z0-9]{16,}'),
+    ('ElevenLabs key header', r'(?i)xi-api-key["\'\s:=]+[A-Za-z0-9_-]{16,}'),
+    ('ElevenLabs key literal', r'\bsk_[a-f0-9]{32,}'),
+    ('bearer token literal', r'\bBearer\s+[A-Za-z0-9_-]{24,}\.?[A-Za-z0-9_.-]*'),
+    ('JWT', r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}'),
+    ('GitHub token', r'\bgh[pousr]_[A-Za-z0-9]{30,}'),
+    ('Slack token', r'\bxox[baprs]-[A-Za-z0-9-]{10,}'),
+    ('OpenAI project key', r'\bsk-proj-[A-Za-z0-9_-]{20,}'),
+    ('generic vendor secret key (sk_ or sk-)', r'\bsk[-_][A-Za-z0-9_-]{24,}'),
+    ('AWS access key id', r'\bAKIA[0-9A-Z]{16}\b'),
+    ('Supabase service_role JWT hint', r'service_role["\'\s:=]+eyJ'),
+    ('Supabase personal access token', r'\bsbp_[0-9a-f]{40}\b'),
+]
+for name, rx in SECRET_PATTERNS:
+    if re.search(rx, c):
+        out.append('REFUSE a secret-shaped value in the body (%s)' % name)
+if len(tok) >= 16 and tok in c:
+    out.append("REFUSE the dashboard token's value is in the body")
+for name, rx in (('a diff header', r'(?m)^diff --git '), ('a hunk header', r'(?m)^@@ .* @@'),
+                 ('an index line', r'(?m)^index [0-9a-f]{7,}\.\.[0-9a-f]{7,}')):
+    if re.search(rx, c):
+        out.append('WARN the body carries command output (%s)' % name)
+print('\n'.join(out))
+GATE_PY
+}
+GATE="$(content_gate)" || { echo "FAIL: the content gate could not run; nothing was sent"; exit 1; }
+REFUSALS=""; WARNINGS=""
+while IFS= read -r line; do
+  case "$line" in
+    "REFUSE "*) REFUSALS="${REFUSALS}REFUSED: ${line#REFUSE }"$'\n' ;;
+    "WARN "*)   WARNINGS="${WARNINGS}WARNING: ${line#WARN }"$'\n' ;;
+  esac
+done <<EOF
+$GATE
+EOF
+if [ -n "$REFUSALS" ]; then
+  printf '%s' "$REFUSALS"
+  echo "REFUSED from=$FROM to=$TO: nothing was sent."
+  # The warnings too: a diff signature next to a length refusal tells the
+  # sender WHAT their shell pasted in.
+  [ -n "$WARNINGS" ] && printf '%s' "$WARNINGS" >&2
+  exit 2
+fi
+[ -n "$WARNINGS" ] && printf '%s' "$WARNINGS" | sed 's/$/; sent anyway -- check it is the text you meant/' >&2
 
 BODY="$(FROM="$FROM" TO="$TO" C="$C" python3 -c 'import json,os; print(json.dumps({"from":os.environ["FROM"],"to":os.environ["TO"],"content":os.environ["C"]}))')"
 
