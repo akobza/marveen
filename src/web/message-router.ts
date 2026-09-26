@@ -30,7 +30,7 @@ import {
   capturePane,
   clearFeedbackModalAndRecheck,
 } from './agent-process.js'
-import { detectPaneState, detectsFirstRunGate, detectsPermissionDialog, permissionPromptSummary, type PaneState, type PermissionPromptSummary } from '../pane-state.js'
+import { readPaneState, detectsFirstRunGate, detectsPermissionDialog, permissionPromptSummary, type PaneState, type PermissionPromptSummary } from '../pane-state.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
@@ -97,10 +97,17 @@ export function formatStuckSessionAlert(
   paneState: PaneState | null = null,
   awaitingPermission = false,
   permissionAsk: PermissionPromptSummary | null = null,
+  paneSignal: string | null = null,
 ): string | null {
   if (agent === mainAgentId) return null
   const min = Math.round(stuckMs / 60000)
   const queue = `${pendingCount} pending message(s) queued`
+  // What the pane classification rests on (card 76ed00de). Without it a reader
+  // takes "no busy signal seen" for "measured idle" -- and the not-busy text
+  // below tells them to restart.
+  const basis = paneState === null
+    ? ' Pane: not captured (tmux session gone or its host unreachable).'
+    : paneSignal ? ` Pane: ${paneState}, on ${paneSignal}.` : ''
   // An unanswered tool-permission prompt looks EXACTLY like a wedged session
   // from the queue side, and the not-ready text below tells the reader to
   // restart. On 2026-09-03 that framing was one step away from throwing out
@@ -119,17 +126,24 @@ export function formatStuckSessionAlert(
   // alerts into wasted restarts-in-waiting. It says what it is: a long turn,
   // worth a look, not a restart on sight.
   if (paneState === 'busy') {
-    return `[session-stuck] Agent '${agent}' (tmux ${session}) has been BUSY (actively working, spinner up) for ${min} min with ${queue}. Not a stall by itself -- check whether the turn is progressing or a tool call is wedged. Do NOT restart on this alert alone.`
+    return `[session-stuck] Agent '${agent}' (tmux ${session}) has been BUSY (actively working, spinner up) for ${min} min with ${queue}.${basis} Not a stall by itself -- check whether the turn is progressing or a tool call is wedged. Do NOT restart on this alert alone.`
   }
-  return `[session-stuck] Agent '${agent}' (tmux ${session}) has been not-ready for ${min} min with ${queue}. Run the delivery-stall diagnosis: check the pane (busy vs idle vs full context) and restart the agent if it is wedged.`
+  // Not measured is not idle. A pane that could not be captured, or that shows
+  // neither a busy signal nor the idle prompt, fell through to the restart
+  // advice below -- the destructive branch as the default. Measured 2026-09-07:
+  // a 10m54s turn with a running shell drew a restart suggestion this way.
+  if (paneState === null || paneState === 'unknown') {
+    return `[session-stuck] Agent '${agent}' (tmux ${session}) has been not-ready for ${min} min with ${queue}.${basis} The pane state is NOT MEASURED, so this alert cannot tell a working session from a wedged one -- a long turn whose spinner the detector does not recognise looks exactly like this. Run the delivery-stall diagnosis from the pane itself (tmux attach -t ${session}); do NOT restart on this alert alone.`
+  }
+  return `[session-stuck] Agent '${agent}' (tmux ${session}) has been not-ready for ${min} min with ${queue}.${basis} Run the delivery-stall diagnosis: check the pane (busy vs idle vs full context) and restart the agent if it is wedged.`
 }
 
-function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckMs: number, pendingCount: number, paneState: PaneState | null, awaitingPermission = false, permissionAsk: PermissionPromptSummary | null = null): void {
+function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckMs: number, pendingCount: number, paneState: PaneState | null, awaitingPermission = false, permissionAsk: PermissionPromptSummary | null = null, paneSignal: string | null = null): void {
   try {
-    const alert = formatStuckSessionAlert(agent, MAIN_AGENT_ID, session, stuckMs, pendingCount, paneState, awaitingPermission, permissionAsk)
+    const alert = formatStuckSessionAlert(agent, MAIN_AGENT_ID, session, stuckMs, pendingCount, paneState, awaitingPermission, permissionAsk, paneSignal)
     if (!alert) return
     createAgentMessage('system', MAIN_AGENT_ID, alert)
-    logger.info({ agent, session, stuckMs, pendingCount, paneState, awaitingPermission }, 'session-stuck surfaced to orchestrator')
+    logger.info({ agent, session, stuckMs, pendingCount, paneState, paneSignal, awaitingPermission }, 'session-stuck surfaced to orchestrator')
   } catch (err) {
     logger.warn({ err, agent }, 'Failed to enqueue session-stuck notification')
   }
@@ -644,7 +658,8 @@ export async function runMessageRouterTick(): Promise<void> {
           // zero extra tmux calls.
           const stuckMs = now - stuckStart
           const pane = capturePane(session, host)
-          const paneState = pane != null ? detectPaneState(pane) : null
+          const paneReading = pane != null ? readPaneState(pane) : null
+          const paneState = paneReading?.state ?? null
           if (shouldEscalateStuckSession(paneState, stuckMs)) {
             // Session has been continuously stuck past the escalation threshold.
             // Log at warn level so monitoring/revival tooling can act — the
@@ -666,7 +681,7 @@ export async function runMessageRouterTick(): Promise<void> {
             // the work (restart it).
             const awaitingPermission = pane != null && detectsPermissionDialog(pane)
             const permissionAsk = awaitingPermission && pane != null ? permissionPromptSummary(pane) : null
-            notifyOrchestratorOfStuckSession(msg.to_agent, session, stuckMs, pendingMsgCount, paneState, awaitingPermission, permissionAsk)
+            notifyOrchestratorOfStuckSession(msg.to_agent, session, stuckMs, pendingMsgCount, paneState, awaitingPermission, permissionAsk, paneReading?.signal ?? null)
             // Reset timer so we don't spam every tick; re-escalate after another window.
             agentStuckSince.set(msg.to_agent, now)
           } else {

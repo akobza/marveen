@@ -1056,7 +1056,32 @@ export function detectPaneState(
   pane: string,
   opts: DetectPaneStateOptions = {},
 ): PaneState {
-  if (!pane || !pane.trim()) return 'unknown'
+  return readPaneState(pane, opts).state
+}
+
+/**
+ * detectPaneState's verdict together with the signal that decided it. The state
+ * alone cannot say whether "not busy" was MEASURED (an idle prompt) or merely
+ * NOT SEEN (no signal the detector knows): the stuck-session alert names the
+ * signal so its reader can tell the two apart (card 76ed00de). `signal` is prose
+ * for a human, quoting the matched pane text where there is one.
+ */
+export interface PaneStateReading {
+  state: PaneState
+  signal: string
+}
+
+// A matched pane fragment, quotable on one line of an alert.
+function quotePaneText(s: string): string {
+  const one = s.replace(/\s+/g, ' ').trim()
+  return one.length > 80 ? `${one.slice(0, 77)}...` : one
+}
+
+export function readPaneState(
+  pane: string,
+  opts: DetectPaneStateOptions = {},
+): PaneStateReading {
+  if (!pane || !pane.trim()) return { state: 'unknown', signal: 'empty capture' }
 
   const paneLines = pane.split('\n')
 
@@ -1072,7 +1097,8 @@ export function detectPaneState(
   // probes; these two windows are the same shape in the function that routes.
   const busyRegion = liveTailRegion(paneLines, BUSY_LIVE_REGION_LINES)
   for (const rx of BUSY_INDICATORS) {
-    if (rx.test(busyRegion)) return 'busy'
+    const m = rx.exec(busyRegion)
+    if (m) return { state: 'busy', signal: `spinner / token counter "${quotePaneText(m[0])}"` }
   }
 
   // Scope `esc to interrupt` check to the live footer region only.
@@ -1080,7 +1106,7 @@ export function detectPaneState(
   // (e.g. in a watchdog report or a log analysis) permanently classify
   // an idle session as busy.
   const footerRegion = liveTailRegion(paneLines, LIVE_FOOTER_REGION_LINES)
-  if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return 'busy'
+  if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return { state: 'busy', signal: '"esc to interrupt" in the footer' }
 
   // Pending-paste placeholder check runs BEFORE the idle-footer gate. The
   // stub sits in the live input box; the footer below it is version-dependent
@@ -1091,7 +1117,7 @@ export function detectPaneState(
   // also rescues the pane from being mis-read 'unknown' at the idle-footer gate
   // below. A placeholder must read 'busy' so the scheduler/router/keepalive
   // defer rather than pile a second prompt on.
-  if (detectsPastePlaceholder(pane)) return 'busy'
+  if (detectsPastePlaceholder(pane)) return { state: 'busy', signal: 'paste placeholder in the input box' }
 
   if (!IDLE_FOOTER_RX.test(pane)) {
     // Footer-less fresh-session / welcome-screen: a PARKED \u276F input box still
@@ -1101,12 +1127,12 @@ export function detectPaneState(
     // there is nothing to confirm a genuine idle state.
     const box = liveInputBox(pane)
     if (box != null && box.split('\n').some(l => PARKED_INPUT_RX.test(l))) {
-      return opts.mergeTypingAsBusy ? 'busy' : 'typing'
+      return { state: opts.mergeTypingAsBusy ? 'busy' : 'typing', signal: 'text parked in the input box, no idle footer' }
     }
-    return 'unknown'
+    return { state: 'unknown', signal: 'no idle footer and no busy signal' }
   }
 
-  if (detectsThinkingBlockError(pane)) return 'error'
+  if (detectsThinkingBlockError(pane)) return { state: 'error', signal: 'thinking-block API error on screen' }
 
   // Find the input box: two BOX_SEP_RX lines framing the current prompt.
   // Scan UPWARDS from the footer so we stay inside the live box and
@@ -1131,14 +1157,16 @@ export function detectPaneState(
       // rescues to 'idle' because the hint is dim -- the exact false-ready
       // path this guards. 'busy' is the honest answer: input IS waiting, it
       // just isn't ours to submit. See QUEUED_MESSAGES_HINT_RX.
-      if (inputLines.some(l => QUEUED_MESSAGES_HINT_RX.test(l))) return 'busy'
+      if (inputLines.some(l => QUEUED_MESSAGES_HINT_RX.test(l))) {
+        return { state: 'busy', signal: 'queued-messages hint in the input box' }
+      }
       if (inputLines.some(l => PARKED_INPUT_RX.test(l))) {
-        return opts.mergeTypingAsBusy ? 'busy' : 'typing'
+        return { state: opts.mergeTypingAsBusy ? 'busy' : 'typing', signal: 'text parked in the input box' }
       }
     }
   }
 
-  return 'idle'
+  return { state: 'idle', signal: 'idle footer, empty input box' }
 }
 
 /**

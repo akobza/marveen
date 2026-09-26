@@ -85,7 +85,10 @@ describe('stuck-session alert for a permission prompt', () => {
     // if it is wedged". Following that on a permission prompt discards the
     // running work and leaves the question unanswered.
     expect(alertFor(true)!).not.toMatch(/restart the agent if it is wedged/)
-    expect(alertFor(false)!).toMatch(/restart the agent if it is wedged/)
+    // The control is a MEASURED not-ready pane ('idle'): since card 76ed00de an
+    // unmeasured one ('unknown') does not advise a restart either.
+    expect(formatStuckSessionAlert('voicedev', 'jarvis', 'agent-voicedev', 11 * 60 * 1000, 1, 'idle', false, null))
+      .toMatch(/restart the agent if it is wedged/)
   })
 
   it('stays usable when the question cannot be parsed', () => {

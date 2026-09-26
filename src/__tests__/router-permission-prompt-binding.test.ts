@@ -26,7 +26,8 @@ import { join } from 'node:path'
 const PERMISSION_PANE = readFileSync(join(__dirname, 'fixtures/pane/permission-prompt-bash-grep.txt'), 'utf8')
 const SEP = '─'.repeat(80)
 // Not ready, not busy, not a permission prompt: a pane the detector reads as
-// unknown -- the case the plain "not-ready ... restart if wedged" text is for.
+// unknown -- the plain not-ready alert (NOT MEASURED since card 76ed00de, see
+// router-stuck-alert-unmeasured.test.ts).
 const PLAIN_NOT_READY_PANE = ['Some tool output that is not a prompt', '', SEP, '  loading…', SEP].join('\n')
 
 const mockGetPendingMessages = vi.fn()
