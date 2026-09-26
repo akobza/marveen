@@ -368,6 +368,13 @@ export async function acquirePortLock(
   const drainMs = opts.postKillDrainMs ?? DEFAULT_POST_KILL_DRAIN_MS
   const pollMs = opts.postKillPollMs ?? DEFAULT_POST_KILL_POLL_MS
   const byPort = findOwnNodeHolders(port, ctx)
+  // A binaryPattern-agat NEM kell a kapuval (decidePortTakeover) kulon szurni: a jeloltek mar
+  // atmentek az argv-attribucion (listOwnProcessesMatching -> argvBelongsToThisInstall), es a
+  // cwd-alapu kizaras (filterOwnNodeCandidates, scopeToProjectRoot) POZITIVAN mas gyokerre kizar.
+  // Az OLVASHATATLAN cwd szandekosan bent marad -- az indoka az ottani kommentben all (macOS-en
+  // minden lsof-nelkuli szonda null, ami teljesen kikapcsolna a reclaimet). Az a res ezert csak
+  // olyan folyamatra all, aminek az argv-je MAR a mi gyokerunket tartalmazza, tehat nem idegen
+  // install. Merve: 2026-09-14, 4 eset (lasd src/__tests__/binary-pattern-foreign-root.test.ts).
   const byBinary = opts.binaryPattern ? findOwnBinaryMatches(opts.binaryPattern, ctx) : []
   const victims = Array.from(new Set([...byPort, ...byBinary]))
   if (!victims.length) return
