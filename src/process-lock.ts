@@ -257,35 +257,105 @@ export async function terminateProcesses(
 export type PortTakeoverDecision =
   | { kind: 'no-holder' }
   | { kind: 'take-over'; holders: number[] }
-  | { kind: 'refuse'; holder: number; holderRoot: string | null; selfRoot: string }
+  /** The holder PROVABLY belongs to a different install. Killing it would be an attack
+   *  on someone else's service, so this is fatal: we stop and say so. */
+  | { kind: 'refuse-foreign'; holder: number; holderRoot: string; selfRoot: string }
+  /** We could not resolve one of the two roots, so ownership is UNKNOWN -- which is not
+   *  the same as foreign. Never take over on this, but never treat it as proof of
+   *  foreignness either: the holder may well be our own legitimate predecessor. */
+  | { kind: 'refuse-unverifiable'; holder: number; holderRoot: string | null; selfRoot: string | null }
 
+/**
+ * `selfRoot` is nullable ON PURPOSE. `index.ts` resolves it with `realpathSync`, which
+ * can fail; the old caller papered over that with `selfProjectRoot ?? PROJECT_ROOT`, and
+ * an unresolved PROJECT_ROOT reached through a symlink can NEVER equal the kernel's
+ * always-resolved /proc cwd. That comparison would have reported our own predecessor as
+ * foreign. If we cannot resolve our own root, nothing here is provable -- say so.
+ */
 export function decidePortTakeover(
   holders: number[],
-  selfRoot: string,
+  selfRoot: string | null,
   rootOf: (pid: number) => string | null,
 ): PortTakeoverDecision {
   if (holders.length === 0) return { kind: 'no-holder' }
+  if (selfRoot === null) {
+    // Our own root is unknown, so no comparison below can mean anything.
+    return { kind: 'refuse-unverifiable', holder: holders[0], holderRoot: rootOf(holders[0]), selfRoot: null }
+  }
   for (const pid of holders) {
     const root = rootOf(pid)
-    // Unreadable root: no evidence either way, so no takeover. This is the branch that
-    // used to read as "probably fine".
-    if (root === null) return { kind: 'refuse', holder: pid, holderRoot: null, selfRoot }
-    if (root !== selfRoot) return { kind: 'refuse', holder: pid, holderRoot: root, selfRoot }
+    // Unreadable root: no evidence either way. This branch used to read as "probably
+    // fine" (carry on and kill); then it read as "probably foreign" (stop and exit).
+    // Both were the same mistake -- turning an absent measurement into a verdict.
+    if (root === null) return { kind: 'refuse-unverifiable', holder: pid, holderRoot: null, selfRoot }
+    if (root !== selfRoot) return { kind: 'refuse-foreign', holder: pid, holderRoot: root, selfRoot }
   }
   return { kind: 'take-over', holders }
 }
 
-/** The message a refusal prints. Exported so the test asserts the operator-facing text. */
-export function formatTakeoverRefusal(d: Extract<PortTakeoverDecision, { kind: 'refuse' }>): string {
-  const holderRoot = d.holderRoot ?? '(could not be determined)'
+/**
+ * What the caller must DO with a decision. The defect this type exists to prevent lived
+ * on the caller side, not in the decision: `decidePortTakeover` correctly refused on an
+ * unreadable root, and the caller then called `process.exit(1)` on it. On a host where
+ * the cwd probe cannot read (LSOFPATH805: a bare `lsof` was command-not-found under the
+ * launchd PATH and silently returned null), that turns a routine restart into a
+ * permanent boot failure -- the dashboard would never come up again.
+ *
+ * Three outcomes, because the operator has to do three different things:
+ *   proceed     -- nothing in the way, or the holder is provably ours: normal path.
+ *   stand-down  -- ownership unknown: do NOT kill, do NOT exit. Startup continues and
+ *                  falls through to the EADDRINUSE path this codebase already handles.
+ *   stop        -- provably someone else's: refuse loudly and exit.
+ */
+export type TakeoverPlan =
+  | { action: 'proceed' }
+  | { action: 'stand-down'; message: string }
+  | { action: 'stop'; message: string }
+
+export function planPortTakeover(d: PortTakeoverDecision): TakeoverPlan {
+  switch (d.kind) {
+    case 'no-holder':
+    case 'take-over':
+      return { action: 'proceed' }
+    case 'refuse-unverifiable':
+      return { action: 'stand-down', message: formatUnverifiableHolder(d) }
+    case 'refuse-foreign':
+      return { action: 'stop', message: formatForeignHolder(d) }
+  }
+}
+
+/** The message a PROVEN-FOREIGN holder prints. Exported so the test asserts the text. */
+export function formatForeignHolder(d: Extract<PortTakeoverDecision, { kind: 'refuse-foreign' }>): string {
   return [
-    'REFUSING TO TAKE THE PORT: the process holding it does not provably belong to this install.',
-    `  holder pid:        ${d.holder}`,
-    `  holder PROJECT_ROOT: ${holderRoot}`,
+    'REFUSING TO TAKE THE PORT: it is held by a process from a DIFFERENT install.',
+    `  holder pid:          ${d.holder}`,
+    `  holder PROJECT_ROOT: ${d.holderRoot}`,
     `  this PROJECT_ROOT:   ${d.selfRoot}`,
-    'Killing it could take down another install\'s dashboard, so this process stops instead.',
-    'If the holder really is this install, start it the way it was started before, or free the',
-    'port by hand -- but do not widen this gate: a takeover has to be proven, not assumed.',
+    'Killing it would take down another install\'s dashboard, so this process stops instead.',
+    'Free the port or start this install on a different WEB_PORT -- but do not widen this',
+    'gate: a takeover has to be proven, not assumed.',
+  ].join('\n')
+}
+
+/**
+ * The message an UNVERIFIABLE holder prints. Deliberately different from the foreign one:
+ * the operator has to do something else. Saying "free the port by hand" here would be
+ * actively wrong advice, because the holder is quite possibly this install's own
+ * predecessor -- we simply could not read the evidence.
+ */
+export function formatUnverifiableHolder(d: Extract<PortTakeoverDecision, { kind: 'refuse-unverifiable' }>): string {
+  const holderRoot = d.holderRoot ?? '(could not be read)'
+  const selfRoot = d.selfRoot ?? '(could not be resolved)'
+  return [
+    'NOT TAKING THE PORT: ownership could not be established, so nothing will be killed.',
+    `  holder pid:          ${d.holder}`,
+    `  holder PROJECT_ROOT: ${holderRoot}`,
+    `  this PROJECT_ROOT:   ${selfRoot}`,
+    'This is NOT a claim that the holder is foreign -- it may well be this install\'s own',
+    'previous process. Startup continues; if the port really is taken it will fail with',
+    'EADDRINUSE, which is the honest error for "occupied", unlike a kill we cannot justify.',
+    'If this repeats, the cwd probe is what to fix: /proc unreadable, or `lsof` missing',
+    'from PATH (LSOFPATH805), leaves this gate blind on every boot.',
   ].join('\n')
 }
 

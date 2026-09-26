@@ -34,7 +34,7 @@ import {
   acquirePortLock,
   acquirePidfileLock,
   decidePortTakeover,
-  formatTakeoverRefusal,
+  planPortTakeover,
   findOwnNodeHolders,
   writeBufferFully,
   DeferToPeerError,
@@ -380,23 +380,42 @@ async function acquireLock(): Promise<void> {
   // (store/claudeclaw.pid from the app, store/dashboard.pid from scripts/start.sh) and
   // they currently disagree -- the first exists, the second does not. /proc/<pid>/cwd
   // answers the question this gate actually asks.
+  //
+  // selfProjectRoot is passed THROUGH, null and all -- no `?? PROJECT_ROOT` fallback.
+  // That fallback substituted an unresolved path for a resolved one, and against the
+  // kernel's always-resolved /proc cwd it could only ever mismatch, reporting our own
+  // predecessor as foreign. An unresolvable own root means "unknown", not "different".
   const takeover = decidePortTakeover(
     findOwnNodeHolders(WEB_PORT, procCtx),
-    procCtx.selfProjectRoot ?? PROJECT_ROOT,
+    procCtx.selfProjectRoot,
     (pid) => {
       const cwd = procCtx.getProcessCwd(pid)
       return cwd === null ? null : cwd
     },
   )
-  if (takeover.kind === 'refuse') {
+  const plan = planPortTakeover(takeover)
+  if (plan.action === 'stop') {
     // stderr, not the logger: this is the last thing the operator sees before we exit,
     // and it must survive whatever the log transport is doing.
-    process.stderr.write(formatTakeoverRefusal(takeover) + '\n')
+    process.stderr.write(plan.message + '\n')
     logger.error(
-      { holder: takeover.holder, holderRoot: takeover.holderRoot, selfRoot: takeover.selfRoot, port: WEB_PORT },
-      'Refusing to take the port from a process that is not provably ours',
+      { holder: takeover.kind === 'refuse-foreign' ? takeover.holder : undefined, port: WEB_PORT },
+      'Refusing to take the port from a process that provably belongs to another install',
     )
     process.exit(1)
+  }
+  if (plan.action === 'stand-down') {
+    // Deliberately NOT fatal. We skip the kill below (that is the safety property), but
+    // we keep booting: an unreadable cwd probe must not be able to make the dashboard
+    // permanently unstartable. If the port is genuinely occupied, bind() fails with
+    // EADDRINUSE, which reports the real situation instead of guessing about ownership.
+    process.stderr.write(plan.message + '\n')
+    logger.warn({ holder: takeover.kind === 'refuse-unverifiable' ? takeover.holder : undefined, port: WEB_PORT },
+      'Port ownership unverifiable: not taking over, not stopping')
+    await acquirePidfileLock(PID_FILE, process.pid, buildPidfileLockContext(procCtx), {
+      onLiveLegitimate: 'defer',
+    })
+    return
   }
 
   // Kill any previous instance(s) next: anything holding WEB_PORT, and
