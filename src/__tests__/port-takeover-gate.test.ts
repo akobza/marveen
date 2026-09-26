@@ -10,9 +10,13 @@ import { decidePortTakeover, formatTakeoverRefusal } from '../process-lock.js'
 //
 // The gate inverts the burden: taking over is the claim that must be proven.
 //
-// The pidfile is not an input, and that is a measured decision: store/dashboard.pid does
-// not exist on this host while the dashboard runs, so a pidfile-based gate would start
-// from a missing signal -- and a missing file must never be read as "then it is ours".
+// The pidfile is not an input. The card brief gave "there is no pidfile" as the reason;
+// measured, that premise was wrong. The app's own store/claudeclaw.pid EXISTS and is
+// correct; only store/dashboard.pid (written by scripts/start.sh) is absent. Two pidfiles
+// for one service, currently disagreeing.
+//
+// The reason that does hold: a pidfile records who WROTE it, not who HOLDS the port. That
+// is a different question from the one this gate asks, so it stays out of the inputs.
 
 const SELF = '/home/user/marveen'
 const OTHER = '/home/user/marveen-worktree'

@@ -237,10 +237,20 @@ export async function terminateProcesses(
  * holder must positively resolve to this install's PROJECT_ROOT. Anything else -- a root
  * we cannot read, a root that differs, a mix -- refuses, and the caller stops loudly.
  *
- * The pidfile is deliberately NOT an input. On this host store/dashboard.pid does not
- * exist at all while the dashboard runs, so a pidfile-based gate would start from a
- * missing signal, and "the pidfile is missing" must never be read as "then it is
- * probably ours". Process attribution is evidence; an absent file is not.
+ * The pidfile is deliberately NOT an input -- not because one is missing, but because a
+ * pidfile answers a different question. It records who WROTE it, not who HOLDS the port,
+ * and the two can diverge.
+ *
+ * This install makes that concrete: TWO pidfiles name the same service, written by
+ * different actors. store/claudeclaw.pid is written by the app itself (PID_FILENAME in
+ * config.ts); store/dashboard.pid is written by scripts/start.sh when it launches the app.
+ * Measured on this host: claudeclaw.pid exists and is correct, dashboard.pid is absent.
+ * A gate that says "the pidfile" cannot say which one it means.
+ *
+ * And the trap is that today the two would AGREE -- the pid recorded in claudeclaw.pid is
+ * in fact the current port holder. A pidfile gate would therefore look correct on a
+ * single-instance host, for exactly as long as that coincidence holds. Resolving the
+ * holder through /proc/<pid>/cwd asks the question the gate actually needs answered.
  *
  * Pure and injectable so the decision can be tested without processes or ports.
  */

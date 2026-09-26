@@ -375,8 +375,11 @@ async function acquireLock(): Promise<void> {
   //
   // This layer requires the opposite: every holder must PROVABLY resolve to this
   // install's PROJECT_ROOT, or we stop and say what we found and what we expected.
-  // It does not read the pidfile: store/dashboard.pid does not exist on this host while
-  // the dashboard runs, and a missing file must never be read as "then it is ours".
+  // It does not read a pidfile, and not because one is missing: a pidfile records who
+  // WROTE it, not who HOLDS the port. This install has two for the same service
+  // (store/claudeclaw.pid from the app, store/dashboard.pid from scripts/start.sh) and
+  // they currently disagree -- the first exists, the second does not. /proc/<pid>/cwd
+  // answers the question this gate actually asks.
   const takeover = decidePortTakeover(
     findOwnNodeHolders(WEB_PORT, procCtx),
     procCtx.selfProjectRoot ?? PROJECT_ROOT,
