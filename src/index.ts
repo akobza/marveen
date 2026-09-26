@@ -33,6 +33,9 @@ import { AGENTS_BASE_DIR } from './web/agent-config.js'
 import {
   acquirePortLock,
   acquirePidfileLock,
+  decidePortTakeover,
+  formatTakeoverRefusal,
+  findOwnNodeHolders,
   writeBufferFully,
   DeferToPeerError,
   type ProcessLockContext,
@@ -364,6 +367,34 @@ async function acquireLock(): Promise<void> {
   // that is alive, legitimate, and not yet on the port, we're the loser
   // of a fresh-startup race -- exit 0 without disturbing the winner.
   checkFreshStartupRace(procCtx)
+
+  // GATE, ahead of any kill (card 853d94db). acquirePortLock chooses victims with a
+  // permissive attribution: a process it cannot place is left alone, which is right for
+  // picking targets and wrong for the decision -- "could not attribute" then means
+  // "carry on", and carrying on here is SIGKILL against a possibly foreign install.
+  //
+  // This layer requires the opposite: every holder must PROVABLY resolve to this
+  // install's PROJECT_ROOT, or we stop and say what we found and what we expected.
+  // It does not read the pidfile: store/dashboard.pid does not exist on this host while
+  // the dashboard runs, and a missing file must never be read as "then it is ours".
+  const takeover = decidePortTakeover(
+    findOwnNodeHolders(WEB_PORT, procCtx),
+    procCtx.selfProjectRoot ?? PROJECT_ROOT,
+    (pid) => {
+      const cwd = procCtx.getProcessCwd(pid)
+      return cwd === null ? null : cwd
+    },
+  )
+  if (takeover.kind === 'refuse') {
+    // stderr, not the logger: this is the last thing the operator sees before we exit,
+    // and it must survive whatever the log transport is doing.
+    process.stderr.write(formatTakeoverRefusal(takeover) + '\n')
+    logger.error(
+      { holder: takeover.holder, holderRoot: takeover.holderRoot, selfRoot: takeover.selfRoot, port: WEB_PORT },
+      'Refusing to take the port from a process that is not provably ours',
+    )
+    process.exit(1)
+  }
 
   // Kill any previous instance(s) next: anything holding WEB_PORT, and
   // anything running the dashboard binary (for the zombie case where the

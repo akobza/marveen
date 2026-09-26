@@ -224,6 +224,61 @@ export async function terminateProcesses(
  * then SIGKILL them. Returns once every holder is dead; the caller is free
  * to call server.listen() afterwards.
  */
+/**
+ * Is this install allowed to take the port from whoever holds it?
+ *
+ * The existing attribution (argvBelongsToThisInstall) is permissive by design: it answers
+ * "does this look like ours", and a process it cannot attribute is simply left alone.
+ * That is the right shape for choosing victims. It is the wrong shape for the DECISION,
+ * because "could not attribute" then quietly means "carry on" -- and carrying on here
+ * means SIGKILL against a process that may belong to another install.
+ *
+ * So this layer inverts the burden: taking over is the claim that must be PROVEN. Every
+ * holder must positively resolve to this install's PROJECT_ROOT. Anything else -- a root
+ * we cannot read, a root that differs, a mix -- refuses, and the caller stops loudly.
+ *
+ * The pidfile is deliberately NOT an input. On this host store/dashboard.pid does not
+ * exist at all while the dashboard runs, so a pidfile-based gate would start from a
+ * missing signal, and "the pidfile is missing" must never be read as "then it is
+ * probably ours". Process attribution is evidence; an absent file is not.
+ *
+ * Pure and injectable so the decision can be tested without processes or ports.
+ */
+export type PortTakeoverDecision =
+  | { kind: 'no-holder' }
+  | { kind: 'take-over'; holders: number[] }
+  | { kind: 'refuse'; holder: number; holderRoot: string | null; selfRoot: string }
+
+export function decidePortTakeover(
+  holders: number[],
+  selfRoot: string,
+  rootOf: (pid: number) => string | null,
+): PortTakeoverDecision {
+  if (holders.length === 0) return { kind: 'no-holder' }
+  for (const pid of holders) {
+    const root = rootOf(pid)
+    // Unreadable root: no evidence either way, so no takeover. This is the branch that
+    // used to read as "probably fine".
+    if (root === null) return { kind: 'refuse', holder: pid, holderRoot: null, selfRoot }
+    if (root !== selfRoot) return { kind: 'refuse', holder: pid, holderRoot: root, selfRoot }
+  }
+  return { kind: 'take-over', holders }
+}
+
+/** The message a refusal prints. Exported so the test asserts the operator-facing text. */
+export function formatTakeoverRefusal(d: Extract<PortTakeoverDecision, { kind: 'refuse' }>): string {
+  const holderRoot = d.holderRoot ?? '(could not be determined)'
+  return [
+    'REFUSING TO TAKE THE PORT: the process holding it does not provably belong to this install.',
+    `  holder pid:        ${d.holder}`,
+    `  holder PROJECT_ROOT: ${holderRoot}`,
+    `  this PROJECT_ROOT:   ${d.selfRoot}`,
+    'Killing it could take down another install\'s dashboard, so this process stops instead.',
+    'If the holder really is this install, start it the way it was started before, or free the',
+    'port by hand -- but do not widen this gate: a takeover has to be proven, not assumed.',
+  ].join('\n')
+}
+
 export async function acquirePortLock(
   port: number,
   ctx: ProcessLockContext,
