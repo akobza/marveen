@@ -718,6 +718,13 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   const kanbanCommentsMatch = path.match(/^\/api\/kanban\/([^/]+)\/comments$/)
   if (kanbanCommentsMatch && method === 'GET') {
     const cardId = decodeURIComponent(kanbanCommentsMatch[1])
+    // An id that does not exist answered 200 with [] -- the same answer as "exists,
+    // no comments yet" -- so a caller checking a card this way saw every id as real.
+    // Archived cards still answer: the dashboard's archived detail view reads them.
+    if (!getKanbanCard(cardId)) {
+      json(res, { error: `Kártya nem található: ${cardId}. Teljes azonosító kell, a rövidített (prefix) alak nem működik.` }, 404)
+      return true
+    }
     json(res, getKanbanComments(cardId))
     return true
   }
@@ -744,6 +751,22 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const card = getKanbanCard(cardId)
     if (!card) {
       json(res, { error: `Kártya nem található: ${cardId}. A komment NEM jött létre. Teljes azonosító kell, a rövidített (prefix) alak nem működik.` }, 404)
+      return true
+    }
+    // The existence check above let an ARCHIVED card through: getKanbanCard does
+    // not filter archived rows. A comment posted there came back with an id and
+    // landed on a card nobody looks at any more (measured on a live board: 124
+    // comments on 49 cards, written after the archival). A different status and
+    // a different message from the not-found case, because the next step is
+    // different: that one is a typo, this one is work that moved on.
+    if (card.archived_at != null) {
+      json(res, {
+        error: `A kártya archivált: ${cardId}. A komment NEM jött létre: archivált lapot senki nem néz. `
+          + `Ha a munka ezen a lapon folytatódik, előbb állítsd vissza (POST /api/kanban/${cardId}/unarchive); `
+          + 'ha máshol folytatódik, oda írj.',
+        archived: true,
+        archived_at: card.archived_at,
+      }, 409)
       return true
     }
     const body = await readBody(req)
