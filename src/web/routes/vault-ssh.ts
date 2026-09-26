@@ -37,6 +37,10 @@ function toApiShape(server: VaultSshServer, key?: VaultSshKey | null) {
   }
 }
 
+// The body fields PUT /api/vault/ssh-servers/:id reads. Anything else is refused
+// (400), not dropped: see the PUT branch.
+const SERVER_PUT_FIELDS = ['name', 'host', 'user', 'port', 'desc', 'sshKeyId'] as const
+
 function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 64)
 }
@@ -117,6 +121,21 @@ export async function tryHandleVaultSsh(ctx: RouteContext): Promise<boolean> {
 
       const body = await readBody(req)
       const data = JSON.parse(body.toString())
+
+      // An unknown field used to be dropped without a word while the answer was
+      // still 200: `hostname` for `host`, or the column names `username` /
+      // `description` for the API's `user` / `desc`, read as accepted and the old
+      // value stayed. Refused whole, like the kanban PUT (#1023): the known fields
+      // sent with it are not applied either, so nothing is half-written.
+      const unknown = Object.keys(data).filter((k) => !(SERVER_PUT_FIELDS as readonly string[]).includes(k))
+      if (unknown.length > 0) {
+        json(res, {
+          error: `Unknown field(s): ${unknown.join(', ')}. Accepted: ${SERVER_PUT_FIELDS.join(', ')}`,
+          unknown,
+          accepted: [...SERVER_PUT_FIELDS],
+        }, 400)
+        return true
+      }
 
       const patch: Parameters<typeof updateVaultSshServer>[1] = {}
       if (typeof data.name === 'string')     patch.name        = data.name.trim()
