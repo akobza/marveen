@@ -14,6 +14,10 @@
 #     echo "<long text>" | bash scripts/agent-msg.sh <from> <to> -
 # Output: success -> "OK id=<n>"; failure -> "FAIL <reason>" + a line in store/agent-msg-failures.log, exit 1.
 #
+# QUEUE NOTE (card 940dfe31): after a success the router did not flag as lost, the receiver's queue depth
+#   follows on STDERR as a line of its own, "OK id=<n>  QUEUE: (...)", when /api/messages/backlog answers
+#   within 200 ms. stdout stays "OK id=<n>".
+#
 # LOG FORMAT, store/agent-msg-failures.log (tab-separated, one line per failure):
 #   <YYYY-MM-DD HH:MM:SS>  FAIL  from=<a>  to=<b>  url=<endpoint>  http=<code>  resp=<first 200 bytes>
 # CHANGED 2026-09: the `url=` field is NEW. It was added together with the
@@ -47,7 +51,7 @@ TOKEN="$(cat "$TOKEN_FILE")"
 
 BODY="$(FROM="$FROM" TO="$TO" C="$C" python3 -c 'import json,os; print(json.dumps({"from":os.environ["FROM"],"to":os.environ["TO"],"content":os.environ["C"]}))')"
 
-# ---- receiver queue depth on the success line (card a509fdf6) ----------------
+# ---- receiver queue depth after the success line (card a509fdf6) -------------
 # The id proves the row was CREATED, not that it was DELIVERED. Measured during
 # a live outage on 2026-09-06: an urgent message to a busy agent sat in the queue
 # for 14 minutes while the sender read a bare "OK id=..." and assumed it had
@@ -55,12 +59,23 @@ BODY="$(FROM="$FROM" TO="$TO" C="$C" python3 -c 'import json,os; print(json.dump
 # delivery estimate was ~7 hours. Nothing in the old output could have said so.
 # The measurement is NOT invented here -- /api/messages/backlog already reports
 # per-agent depth and the age of the oldest entry.
+# Three rules (card 940dfe31): the note goes to STDERR as its own line, so the
+# stdout "OK id=N" stays byte-identical for parsers (the same choice #1334 made
+# for the router warning); a message the router reports as LOST gets no queue
+# note at all ("lost" and "queued behind N" at once would let the sender believe
+# the reassuring one); and the backlog call gets 200 ms -- past that the note is
+# skipped rather than slowing the send.
 QUEUE_LOUD_COUNT=5      # chosen, not measured -- see the card comment
 QUEUE_LOUD_AGE_SEC=600  # 10 min: past this, "sent" and "will be read" diverge
+QUEUE_NOTE_MAX_SEC=0.2
 queue_note() {
-  local to="$1" resp code json
-  resp="$(curl -s -H "Authorization: Bearer $TOKEN" -w $'\n%{http_code}' \
-          "${API_BASE}/api/messages/backlog" 2>/dev/null || true)"
+  local to="$1" resp rc code json
+  resp="$(curl -s --max-time "$QUEUE_NOTE_MAX_SEC" -H "Authorization: Bearer $TOKEN" -w $'\n%{http_code}' \
+          "${API_BASE}/api/messages/backlog" 2>/dev/null)"
+  rc=$?
+  # curl 28 = the 200 ms ran out: no note, by rule (3). Any other failure falls
+  # through to the visible NEM MERHETO line below.
+  [ "$rc" = "28" ] && return 0
   code="$(printf '%s' "$resp" | tail -n1)"
   json="$(printf '%s' "$resp" | sed '$d')"
   if [ "$code" != "200" ]; then
@@ -121,9 +136,11 @@ EOF
   if { [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; } && [ -n "$ID" ]; then
     if [ -n "${WARN:-}" ]; then
       echo "OK id=$ID  WARNING: $WARN" >&2
-      echo "OK id=$ID (warning)$(queue_note "$TO")"
+      echo "OK id=$ID (warning)"
     else
-      echo "OK id=$ID$(queue_note "$TO")"
+      echo "OK id=$ID"
+      NOTE="$(queue_note "$TO")"
+      [ -n "$NOTE" ] && echo "OK id=$ID  QUEUE:$NOTE" >&2
     fi
     exit 0
   fi
