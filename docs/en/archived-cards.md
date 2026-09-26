@@ -47,13 +47,14 @@ Both settings are hot-reloaded; no restart required.
 
 ### GET /api/kanban/archived
 
-Returns archived cards with embedded labels per card.
+Returns archived cards with embedded labels and the description per card
+(`description`: always a string, `""` for a card without one; the key is never missing).
 
 Query parameters (all optional):
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `q` | string | Free-text search (title, project, assignee). |
+| `q` | string | Free-text search (title, id, description, project, assignee). |
 | `project` | string | Exact project name filter. |
 | `label` | string | Label name filter. |
 | `from` | unix timestamp | Archived-at lower bound. |
@@ -74,6 +75,7 @@ Response:
       "assignee": "jarvis",
       "archived_at": 1718000000,
       "updated_at": 1718000000,
+      "description": "Card description",
       "labels": [{ "id": "x1", "name": "AI", "color": "#3b82f6" }]
     }
   ],

@@ -47,13 +47,14 @@ Mindkét érték a Beállítások oldalon változtatható, újraindítás nélk�
 
 ### GET /api/kanban/archived
 
-Lekéri az archivált kártyákat. Az eredmény tartalmazza a kártyánkénti cimkéket is.
+Lekéri az archivált kártyákat. Az eredmény tartalmazza a kártyánkénti cimkéket és a leírást is
+(`description`: mindig szöveg, leírás nélküli kártyán `""`, a kulcs sosem hiányzik).
 
 Query paraméterek (mind opcionális):
 
 | Paraméter | Típus | Leírás |
 |-----------|-------|--------|
-| `q` | string | Szabad szöveges keresés (cím, projekt, felelős). |
+| `q` | string | Szabad szöveges keresés (cím, azonosító, leírás, projekt, felelős). |
 | `project` | string | Projektre szűrés (pontos egyezés). |
 | `label` | string | Cimke nevére szűrés. |
 | `from` | unix timestamp | Archiválás időpontja ettől. |
@@ -74,6 +75,7 @@ Válasz:
       "assignee": "jarvis",
       "archived_at": 1718000000,
       "updated_at": 1718000000,
+      "description": "A kártya leírása",
       "labels": [{ "id": "x1", "name": "AI", "color": "#3b82f6" }]
     }
   ],

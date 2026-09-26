@@ -703,7 +703,9 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const labelsByCard = getLabelsForAllCards()
     const cards = listArchivedKanbanCards({ q, project, label, from, to, limit })
       .map(card => ({ ...card, labels: labelsByCard.get(card.id) ?? [] }))
-    json(res, { cards, total: cards.length, limit })
+    // Gzip-capable like GET /api/kanban: the descriptions now ride along, and
+    // at the default limit that is megabytes of text on a long-lived board.
+    jsonMaybeGzip(req, res, { cards, total: cards.length, limit })
     return true
   }
 

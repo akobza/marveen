@@ -2541,6 +2541,10 @@ export interface ArchivedKanbanCard {
   assignee: string | null
   archived_at: number
   updated_at: number
+  // Always a string: "" when the card has none. A missing key read the same as
+  // an empty text, and an archived card's description is readable nowhere else
+  // in this API -- a caller that took the absence for "empty" overwrote one.
+  description: string
 }
 
 export function listArchivedKanbanCards(opts: {
@@ -2553,7 +2557,8 @@ export function listArchivedKanbanCards(opts: {
 }): ArchivedKanbanCard[] {
   const { q, project, label, from, to, limit } = opts
   let sql = `
-    SELECT DISTINCT kc.id, kc.title, kc.status, kc.project, kc.priority, kc.assignee, kc.archived_at, kc.updated_at
+    SELECT DISTINCT kc.id, kc.title, kc.status, kc.project, kc.priority, kc.assignee, kc.archived_at, kc.updated_at,
+           COALESCE(kc.description, '') AS description
     FROM kanban_cards kc
   `
   const params: unknown[] = []
@@ -2569,9 +2574,13 @@ export function listArchivedKanbanCards(opts: {
   if (from)    { sql += ' AND kc.archived_at >= ?'; params.push(from) }
   if (to)      { sql += ' AND kc.archived_at <= ?'; params.push(to) }
   if (q) {
-    sql += ' AND (kc.title LIKE ? OR kc.project LIKE ? OR kc.assignee LIKE ?)'
+    // The id and the description too: a card searched for by its id came back
+    // empty, and text that only an archived card's description holds (a merged
+    // duplicate's remainder, say) was invisible to the search one runs before
+    // opening a new card.
+    sql += ' AND (kc.title LIKE ? OR kc.project LIKE ? OR kc.assignee LIKE ? OR kc.id LIKE ? OR kc.description LIKE ?)'
     const like = `%${q}%`
-    params.push(like, like, like)
+    params.push(like, like, like, like, like)
   }
   sql += ' ORDER BY kc.archived_at DESC LIMIT ?'
   params.push(limit)
