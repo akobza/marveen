@@ -425,6 +425,160 @@ case "$OUT" in
 esac
 echo ""
 
+# ---------------------------------------------------------------------------
+# (i) A host WITHOUT the sqlite3 CLI -- the typical Linux install. The
+#     installer's dependencies are ffmpeg, git, tmux, lsof, curl, python3, pipx
+#     and unzip; sqlite3 is not among them. Measured live 2026-09-26: there
+#     `sqlite3: command not found` vanished into 2>/dev/null, every tick read
+#     verdict=unknown (51 in 4 hours) and the owner got an hourly false "cannot
+#     READ the queue" alert. The observer now falls back to python3's stdlib
+#     sqlite3. The fixtures are still BUILT with the CLI (full PATH); only the
+#     observer runs under the stripped PATH.
+# ---------------------------------------------------------------------------
+echo "(i) No sqlite3 CLI on PATH: the python3 reader"
+BASH_BIN="$(command -v bash)"
+# $1 = dir, rest = tool names -> a PATH dir holding only those tools.
+make_bin() {
+  local dir="$1" t src; shift
+  mkdir -p "$dir"
+  for t in "$@"; do
+    src="$(command -v "$t" 2>/dev/null)" || { echo "  (tool $t not found on this host)"; continue; }
+    ln -sf "$src" "$dir/$t"
+  done
+}
+BASE_TOOLS="date dirname cat grep head cut tr sed mkdir rm"
+NOSQL="$TMP/bin-nosqlite3"
+make_bin "$NOSQL" $BASE_TOOLS python3
+NOREADER="$TMP/bin-noreader"
+make_bin "$NOREADER" $BASE_TOOLS
+
+# $1 = PATH dir, $2 = tool -> 0 if a FRESH shell on that PATH finds the tool.
+# A fresh process on purpose: `PATH=x command -v` in this shell answers from
+# the current PATH and the hash table, and says "found" for a tool that is gone.
+on_path() { PATH="$1" "$BASH_BIN" -c 'command -v "$1"' _ "$2" >/dev/null 2>&1; }
+
+# The control that makes this section mean anything: the stripped PATH really
+# has no sqlite3, and really has python3.
+if ! on_path "$NOSQL" sqlite3 && on_path "$NOSQL" python3; then
+  pass "the stripped PATH has python3 and NO sqlite3 (otherwise this section proves nothing)"
+else
+  fail "the stripped PATH has python3 and NO sqlite3" "$(ls "$NOSQL")"
+fi
+
+# $1 = label, $2 = PATH dir, $3 = db, $4 = expected verdict, $5 = expected rc,
+# $6 = expected reader
+expect_on_path() {
+  local out rc verdict reader
+  out=$(PATH="$2" MAIN_AGENT_ID=marveen "$BASH_BIN" "$OBSERVER" --check "$3" 2>&1); rc=$?
+  verdict=$(printf '%s' "$out" | sed -n 's/.*verdict=\([a-z]*\).*/\1/p')
+  reader=$(printf '%s' "$out" | sed -n 's/.*reader=\([a-z0-9]*\).*/\1/p')
+  if [ "$verdict" = "$4" ] && [ "$rc" = "$5" ] && [ "$reader" = "$6" ]; then
+    pass "$1"
+  else
+    fail "$1" "verdict=$verdict rc=$rc reader=$reader (expected $4/$5/$6) out: $out"
+  fi
+}
+
+expect_on_path "no sqlite3: an empty queue reads ok" "$NOSQL" "$DB_EMPTY" ok 0 python3
+expect_on_path "no sqlite3: a 5-minute-old pending row reads ok" "$NOSQL" "$DB_FRESH" ok 0 python3
+expect_on_path "no sqlite3: a 60-minute-old pending row reads STALLED (the discriminating input)" "$NOSQL" "$DB_STALL" stalled 1 python3
+expect_on_path "no sqlite3: the predicate scope holds (aged row to a sub-agent is ok)" "$NOSQL" "$DB_OTHER" ok 0 python3
+
+# Same numbers as the CLI, not just the same verdict: the python reader's
+# output has to parse into the same count and oldest age.
+CLI_OUT=$(MAIN_AGENT_ID=marveen bash "$OBSERVER" --check "$DB_TWO" 2>&1)
+PY_OUT=$(PATH="$NOSQL" MAIN_AGENT_ID=marveen "$BASH_BIN" "$OBSERVER" --check "$DB_TWO" 2>&1)
+CLI_P=$(printf '%s' "$CLI_OUT" | sed -n 's/.*pending=\([0-9]*\).*/\1/p')
+PY_P=$(printf '%s' "$PY_OUT" | sed -n 's/.*pending=\([0-9]*\).*/\1/p')
+CLI_A=$(printf '%s' "$CLI_OUT" | sed -n 's/.*oldest_age_s=\([0-9]*\).*/\1/p')
+PY_A=$(printf '%s' "$PY_OUT" | sed -n 's/.*oldest_age_s=\([0-9]*\).*/\1/p')
+if [ -n "$PY_P" ] && [ "$CLI_P" = "$PY_P" ] && [ -n "$PY_A" ] && [ $(( PY_A - CLI_A )) -ge 0 ] && [ $(( PY_A - CLI_A )) -le 2 ]; then
+  pass "the python reader yields the same pending count ($PY_P) and oldest age as the CLI"
+else
+  fail "the python reader yields the same count and age as the CLI" "cli: $CLI_OUT / py: $PY_OUT"
+fi
+
+# Unreadable stays unknown -- the fallback must not turn an error into a zero.
+expect_on_path "no sqlite3: a missing database file is unknown" "$NOSQL" "$TMP/nincs-py.db" unknown 2 python3
+if [ -e "$TMP/nincs-py.db" ]; then
+  fail "no sqlite3: reading a missing file does not create it" "$(ls -la "$TMP/nincs-py.db")"
+else
+  pass "no sqlite3: reading a missing file does not create it (mode=rw, never rwc)"
+fi
+expect_on_path "no sqlite3: a database without agent_messages is unknown" "$NOSQL" "$DB_NOTABLE" unknown 2 python3
+expect_on_path "no sqlite3: a corrupt database file is unknown" "$NOSQL" "$DB_JUNK" unknown 2 python3
+
+# The WAL-without-shm shape (see (h)): the stopped-dashboard case, which is the
+# one the observer exists for, must also be read by the python reader.
+rm -f "$WALDB-wal" "$WALDB-shm"
+PY_RO_RC=$(python3 - "$WALDB" <<'PY'
+import os, sqlite3, sys, urllib.parse
+try:
+    c = sqlite3.connect('file:' + urllib.parse.quote(os.path.abspath(sys.argv[1])) + '?mode=ro', uri=True)
+    c.execute('SELECT 1 FROM agent_messages').fetchall(); c.close(); print(0)
+except sqlite3.Error:
+    print(1)
+PY
+)
+rm -f "$WALDB-wal" "$WALDB-shm"
+SUM_BEFORE="$(shasum -a 256 "$WALDB" | awk '{print $1}')"
+expect_on_path "no sqlite3: a stalled row is SEEN on a WAL db with no -shm" "$NOSQL" "$WALDB" stalled 1 python3
+SUM_AFTER="$(shasum -a 256 "$WALDB" | awk '{print $1}')"
+if [ "$SUM_BEFORE" = "$SUM_AFTER" ]; then
+  pass "no sqlite3: the WAL read leaves the database byte-identical"
+else
+  fail "no sqlite3: the WAL read leaves the database byte-identical" "sum $SUM_BEFORE -> $SUM_AFTER"
+fi
+rm -f "$WALDB-wal" "$WALDB-shm"
+# Same environment-dependence as (h): the second (mode=rw + query_only) open can
+# only be shown necessary where mode=ro fails on this shape.
+if [ "$PY_RO_RC" = 0 ]; then
+  pass "skipped: python mode=ro opens the no-shm WAL fixture on this host (sqlite $(python3 -c 'import sqlite3;print(sqlite3.sqlite_version)')), nothing to control against"
+else
+  NORW_OBS="$TMP/observer-without-py-rw.sh"
+  sed "s/rows = run('rw', True)/raise/" "$OBSERVER" > "$NORW_OBS"
+  if grep -q "run('rw', True)" "$NORW_OBS"; then
+    fail "NEGATIVE CONTROL (python): the rw fallback could be cut" "sed did not apply"
+  else
+    OUT="$(PATH="$NOSQL" MAIN_AGENT_ID=marveen "$BASH_BIN" "$NORW_OBS" --check "$WALDB" 2>&1)"; RC=$?
+    case "$OUT" in
+      *"verdict=unknown"*) [ "$RC" = 2 ] && pass "NEGATIVE CONTROL (python): without the rw fallback the WAL file reads as unknown" \
+                             || fail "NEGATIVE CONTROL (python): without the rw fallback" "rc=$RC out: $OUT" ;;
+      *) fail "NEGATIVE CONTROL (python): without the rw fallback the WAL file reads as unknown" "rc=$RC out: $OUT" ;;
+    esac
+  fi
+  rm -f "$WALDB-wal" "$WALDB-shm"
+fi
+
+# Neither reader: still unknown (never ok), but the alert must name the missing
+# TOOL, not claim the database is unreadable.
+if ! on_path "$NOREADER" python3 && ! on_path "$NOREADER" sqlite3; then
+  expect_on_path "no sqlite3 and no python3: the verdict is unknown, not ok" "$NOREADER" "$DB_STALL" unknown 2 none
+  FIX2="$TMP/install-noreader"
+  mkdir -p "$FIX2/scripts/lib" "$FIX2/store"
+  cp "$OBSERVER" "$FIX2/scripts/main-inbox-observer.sh"
+  printf 'MAIN_AGENT_ID=marveen\n' > "$FIX2/.env"
+  cp "$DB_STALL" "$FIX2/store/claudeclaw.db"
+  PATH="$NOREADER" MAIN_INBOX_OBSERVER_ALERT_DRYRUN=1 "$BASH_BIN" "$FIX2/scripts/main-inbox-observer.sh" >"$TMP/run-noreader.out" 2>&1
+  if grep -q 'ALERT_DRYRUN.*NO queue reader' "$TMP/run-noreader.out" && ! grep -q 'cannot READ the queue' "$TMP/run-noreader.out"; then
+    pass "the alert names the missing reader tool instead of calling the queue unreadable"
+  else
+    fail "the alert names the missing reader tool" "$(cat "$TMP/run-noreader.out")"
+  fi
+  # Positive control on the wording: with a reader present, an unreadable file
+  # still gets the "cannot READ" text.
+  rm -f "$FIX2/store/claudeclaw.db" "$FIX2/store/.main-inbox-observer-alerted"
+  PATH="$NOSQL" MAIN_INBOX_OBSERVER_ALERT_DRYRUN=1 "$BASH_BIN" "$FIX2/scripts/main-inbox-observer.sh" >"$TMP/run-unreadable.out" 2>&1
+  if grep -q 'ALERT_DRYRUN.*cannot READ the queue' "$TMP/run-unreadable.out"; then
+    pass "with a reader present, an unreadable queue keeps the 'cannot READ' alert"
+  else
+    fail "with a reader present, an unreadable queue keeps the 'cannot READ' alert" "$(cat "$TMP/run-unreadable.out")"
+  fi
+else
+  fail "the no-reader PATH really lacks both readers" "$(ls "$NOREADER")"
+fi
+echo ""
+
 echo "==================================="
 echo "PASS: $PASS  FAIL: $FAIL"
 [ "$FAIL" = 0 ] || exit 1

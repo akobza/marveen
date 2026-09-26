@@ -110,15 +110,68 @@ resolve_main_agent_id() {
 # which the next dashboard start uses as its own. If even the fallback fails
 # (an unwritable directory, say), the caller keeps verdict=unknown -- honest,
 # because at that point the queue really cannot be read.
+#
+# THE READER ITSELF IS NOT A GIVEN. The sqlite3 CLI is not installed on a
+# typical Linux host (the installer's dependencies are ffmpeg, git, tmux, lsof,
+# curl, python3, pipx, unzip), and with 2>/dev/null its "command not found" was
+# indistinguishable from an unreadable file: measured on a Linux install as 51
+# verdict=unknown ticks in 4 hours and an hourly false "cannot READ the queue"
+# alert, gone the moment sqlite3 was installed by hand. python3 IS an installer
+# dependency, and its stdlib sqlite3 module gives the same two opens, so it is
+# the fallback reader, with the same order and the same output shape as the
+# CLI's default list mode (columns joined by '|', one row per line).
 read_queue_row() {
   local db="$1" sql="$2" out
-  if out="$(sqlite3 -readonly -cmd '.timeout 3000' "$db" "$sql" 2>/dev/null)"; then
+  if command -v sqlite3 >/dev/null 2>&1; then
+    if out="$(sqlite3 -readonly -cmd '.timeout 3000' "$db" "$sql" 2>/dev/null)"; then
+      printf '%s' "$out"
+      return 0
+    fi
+    out="$(sqlite3 -cmd '.timeout 3000' "$db" "PRAGMA query_only=ON; $sql" 2>/dev/null)" || return 1
     printf '%s' "$out"
     return 0
   fi
-  out="$(sqlite3 -cmd '.timeout 3000' "$db" "PRAGMA query_only=ON; $sql" 2>/dev/null)" || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  # The path and the SQL travel as argv, never spliced into the Python source.
+  # mode=ro first; then mode=rw (NOT rwc: a missing file must stay missing, it
+  # must never become a freshly created empty queue) with query_only=ON.
+  out="$(python3 - "$db" "$sql" 2>/dev/null <<'PY'
+import os, sqlite3, sys, urllib.parse
+db, sql = sys.argv[1], sys.argv[2]
+uri = 'file:' + urllib.parse.quote(os.path.abspath(db))
+
+def fmt(v):
+    return '' if v is None else str(v)
+
+def run(mode, query_only):
+    con = sqlite3.connect(uri + '?mode=' + mode, uri=True, timeout=3.0)
+    try:
+        if query_only:
+            con.execute('PRAGMA query_only=ON')
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+try:
+    rows = run('ro', False)
+except sqlite3.Error:
+    rows = run('rw', True)
+sys.stdout.write('\n'.join('|'.join(fmt(v) for v in r) for r in rows))
+PY
+)" || return 1
   printf '%s' "$out"
   return 0
+}
+
+# Which reader read_queue_row will use: "sqlite3", "python3", or "" for none.
+# Asked by the caller in its own shell (read_queue_row runs inside $(...), so
+# nothing it sets survives), and used to tell "no reader tool on this host"
+# apart from "the database cannot be read" in the alert.
+queue_reader() {
+  if command -v sqlite3 >/dev/null 2>&1; then echo sqlite3
+  elif command -v python3 >/dev/null 2>&1; then echo python3
+  else echo ""
+  fi
 }
 
 # Evaluate one database. Sets PENDING / OLDEST_AGE / VERDICT, returns the exit
@@ -128,9 +181,11 @@ read_queue_row() {
 QUERY_PENDING=0
 QUERY_OLDEST_AGE=0
 QUERY_VERDICT=unknown
+QUERY_READER=""
 evaluate_queue() {
   local db="$1" agent="$2" row count oldest now
   QUERY_PENDING=0; QUERY_OLDEST_AGE=0; QUERY_VERDICT=unknown
+  QUERY_READER="$(queue_reader)"
   [ -n "$agent" ] || { log "MAIN_AGENT_ID is not a usable agent id -- refusing to query"; return 2; }
   [ -f "$db" ] || return 2
   row="$(read_queue_row "$db" \
@@ -165,7 +220,7 @@ if [ "${1:-}" = "--check" ]; then
   [ -n "${2:-}" ] || { echo "usage: main-inbox-observer.sh --check <db-path>" >&2; exit 2; }
   CHECK_AGENT="$(resolve_main_agent_id)"
   evaluate_queue "$2" "$CHECK_AGENT"; CHECK_RC=$?
-  echo "pending=$QUERY_PENDING oldest_age_s=$QUERY_OLDEST_AGE threshold_s=$STALL_SECONDS agent=${CHECK_AGENT:-?} verdict=$QUERY_VERDICT"
+  echo "pending=$QUERY_PENDING oldest_age_s=$QUERY_OLDEST_AGE threshold_s=$STALL_SECONDS agent=${CHECK_AGENT:-?} reader=${QUERY_READER:-none} verdict=$QUERY_VERDICT"
   exit "$CHECK_RC"
 fi
 
@@ -231,7 +286,9 @@ main() {
     return 0
   fi
 
-  if [ "$rc" = 2 ]; then
+  if [ "$rc" = 2 ] && [ -z "$QUERY_READER" ]; then
+    msg="🔴 Main-agent inbox observer has NO queue reader on this host: neither the sqlite3 CLI nor python3 is on PATH ($PATH), so $db (agent '${agent:-?}') was not read at all. This says nothing about the queue itself; install python3 (an installer dependency) or sqlite3 and the next tick will check it."
+  elif [ "$rc" = 2 ]; then
     msg="🔴 Main-agent inbox observer cannot READ the queue: $db (agent '${agent:-?}'). An unreadable queue is not an empty one -- inter-agent mail to the main agent may be piling up unseen."
   else
     minutes=$(( QUERY_OLDEST_AGE / 60 ))

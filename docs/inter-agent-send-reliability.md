@@ -75,7 +75,12 @@ because `-readonly` **cannot read a WAL database whose `-shm` is missing** -- an
 `-wal`/`-shm` pair when the last connection closes, so that is precisely the shape a stopped dashboard
 leaves behind. Measured: `-readonly` fails there with *unable to open database file (14)*, i.e. the
 observer would report `unknown` in the one situation it exists for; the fallback answers correctly and
-still leaves the file byte-identical (a write through it is refused with error 8) and alerts over the **direct Bot API**, never `/api/*` - the API dies with the
+still leaves the file byte-identical (a write through it is refused with error 8). Where the `sqlite3` CLI is
+not installed (the typical Linux host: it is not an installer dependency, python3 is), the same two opens
+run through python3's stdlib `sqlite3` module (`mode=ro`, then `mode=rw` with `query_only=ON`); without
+that fallback such a host read `unknown` on every tick and raised an hourly false alert. If neither reader
+is on PATH the verdict stays `unknown`, and the alert says the reader tool is missing rather than calling
+the queue unreadable. The observer alerts over the **direct Bot API**, never `/api/*` - the API dies with the
 process the observer exists to outlive. Defaults: alert when a row addressed to `MAIN_AGENT_ID` has been
 pending for `MAIN_INBOX_STALL_SECONDS` (1800s), at most one alert per hour, and the cooldown is dropped as
 soon as the queue drains so the next stall is reported at once.
