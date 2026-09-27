@@ -327,11 +327,13 @@ export function writeScheduledTask(
 /**
  * Whether a prompt task's run counts as the "first successful run" of a once task (card 7d2b49b4): the
  * run closed 'done' -- the session worked on it and went idle -- AND the transcript shows the prompt arrived
- * intact. Every other ending ('abandoned', 'lost') and every other delivery verdict (damaged, not arrived,
- * unverifiable, never checked) is not a success: the task stays on and visible rather than silently gone.
+ * intact, as a turn of its own ('intact') or queued into a running turn ('intact-queued', card c8a6c2cc:
+ * whole, just handed over while the agent was busy). Every other ending ('abandoned', 'lost') and every
+ * other delivery verdict (damaged, not arrived, unverifiable, never checked) is not a success: the task
+ * stays on and visible rather than silently gone.
  */
 export function isOnceRunSuccess(decision: string, deliveryVerdict: string | null | undefined): boolean {
-  return decision === 'done' && deliveryVerdict === 'intact'
+  return decision === 'done' && (deliveryVerdict === 'intact' || deliveryVerdict === 'intact-queued')
 }
 
 /**
