@@ -242,7 +242,7 @@ def tmux_session_alive(session):
     if forced in ("0", "1"):
         return forced == "1"
     try:
-        return subprocess.run(["tmux", "has-session", "-t", session],
+        return subprocess.run(["tmux", "has-session", "-t", f"={session}:"],
                               capture_output=True, timeout=5).returncode == 0
     except Exception:
         return True  # if tmux probe fails, assume alive (don't false-alarm)

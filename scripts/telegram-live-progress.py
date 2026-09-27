@@ -191,7 +191,7 @@ def api(tok, method, payload):
 
 def session_alive(agent):
     try:
-        return subprocess.run(["tmux", "has-session", "-t", tmux_session(agent)],
+        return subprocess.run(["tmux", "has-session", "-t", f"={tmux_session(agent)}:"],
                               capture_output=True, timeout=5).returncode == 0
     except Exception as exc:
         # SILENTOLLAMA926: a missing tmux binary made every session look dead
@@ -253,7 +253,7 @@ def status_line(agent):
     session = tmux_session(agent)
     try:
         out = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", session],
+            ["tmux", "capture-pane", "-p", "-t", f"={session}:"],
             capture_output=True, text=True, timeout=5).stdout
     except Exception as exc:
         log(f"tmux capture-pane failed for {session}: {type(exc).__name__}: {exc}")
