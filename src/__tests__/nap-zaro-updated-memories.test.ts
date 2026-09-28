@@ -68,10 +68,13 @@ describe('nap-zaro SKILL.md step-2: uj + frissitett emlekek (NAPZAROFRISS918)', 
         res.end('{}')
       }
     })
-    // the shipped script connects to "localhost", which this environment resolves to
-    // ::1 first (IPv6) -- bind there explicitly instead of 127.0.0.1, or the python
-    // process tries the wrong address family first.
-    await new Promise<void>((resolve) => server.listen(0, '::1', resolve))
+    // the shipped script connects to "localhost". Bind to whatever "localhost" resolves
+    // to on THIS host, not to a fixed address family: one host resolves it to ::1 first,
+    // another only to 127.0.0.1 (its /etc/hosts names ::1 "ip6-localhost"), and a stub
+    // fixed to ::1 refuses the script there (exit 1, "Connection refused" -- both tests
+    // red on every run). node takes the host's own resolution, and the script's urllib
+    // tries every address the host gives it, so the two always meet.
+    await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve))
     port = (server.address() as { port: number }).port
   })
 
