@@ -3424,8 +3424,19 @@ export function markPendingFederatedFailed(id: number, error: string): boolean {
   return db.prepare("UPDATE agent_messages SET status = 'failed', result = ?, completed_at = ? WHERE id = ? AND status = 'pending'").run(error, now, id).changes > 0
 }
 
-export function listAgentMessages(limit = 50): AgentMessage[] {
-  return db.prepare('SELECT * FROM agent_messages ORDER BY created_at DESC LIMIT ?').all(limit) as AgentMessage[]
+// The GLOBAL (no agent) list, newest-first, with the same cap and `beforeId` cursor as
+// getAgentConversation (39a46ab7: this branch used to ignore `before`, so nothing older than the
+// newest 200 rows of the whole fleet could be listed at all).
+export function listAgentMessagesPage(limit = 50, beforeId?: number): AgentMessagePage {
+  const applied = effectiveMessageLimit(limit)
+  const rows = beforeId !== undefined && Number.isFinite(beforeId)
+    ? db.prepare('SELECT * FROM agent_messages WHERE id < ? ORDER BY created_at DESC, id DESC LIMIT ?').all(beforeId, applied + 1)
+    : db.prepare('SELECT * FROM agent_messages ORDER BY created_at DESC, id DESC LIMIT ?').all(applied + 1)
+  return messagePage(rows as AgentMessage[], applied)
+}
+
+export function listAgentMessages(limit = 50, beforeId?: number): AgentMessage[] {
+  return listAgentMessagesPage(limit, beforeId).messages
 }
 
 // --- Context-restart gate helpers -------------------------------------------
@@ -3613,22 +3624,48 @@ export function hasOpenInboundQuestion(agentId: string): boolean {
 // getAgentConversation returns when you open it).
 export const CHAT_SYSTEM_AGENTS = ['heartbeat', 'telegram-coordinator', 'channel-coordinator', 'system'] as const
 
-const AGENT_MESSAGE_LIMIT_CAP = 200
+export const AGENT_MESSAGE_LIMIT_CAP = 200
+
+/** The limit a message list actually applies: at least 1, at most AGENT_MESSAGE_LIMIT_CAP. */
+export function effectiveMessageLimit(limit: number): number {
+  return Math.min(Math.max(1, Math.floor(limit) || 1), AGENT_MESSAGE_LIMIT_CAP)
+}
+
+// 39a46ab7: a list page and whether it was CUT. The query asks one row more than the applied
+// limit, so "there is more" is measured, not guessed; `nextBefore` is the cursor for the next
+// older page (the id of the oldest row returned), null when nothing older is left.
+export interface AgentMessagePage {
+  messages: AgentMessage[]
+  appliedLimit: number
+  hasMore: boolean
+  nextBefore: number | null
+}
+
+function messagePage(rows: AgentMessage[], applied: number): AgentMessagePage {
+  const hasMore = rows.length > applied
+  const messages = hasMore ? rows.slice(0, applied) : rows
+  const nextBefore = hasMore && messages.length > 0 ? messages[messages.length - 1].id : null
+  return { messages, appliedLimit: applied, hasMore, nextBefore }
+}
 
 // The actual last-N messages for ONE agent, filtered in SQL (NOT global-last-N
 // then JS-filter -- that starved rarely-active agents' threads, dashboard bug
 // 2026-06-03). `beforeId` pages older: pass the oldest id you already have to
 // fetch the next-older batch (scroll-up pagination). Newest-first.
-export function getAgentConversation(agent: string, limit = 50, beforeId?: number): AgentMessage[] {
-  const cap = Math.min(Math.max(1, Math.floor(limit) || 1), AGENT_MESSAGE_LIMIT_CAP)
-  if (beforeId !== undefined && Number.isFinite(beforeId)) {
-    return db.prepare(
+export function getAgentConversationPage(agent: string, limit = 50, beforeId?: number): AgentMessagePage {
+  const applied = effectiveMessageLimit(limit)
+  const rows = beforeId !== undefined && Number.isFinite(beforeId)
+    ? db.prepare(
       'SELECT * FROM agent_messages WHERE (from_agent = ? OR to_agent = ?) AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
-    ).all(agent, agent, beforeId, cap) as AgentMessage[]
-  }
-  return db.prepare(
-    'SELECT * FROM agent_messages WHERE (from_agent = ? OR to_agent = ?) ORDER BY created_at DESC, id DESC LIMIT ?'
-  ).all(agent, agent, cap) as AgentMessage[]
+    ).all(agent, agent, beforeId, applied + 1)
+    : db.prepare(
+      'SELECT * FROM agent_messages WHERE (from_agent = ? OR to_agent = ?) ORDER BY created_at DESC, id DESC LIMIT ?'
+    ).all(agent, agent, applied + 1)
+  return messagePage(rows as AgentMessage[], applied)
+}
+
+export function getAgentConversation(agent: string, limit = 50, beforeId?: number): AgentMessage[] {
+  return getAgentConversationPage(agent, limit, beforeId).messages
 }
 
 export interface AgentThread {
