@@ -112,6 +112,11 @@ export const APP_TZ_INVALID = appTz.invalid
 // reconfigures a running fleet.
 export const DEFAULT_AGENT_MODEL =
   cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+// DEFAULTCLIGUARD927: true when no operator configured DEFAULT_AGENT_MODEL, so
+// the value above is the SHIPPED default. Only then may a launch swap it for
+// the previous tier on a CLI that cannot run it (default-model-guard.ts); a
+// configured value is the operator's choice and is never replaced.
+export const DEFAULT_AGENT_MODEL_IS_DISTRIBUTION = !cfg('DEFAULT_AGENT_MODEL')
 
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
@@ -366,6 +371,14 @@ export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLa
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
+// Where OPERATIONAL alerts go (watchdog respawns, stuck sessions, restart
+// notices). Empty = the owner chat; set it when the person who runs the
+// system is not the owner, so the owner is not flooded with plumbing noise.
+// Owner-facing content (heartbeat digest, security events) ignores it.
+export function resolveAlertChatIdSetting(e: Record<string, string | undefined>): string {
+  return (e['MARVEEN_ALERT_CHAT_ID'] || e['ALERT_CHAT_ID'] || '').trim()
+}
+export const ALERT_CHAT_ID = resolveAlertChatIdSetting(env)
 
 // Respawn / keep-alive gate.
 // The in-process channel-plugin monitor (main-agent respawn + sub-agent
@@ -423,6 +436,15 @@ export const SUBAGENT_INBOX_TEE =
 // with SUBAGENT_TELEGRAM_WAKE_ENABLED=1 (alongside SUBAGENT_INBOX_TEE=1).
 export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_TELEGRAM_WAKE_ENABLED') ?? '').trim().toLowerCase())
+
+// Install-wide default for router-side speech-to-text on inbound voice notes
+// (opt-in, DEFAULT OFF). Agents in responseMode 'voice'/'auto' are always
+// transcribed; this only decides what happens for text-mode agents that do not
+// set voice.transcribeInbound in their agent-config.json. Enable with
+// VOICE_TRANSCRIBE_INBOUND=1 to run faster-whisper on every inbound voice note
+// for every such agent. Read at boot: takes effect after a dashboard restart.
+export const VOICE_TRANSCRIBE_INBOUND =
+  ['1', 'true', 'yes', 'on'].includes((cfg('VOICE_TRANSCRIBE_INBOUND') ?? '').trim().toLowerCase())
 
 // Google Calendar account the heartbeat summarises (next 2h). Empty (the
 // default) means the agent uses whatever calendar its MCP server is
