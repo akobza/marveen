@@ -12,8 +12,10 @@
 //   - the Claude Code runtime tools ScheduleWakeup / CronCreate / CronList /
 //     CronDelete / RemoteTrigger (the autonomous-loop machinery), AND
 //   - the Bash escape routes that achieve the same self-injection: writing the
-//     Claude scheduled_tasks.json directly, tmux send-keys into a session, or
-//     POSTing a new schedule to the dashboard.
+//     Claude scheduled_tasks.json directly, tmux send-keys into a session,
+//     POSTing a new schedule to the dashboard, or an OS scheduler (crontab / at /
+//     launchctl / systemd-run, and a systemd timer armed with systemctl or
+//     written into a unit directory).
 //
 // Why a hook and not only a permissions deny-list: permissive profiles launch
 // with --dangerously-skip-permissions. A whole-tool-name deny DOES survive that
@@ -119,6 +121,311 @@ const SCHEDULER_RX = new RegExp(
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
 const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
 
+// --- systemd timers -----------------------------------------------------------
+//
+// Measured 2026-09-27: an agent installed a systemd USER timer in two steps --
+// wrote the unit files into ~/.config/systemd/user, then ran `systemctl --user
+// enable --now <name>.timer` -- and the timer's job messaged the agent's own
+// queue on a finding, so the agent woke up on turns it had scheduled for itself,
+// twice in an hour. SCHEDULER_RX catches `systemd-run` (a transient timer in one
+// call), but neither of these steps: `systemctl` is not a scheduler binary, and
+// writing a file is not an invocation.
+//
+// An inventory of one install two days later (43 timer units) showed how agents
+// actually create them: 36 through Bash (among them 23 a heredoc redirect into
+// the unit file and 9 a cp/install of prepared unit files, the unit directory
+// often held in a variable), 1 with the Edit tool, and in 9 the write and the
+// enable were separate tool calls. So each step is checked on its own, and
+// either one alone is a deny:
+//   (a) systemctl with a timer argument and a verb that is not a pure read or a
+//       disarm. An ALLOWLIST on purpose: enable, start, restart, reenable, link,
+//       edit, add-wants, unmask, and any verb systemd adds later arm a timer;
+//   (b) a write whose target is a timer unit in a systemd unit directory: a
+//       redirect, tee, cp/mv/install/ln/rsync, dd of=, sed -i, a script's write
+//       call (open(..., 'w'), write_text, writeFileSync, shutil.copy, ...), and
+//       the native Write/Edit/NotebookEdit tools.
+// Reading stays allowed: status, show, cat, list-timers, is-active, is-enabled,
+// journalctl, cat/ls/grep/diff on a unit file, copying a unit file OUT of the
+// directory. So do stopping and disabling a timer, and running a .service once.
+//
+// Like SCHEDULER_RX, both shell checks read what the SHELL would run: quoted text
+// and heredoc bodies are inert (maskInertLiterals), so a message or a card
+// comment that quotes the very command is not a deny. A unit name or a path in
+// quotes is still an argument, so those are read from the command with only the
+// heredoc bodies blanked. Unlike SCHEDULER_RX, one `"...$(...)..."` does not
+// send the WHOLE command to the naive split: measured on 3250 real commands that
+// mention systemctl, a unit directory or a timer, that fallback let the prose of
+// quoted heredoc bodies (messages, card comments) read as commands, and most of
+// those commands carry a `"$(date ...)"` somewhere. Here only that one region
+// stays visible (maskInertLiterals `strict: false`).
+//
+// KNOWN LIMITATIONS, the same class as the other anchored checks: a wrapper that
+// neither SCHED_PREFIX nor WRAPPER_PREFIX knows (`bash -c '...'`, `xargs`, `nice
+// -n 5 ...`), a command fed to an interpreter as a quoted heredoc (`bash
+// <<'EOF'`, `ssh host bash -s <<'EOF'`), a unit name that only a runtime
+// expansion yields, an existing timer edited through a script's argv, and a
+// script file that does it all (the gate sees `bash install.sh`, not what it runs).
+//
+// A systemd unit directory: the directory systemd loads unit files from, or one
+// of its .wants/.requires/.upholds/.d subdirectories (an enable symlink, a
+// drop-in). A file elsewhere under it (a `retired/` folder) is never loaded.
+const UNIT_DIR_RX = /(?:^|\/)systemd\/(?:user|system)(?:\.control)?(?:\/[^/]+\.(?:wants|requires|upholds|d))?\/?$/
+// A line of script code (python, node) that writes, copies or links a file.
+// `open(` is followed lazily to its mode argument: the path expression often has
+// parentheses of its own (`open(os.path.expanduser('...'), 'w')`).
+const SCRIPT_WRITE_RX = /\bopen\s*\(.*?,\s*['"][wax]b?\+?['"]|\.write_(?:text|bytes)\s*\(|\b(?:writeFileSync|appendFileSync|copyFileSync|symlinkSync|renameSync)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(|\bos\.(?:symlink|rename|replace)\s*\(/
+// systemctl verbs that only READ state, or that DISARM a timer.
+const SYSTEMCTL_SAFE_VERBS = new Set([
+  'status', 'show', 'cat', 'help', 'list-units', 'list-timers', 'list-unit-files', 'list-dependencies',
+  'list-jobs', 'list-sockets', 'list-paths', 'list-automounts', 'list-machines', 'is-active', 'is-enabled',
+  'is-failed', 'is-system-running', 'get-default', 'show-environment', 'daemon-reload',
+  'stop', 'disable', 'mask', 'kill', 'reset-failed', 'clean',
+])
+// systemctl options that take their value as the NEXT word (`-p Prop show x.timer`),
+// so the value is not mistaken for the verb.
+const SYSTEMCTL_VALUE_OPTS = new Set([
+  '-p', '--property', '-P', '-t', '--type', '--state', '-H', '--host', '-M', '--machine', '-n', '--lines',
+  '-o', '--output', '-s', '--signal', '--kill-whom', '--kill-value', '--job-mode', '--root', '--image',
+  '--what', '--timestamp', '--preset-mode', '--when', '--drop-in', '--message', '--check-inhibitors',
+])
+// The command word of a segment, as for SCHEDULER_RX, and also after a shell
+// keyword that starts a command inside a loop or a condition: the measured
+// `for f in x.service x.timer; do cp ... "$U/$f"; done` puts `do cp` at the start.
+const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*`
+// ...and after `sudo` WITH options (`sudo -n tee /etc/systemd/system/x.timer` was
+// the one real write the plain prefix missed among 3250 measured commands; the
+// options that take a value are named, so `sudo -n tee` keeps `tee` as the
+// command) or `timeout <duration>`.
+const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+-\S+)*\s+\S+)\s+)*`
+const TIMER_CMD_RX = new RegExp(
+  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
+  'gi',
+)
+
+// A unit argument that names a timer: <x>.timer, a glob, or a brace form
+// (x.{service,timer}). A `)` or backtick closing a substitution, or punctuation
+// after it, is not part of the name; a bare ".timer" names nothing.
+function isTimerName(word) {
+  const w = String(word).replace(/[)`'",;:.]+$/, '')
+  return /[^\s/`'"]\.timer$/i.test(w) || /\{[^}]*\btimer\b[^}]*\}$/i.test(w)
+}
+
+// A name the command does not spell out: nothing but a variable, a substitution
+// or a glob (`$f`, `${name}`, `*`). `x.service.bak.$TS` is spelled out enough.
+function isUnknownName(base) {
+  return /^(?:\$\{?[A-Za-z_]\w*\}?|\$\([^)]*\)|[*?]+)$/.test(base)
+}
+
+// A path's directory and last component; a trailing slash names a directory.
+function splitPath(p) {
+  const s = String(p)
+  if (s.endsWith('/')) return [s.slice(0, -1), '']
+  const k = s.lastIndexOf('/')
+  return k === -1 ? ['', s] : [s.slice(0, k), s.slice(k + 1)]
+}
+
+// One shell word from index i: quotes removed, a backslash escape resolved.
+function readWord(s, i) {
+  let w = ''
+  while (i < s.length && !/[\s<>]/.test(s[i])) {
+    const c = s[i]
+    if (c === "'") {
+      const e = s.indexOf("'", i + 1)
+      const end = e === -1 ? s.length : e
+      w += s.slice(i + 1, end); i = end + 1; continue
+    }
+    if (c === '"') {
+      let j = i + 1
+      while (j < s.length && s[j] !== '"') {
+        if (s[j] === '\\' && j + 1 < s.length) { w += s[j + 1]; j += 2 } else { w += s[j]; j++ }
+      }
+      i = j + 1; continue
+    }
+    if (c === '\\' && i + 1 < s.length) { w += s[i + 1]; i += 2; continue }
+    w += c; i++
+  }
+  return [w, i]
+}
+
+// The argument words of one command segment, and the files its output
+// redirections write. Enough to read a unit name or a path; it is not a shell.
+function shellWords(text) {
+  const s = String(text ?? '')
+  const words = []
+  const outTargets = []
+  let i = 0
+  while (i < s.length) {
+    if (/\s/.test(s[i])) { i++; continue }
+    // a redirection: an fd number glued in front (2>), the operator, its target
+    const op = /^(?:\d+|&)?(>>?\|?|<<<|<<-?|<>|<)(&?)/.exec(s.slice(i))
+    if (op) {
+      i += op[0].length
+      while (i < s.length && /\s/.test(s[i])) i++
+      const [t, e] = readWord(s, i)
+      i = e
+      if (op[1].startsWith('>') && !op[2]) outTargets.push(t) // `>&2` copies an fd, writes no file
+      continue
+    }
+    const [w, e] = readWord(s, i)
+    if (e === i) { i++; continue }
+    words.push(w)
+    i = e
+  }
+  return { words, outTargets }
+}
+
+// (a) the verb and the units of a `systemctl` call: arms a timer unless the verb
+// is on the read/disarm allowlist.
+function systemctlArmsTimer(args) {
+  let verb = null
+  const units = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a.startsWith('-')) { if (SYSTEMCTL_VALUE_OPTS.has(a)) i++; continue }
+    if (verb === null) verb = a.toLowerCase().replace(/[)`'",;:.]+$/, '')
+    else units.push(a)
+  }
+  return verb !== null && !SYSTEMCTL_SAFE_VERBS.has(verb) && units.some(isTimerName)
+}
+
+// (b) what a write binary writes: dd of=, tee and sed -i write FILES; cp, mv,
+// install, ln and rsync COPY their sources to a destination (-t DIR, or the last
+// operand), which can be a file or a directory.
+function writeTargets(bin, args) {
+  const none = { files: [], copies: [] }
+  if (bin === 'dd') return { files: args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3)), copies: [] }
+  const operands = []
+  let dest = null
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '-t' || a === '--target-directory') { dest = args[++i] ?? null; continue }
+    if (a.startsWith('--target-directory=')) { dest = a.slice(a.indexOf('=') + 1); continue }
+    if (a.startsWith('-')) continue
+    operands.push(a)
+  }
+  if (bin === 'tee') return { files: operands, copies: [] }
+  if (bin === 'sed') return args.some((a) => /^-[a-zA-Z]*i|^--in-place/.test(a)) ? { files: operands.slice(1), copies: [] } : none
+  if (bin === 'install' && args.includes('-d')) return none // creates directories
+  if (dest != null) return { files: [], copies: [{ dest, sources: operands }] }
+  if (operands.length >= 2) return { files: [], copies: [{ dest: operands[operands.length - 1], sources: operands.slice(0, -1) }] }
+  // `ln -s SRC` with one operand links into the working directory
+  if (bin === 'ln' && operands.length === 1) return { files: [], copies: [{ dest: '.', sources: operands }] }
+  return none
+}
+
+// A file written from a heredoc in the command: `cat > inst.sh <<'EOF' ... EOF`.
+const HEREDOC_FILE_RX = /(?:^|[\n;&|])[^\n]*?>\s*(["']?)([^\s"'<>;|&]+)\1[^\n]*?<<-?\s*(['"]?)([A-Za-z_]\w*)\3[^\n]*\n([\s\S]*?)\n[ \t]*\4[ \t]*(?=\n|$)/g
+
+// Does this Bash command arm a systemd timer, or write a timer unit into a unit
+// directory? `depth` bounds the installer recursion below.
+function armsSystemdTimer(command, naiveSegs, depth = 0) {
+  // The segments the shell really has (masked: quotes and heredoc bodies blank),
+  // and the same spans with only the heredoc bodies blank: quoted arguments are
+  // read from those. The two strings have the same length (maskInertLiterals
+  // blanks in place). Only an unterminated quote or heredoc falls back to the
+  // naive segments here (see the strict: false note above).
+  const masked = maskInertLiterals(command, { strict: false })
+  const bodiesBlank = maskInertLiterals(command, { quotes: false, strict: false })
+  const pairs = []
+  if (masked == null || bodiesBlank == null) {
+    for (const s of naiveSegs) pairs.push([s, s])
+  } else {
+    const sep = /&&|\|\||[;&|]|\r?\n/g
+    let last = 0
+    let m
+    while ((m = sep.exec(masked))) {
+      pairs.push([masked.slice(last, m.index), bodiesBlank.slice(last, m.index)])
+      last = m.index + m[0].length
+    }
+    pairs.push([masked.slice(last), bodiesBlank.slice(last)])
+  }
+  // A name the command leaves to a variable or a glob (`"$U/$f"` in a for loop)
+  // writes a timer if the command names one anywhere.
+  const mentionsTimer = /\.timer\b|[{,]timer[,}]/i.test(String(command ?? ''))
+  const vars = {} // literal NAME=value assignments earlier in the same command
+  let cwdInUnitDir = false // after `cd <unit dir>`, a relative path is inside it
+  const expand = (w) => String(w).replace(/\$\{?([A-Za-z_]\w*)\}?/g, (full, n) => (Object.hasOwn(vars, n) ? vars[n] : full))
+  const isUnitDir = (d) => (d === '' || d === '.' ? cwdInUnitDir : UNIT_DIR_RX.test(d))
+  const namesTimer = (base) => isTimerName(base) || (isUnknownName(base) && mentionsTimer)
+  // A FILE written into a unit directory: a timer unit, or a drop-in of one
+  // (x.timer.d/override.conf changes its schedule). A directory itself is not a
+  // file (a redirect onto one fails), so `-> ~/.config/systemd/user/` is nothing.
+  const writesTimerFile = (t) => {
+    const [dir, base] = splitPath(expand(t))
+    return base !== '' && base !== '.' && isUnitDir(dir) && (namesTimer(base) || /\.timer\.d$/i.test(dir))
+  }
+  // A copy INTO a unit directory writes a timer if a source is one; a copy onto
+  // a file path is a file write.
+  const copiesTimerIn = ({ dest, sources }) => {
+    const p = expand(dest)
+    const [dir, base] = splitPath(p)
+    // the destination directory: `DIR/`, `.`, or a unit directory without the slash
+    const destDir = base === '' ? dir : base === '.' ? '' : UNIT_DIR_RX.test(p) ? p : null
+    if (destDir === null) return writesTimerFile(dest)
+    return isUnitDir(destDir) && sources.some((s) => namesTimer(splitPath(expand(s))[1]))
+  }
+
+  for (const [mseg, bseg] of pairs) {
+    const lead = mseg.length - mseg.trimStart().length
+    const m = mseg.slice(lead)
+    const b = bseg.slice(lead)
+    const { words, outTargets } = shellWords(b)
+    if (outTargets.some(writesTimerFile)) return true
+    // a fresh regex per call: a /g regex keeps lastIndex, and this function recurses
+    const cmdRx = new RegExp(TIMER_CMD_RX.source, TIMER_CMD_RX.flags)
+    let cm
+    while ((cm = cmdRx.exec(m))) {
+      const bin = cm[2].toLowerCase()
+      // a command that starts a substitution ends where the substitution does
+      let rest = b.slice(cm.index + cm[0].length)
+      const close = cm[1].includes('`') ? rest.indexOf('`') : cm[1].includes('(') ? rest.indexOf(')') : -1
+      if (close !== -1) rest = rest.slice(0, close)
+      const { words: args } = shellWords(rest)
+      if (bin === 'systemctl') {
+        if (systemctlArmsTimer(args.map(expand))) return true
+        continue
+      }
+      const { files, copies } = writeTargets(bin, args)
+      if (files.some(writesTimerFile) || copies.some(copiesTimerIn)) return true
+    }
+    // what this segment leaves for the next ones: its assignments, its cd
+    const w = words[0] === 'export' || words[0] === 'local' || words[0] === 'readonly' ? words.slice(1) : words
+    for (const a of w) {
+      const as = /^([A-Za-z_]\w*)=(.*)$/s.exec(a)
+      if (!as) break
+      if (!/\$\(|`/.test(as[2])) vars[as[1]] = expand(as[2])
+    }
+    const cmd0 = (words[0] ?? '').replace(/^[({]+/, '')
+    if (cmd0 === 'cd' || cmd0 === 'pushd') cwdInUnitDir = UNIT_DIR_RX.test(expand(words[1] ?? ''))
+  }
+  // An installer written AND run in the same command (measured: 1 of the 36
+  // creations wrote `install-...-timer.sh` from a heredoc, then `bash` ran it): the
+  // body is checked as commands when the command runs that very file with a shell.
+  if (depth < 2 && masked != null) {
+    const hereRx = new RegExp(HEREDOC_FILE_RX.source, HEREDOC_FILE_RX.flags) // fresh: see cmdRx
+    let h
+    while ((h = hereRx.exec(String(command ?? '')))) {
+      const file = h[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // run at a command position (the `cat > file` line itself is not one), with a
+      // shell, `source`/`.`, or as ./file; in `masked` a quoted body is blank, so a
+      // message that merely SAYS `bash inst.sh` runs nothing. `bash -n` only parses
+      // (measured: in 7 of the 8 commands this rule met among 3250 real ones, the
+      // arming script was only syntax-checked), so a short option with `n` is no run.
+      const runs = new RegExp(String.raw`(?:^|[;&|(\n])\s*(?:(?:bash|sh|zsh|dash|source|\.)\s+(?:(?:--[\w-]+|-(?![A-Za-z]*n)[A-Za-z]+)\s+)*)?["']?(?:\./)?${file}["']?(?=\s|$|[;&|)])`)
+      const body = h[5]
+      if (runs.test(masked) && armsSystemdTimer(body, splitSegments(body), depth + 1)) return true
+    }
+  }
+  // A script's own write call (python/node, e.g. in a heredoc body), per line.
+  return naiveSegs.some((seg) => SCRIPT_WRITE_RX.test(seg) && /systemd\/(?:user|system)(?:\.control)?\/\S*\.timer\b/i.test(seg))
+}
+
+// The native file tools: a timer unit written straight into a unit directory.
+function isTimerUnitPath(fp) {
+  const [dir, base] = splitPath(fp)
+  return dir !== '' && UNIT_DIR_RX.test(dir) && isTimerName(base)
+}
+
 // The Claude self-schedule store. Blocked for WRITE on any route (a Bash write,
 // or the native Write/Edit/NotebookEdit tool); a read/grep is legit diagnostics.
 const SCHEDULE_STORE_RX = /scheduled_tasks\.json/i
@@ -202,7 +509,16 @@ export function splitSegments(command) {
 // happened to reject the following bar. So the primitive is not "split more
 // carefully", it is "the inert text must not be there": mask it out, then let
 // the existing splitter and regexes run unchanged on what remains.
-export function maskInertLiterals(command) {
+//
+// `{ quotes: false }` blanks the heredoc bodies only and keeps the quoted text as
+// it is (same length): a quoted word can be an ARGUMENT -- a unit name, a path --
+// and the systemd-timer check reads its arguments from that.
+// `{ strict: false }` does not give up on a region that can command-substitute
+// (a double-quoted string or an unquoted-tag heredoc body with $(...) or a
+// backtick): it keeps THAT region as it is, visible, and masks the rest. Only an
+// unterminated quote or heredoc is still null. The scheduler check keeps the
+// strict default; the systemd-timer check uses this.
+export function maskInertLiterals(command, { quotes = true, strict = true } = {}) {
   const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
   let cur = ''
   let i = 0
@@ -210,6 +526,7 @@ export function maskInertLiterals(command) {
   // Inert regions collapse to spaces: the text is gone, and with it every
   // separator inside it -- which is precisely what prose was faking.
   const blank = (s) => ' '.repeat(s.length)
+  const quoted = (s) => (quotes ? blank(s) : s)
 
   while (i < src.length) {
     const c = src[i]
@@ -234,7 +551,12 @@ export function maskInertLiterals(command) {
       const rel = endRx.exec(src.slice(i))
       if (!rel) return null // unterminated heredoc
       const body = src.slice(i, i + rel.index)
-      if (!quotedTag && /\$\(|`/.test(body)) return null // unquoted tag expands the body
+      if (!quotedTag && /\$\(|`/.test(body)) { // unquoted tag expands the body
+        if (strict) return null
+        cur += body + rel[0]
+        i += rel.index + rel[0].length
+        continue
+      }
       cur += blank(body) + rel[0]
       i += rel.index + rel[0].length
       continue
@@ -243,14 +565,14 @@ export function maskInertLiterals(command) {
     if (c === "'") { // literal until the next ' -- a backslash is NOT special here
       const end = src.indexOf("'", i + 1)
       if (end === -1) return null
-      cur += blank(src.slice(i, end + 1)); i = end + 1; continue
+      cur += quoted(src.slice(i, end + 1)); i = end + 1; continue
     }
 
     if (c === '$' && src[i + 1] === "'") { // ANSI-C: \' does escape
       let j = i + 2
       while (j < src.length && src[j] !== "'") { j += src[j] === '\\' ? 2 : 1 }
       if (j >= src.length) return null
-      cur += blank(src.slice(i, j + 1)); i = j + 1; continue
+      cur += quoted(src.slice(i, j + 1)); i = j + 1; continue
     }
 
     if (c === '"') {
@@ -258,8 +580,11 @@ export function maskInertLiterals(command) {
       while (j < src.length && src[j] !== '"') { j += src[j] === '\\' ? 2 : 1 }
       if (j >= src.length) return null
       const inner = src.slice(i + 1, j)
-      if (/\$\(|`/.test(inner)) return null // may run a command -> not inert
-      cur += blank(src.slice(i, j + 1)); i = j + 1; continue
+      if (/\$\(|`/.test(inner)) { // may run a command -> not inert
+        if (strict) return null
+        cur += src.slice(i, j + 1); i = j + 1; continue
+      }
+      cur += quoted(src.slice(i, j + 1)); i = j + 1; continue
     }
 
     cur += c; i++
@@ -354,6 +679,8 @@ export function gateDecision(toolName, toolInput) {
   if (name === 'Write' || name === 'Edit' || name === 'NotebookEdit') {
     const fp = String(toolInput?.file_path ?? toolInput?.notebook_path ?? '')
     if (SCHEDULE_STORE_RX.test(fp)) return { deny: true }
+    // ...and a timer unit written straight into a systemd unit directory
+    if (isTimerUnitPath(fp)) return { deny: true }
   }
   if (name === 'Bash') {
     // Strip -d/--data payloads on the WHOLE command BEFORE splitting. A payload is
@@ -392,6 +719,8 @@ export function gateDecision(toolName, toolInput) {
       // scheduler binaries: deny the exec/submit forms, allow pure read-listing
       if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) return { deny: true }
     }
+    // a systemd timer, armed with systemctl or written into a unit directory
+    if (armsSystemdTimer(safeCommand, naiveSegs)) return { deny: true }
   }
   return { deny: false }
 }
@@ -399,7 +728,9 @@ export function gateDecision(toolName, toolInput) {
 const GATE_MSG =
   'Self-pace TILTOTT (governance hard-gate). Sub-agentkent NEM utemezhetsz sajat ' +
   'jovobeli turn-t: se ScheduleWakeup/Cron*/RemoteTrigger, se tmux send-keys, se ' +
-  'scheduled_tasks.json iras, se /api/schedules POST, se /loop self-pace. Input-vezerelt ' +
+  'scheduled_tasks.json iras, se /api/schedules POST, se /loop self-pace, se OS-utemezo ' +
+  '(crontab, at, systemd-run, systemd timer: systemctl enable/start ... .timer, vagy .timer ' +
+  'unit-fajl irasa a systemd unit-konyvtarba). Input-vezerelt ' +
   'vagy: csak az operator (channel) vagy egy peer (inter-agent) uzenete inditson. Ha varakozol, ' +
   'maradj idle a prompt-on -- a beerkezo uzenet majd ujrainditja a turn-t. SOHA ne valaszolj ' +
   'magadnak es SOHA ne dontsd el az operator helyett egy hozza intezett kerdest.'
