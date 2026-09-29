@@ -1209,6 +1209,65 @@ export function initDatabase(dbPathOverride?: string): void {
   // Migration: add agent column to installs that created the table before this column existed.
   try { db.exec(`ALTER TABLE store_file_audit ADD COLUMN agent TEXT`) } catch { /* column already exists */ }
 
+  // --- Owner rules (src/owner-rules.ts) ---
+  // One source for the owners' standing rules and decisions: who asked, what, where (a message or card id), when, and
+  // whether it still holds. Written only through /api/owner-rules, each write with an event row carrying a hash of the
+  // row as written; the rules file an instance imports into its CLAUDE.md is generated from here. A rule is never
+  // deleted, only revoked with its own source, and the event log is append-only, so the history cannot be rewritten
+  // quietly (the view then leaves out any row no event vouches for). An imported line may lack its source or date (NULL,
+  // "to complete"), and the text lines around the rules of an imported file are kept as intro/note/outro rows.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS owner_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_chat_id TEXT NOT NULL,
+      owner_label TEXT,
+      kind TEXT NOT NULL DEFAULT 'rule' CHECK (kind IN ('rule', 'intro', 'note', 'outro')),
+      rule TEXT NOT NULL,
+      source TEXT,
+      decided_on TEXT,
+      verbatim_line TEXT,
+      valid_from TEXT,
+      valid_until TEXT,
+      revoked_at INTEGER,
+      revoked_source TEXT,
+      revoked_by TEXT,
+      created_by TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_owner_rules_owner ON owner_rules(owner_chat_id, revoked_at)`)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS owner_rule_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL CHECK (event_type IN ('create', 'revoke')),
+      actor TEXT NOT NULL,
+      auth_kind TEXT,
+      payload_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_owner_rule_events_rule ON owner_rule_events(rule_id)`)
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS owner_rules_no_delete BEFORE DELETE ON owner_rules
+    BEGIN SELECT RAISE(ABORT, 'owner_rules: revoke a rule, do not delete it'); END
+  `)
+  // A revocation is final: clearing it would bring the rule back quietly, changing it would rewrite who revoked it and why.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS owner_rules_revocation_final BEFORE UPDATE ON owner_rules
+    WHEN OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS NOT OLD.revoked_at
+      OR NEW.revoked_source IS NOT OLD.revoked_source OR NEW.revoked_by IS NOT OLD.revoked_by)
+    BEGIN SELECT RAISE(ABORT, 'owner_rules: a revocation is final, it cannot be undone or changed'); END
+  `)
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS owner_rule_events_no_update BEFORE UPDATE ON owner_rule_events
+    BEGIN SELECT RAISE(ABORT, 'owner_rule_events is append-only'); END
+  `)
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS owner_rule_events_no_delete BEFORE DELETE ON owner_rule_events
+    BEGIN SELECT RAISE(ABORT, 'owner_rule_events is append-only'); END
+  `)
+
   // --- CostOps (local cost ledger) ---
   // Read-mostly, FOCUS-inspired. cost_sources = provider/subscription origin,
   // cost_line_items = individual charge rows (estimate or provider-sourced).
@@ -4957,7 +5016,7 @@ export function getRecentStoreFileEvents(limit = 200): StoreFileAuditRow[] {
 
 // --- Unified Audit Log Query ---
 
-export type AuditSource = 'config' | 'idea' | 'store' | 'diary'
+export type AuditSource = 'config' | 'idea' | 'store' | 'diary' | 'owner_rule'
 
 export interface AuditLogEntry {
   id: number
@@ -4984,6 +5043,9 @@ export interface AuditLogEntry {
   category?: string
   keywords?: string
   entry_type?: 'log' | 'memory'
+  // owner_rule (owner_rule_events): event_type and actor above, plus
+  rule_id?: number
+  auth_kind?: string | null
 }
 
 export function queryAuditLog(opts: {
@@ -4995,7 +5057,7 @@ export function queryAuditLog(opts: {
   limit: number
 }): AuditLogEntry[] {
   const { sources, from, to, q, agent, limit } = opts
-  const all: AuditSource[] = ['config', 'idea', 'store', 'diary']
+  const all: AuditSource[] = ['config', 'idea', 'store', 'diary', 'owner_rule']
   const active = sources.length > 0 ? sources : all
 
   const parts: AuditLogEntry[] = []
@@ -5020,6 +5082,18 @@ export function queryAuditLog(opts: {
     sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
     const rows = db.prepare(sql).all(...params) as Array<{ id: number; idea_id: string; from_status: string | null; to_status: string; actor: string; note: string | null; created_at: number }>
     for (const r of rows) parts.push({ ...r, source: 'idea' })
+  }
+
+  if (active.includes('owner_rule')) {
+    let sql = 'SELECT id, rule_id, event_type, actor, auth_kind, created_at FROM owner_rule_events WHERE 1=1'
+    const params: unknown[] = []
+    if (from) { sql += ' AND created_at >= ?'; params.push(from) }
+    if (to)   { sql += ' AND created_at <= ?'; params.push(to) }
+    if (agent) { sql += ' AND actor = ?'; params.push(agent) }
+    if (q)    { sql += ' AND (event_type LIKE ? OR actor LIKE ?)'; const p = `%${q}%`; params.push(p, p) }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
+    const rows = db.prepare(sql).all(...params) as Array<{ id: number; rule_id: number; event_type: string; actor: string; auth_kind: string | null; created_at: number }>
+    for (const r of rows) parts.push({ ...r, source: 'owner_rule' })
   }
 
   if (active.includes('store')) {
