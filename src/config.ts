@@ -231,6 +231,17 @@ export function brandSlug(raw: string): string {
 // (NFKD + ASCII + lowercase dashes). Older installs without this env var
 // fall back to "marveen" so nothing breaks when upgrading in place.
 export const MAIN_AGENT_ID = env['MAIN_AGENT_ID'] ?? 'marveen'
+
+// Where the owner-rules view (src/owner-rules.ts) is written: the Markdown file the main agent's CLAUDE.md imports.
+// Relative paths resolve against PROJECT_ROOT. Empty: the table and the API work, no file is written.
+export const OWNER_RULES_VIEW_PATH = env['OWNER_RULES_VIEW_PATH'] ?? ''
+
+// The sha256 (hex) of the owner-rules WRITE token: creating, revoking and importing owner rules need that token, which only
+// the main agent holds. Only the hash is configured, never the token. Read per call, so setting it needs no restart;
+// empty or not a sha256 digest: every rule write is refused.
+export function ownerRulesWriteTokenSha256(): string {
+  return (readEnvFile(['OWNER_RULES_WRITE_TOKEN_SHA256'])['OWNER_RULES_WRITE_TOKEN_SHA256'] ?? '').trim()
+}
 // The hidden heartbeat worker's agent id. Lives here (not in
 // heartbeat-agent-scaffold) so agent-scaffold can key gates on it without an
 // import cycle: heartbeat-agent-scaffold already imports agent-scaffold.
