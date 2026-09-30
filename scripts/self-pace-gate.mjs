@@ -136,7 +136,13 @@ const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s
 // adjustment, nohup, command -p (only -p runs the command; -v and -V look it up),
 // exec -a, stdbuf, setsid, flock <file>, doas, runuser, and xargs as the head of a
 // pipeline segment (`... | xargs crontab -r`).
-const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|env(?:\s+(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-[A-Za-z]*|--[\w-]+|[A-Za-z_]\w*=\S*))*|nice(?:\s+(?:-n\s*\S+|--adjustment(?:=|\s+)\S+|-\d+))*|nohup|command(?:\s+-p)+|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)(?:=|\s+)\S+))*|setsid(?:\s+(?:-[A-Za-z]+|--[\w-]+))*|flock(?:\s+(?:-[wEe]\s*\S+|--(?:timeout|conflict-exit-code)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|doas(?:\s+(?:-u\s*\S+|-[A-Za-z]+))*|runuser(?:\s+(?:-u\s*\S+|--user(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*(?:\s+--)?|xargs(?:\s+(?:-[IdEeLnPsa]\s*\S+|--[\w-]+(?:=\S+)?|-[A-Za-z0]+))*)\s+)*`
+// And GNU time or the shell keyword `time`, by path too, with its options (teszter
+// 38794, fejlesztes-vezeto 53671): `/usr/bin/time crontab -r`, `/usr/bin/time -o f
+// -f %M crontab -r` and `time -p crontab -r` passed, on develop too. The bare
+// option branch is there on purpose: the masked view blanks a quoted value
+// (`-f "%e %M"`), so the valued branch would take the next word for the value, and
+// the bare branch keeps the command word after it.
+const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|env(?:\s+(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-[A-Za-z]*|--[\w-]+|[A-Za-z_]\w*=\S*))*|nice(?:\s+(?:-n\s*\S+|--adjustment(?:=|\s+)\S+|-\d+))*|nohup|command(?:\s+-p)+|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)(?:=|\s+)\S+))*|setsid(?:\s+(?:-[A-Za-z]+|--[\w-]+))*|flock(?:\s+(?:-[wEe]\s*\S+|--(?:timeout|conflict-exit-code)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|doas(?:\s+(?:-u\s*\S+|-[A-Za-z]+))*|runuser(?:\s+(?:-u\s*\S+|--user(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*(?:\s+--)?|xargs(?:\s+(?:-[IdEeLnPsa]\s*\S+|--[\w-]+(?:=\S+)?|-[A-Za-z0]+))*|(?:\S*/)?time(?:\s+(?:-[of]\s*\S+|--(?:output|format)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*)\s+)*`
 const SCHEDULER_RX = new RegExp(
   String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
   'i',

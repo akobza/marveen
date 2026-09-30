@@ -71,6 +71,38 @@ describe('ffc45c28 (2): the other common wrappers and a script handed to a shell
   })
 })
 
+describe('ffc45c28 (3): GNU time and the time keyword, by path and with options (teszter 38794, fejlesztes-vezeto 53671)', () => {
+  const SF = 'systemd-run --user --scope --quiet --collect --slice=sf-heavy.slice --unit=sf-heavy-tsc-4242 -p MemoryMax=16G --'
+  const T = '/usr/bin/time -o /tmp/sfh-demo.txt -f %M'
+  it('the three measured forms', () => {
+    expect(bash('/usr/bin/time crontab -r')).toBe(true)
+    expect(bash('/usr/bin/time -o f -f %M crontab -r')).toBe(true)
+    expect(bash('time -p crontab -r')).toBe(true)
+  })
+  it('other options, a quoted format, other schedulers, a timer, a shell script, after a keyword', () => {
+    expect(bash('/usr/bin/time -f "%e %M" crontab -r')).toBe(true)
+    expect(bash('/usr/bin/time --output=f --format=%M at now')).toBe(true)
+    expect(bash('/bin/time -v -a -o f systemd-run --user --on-active=60 /bin/true')).toBe(true)
+    expect(bash('time -p systemctl --user enable --now demo-guard.timer')).toBe(true)
+    expect(bash(`/usr/bin/time -o f -f %M bash -c ${Q}crontab -r${Q}`)).toBe(true)
+    expect(bash('if true; then /usr/bin/time crontab -r; fi')).toBe(true)
+    expect(bash('sudo -n /usr/bin/time -o f -f %M crontab -r')).toBe(true)
+  })
+  it('the sf-heavy form with a time wrapper behind its own tail is denied as the wrapper is without it', () => {
+    expect(bash(`${SF} ${T} /usr/bin/time crontab -r`)).toBe(true)
+    expect(bash(`${SF} ${T} time -p at now`)).toBe(true)
+    expect(bash(`${SF} ${T} npx tsc --noEmit`)).toBe(false)
+  })
+  it('what stays allowed: an ordinary command or a read behind time, prose that quotes the forms', () => {
+    expect(bash('/usr/bin/time -o f -f %M npx tsc --noEmit')).toBe(false)
+    expect(bash('time -p crontab -l')).toBe(false)
+    expect(bash('/usr/bin/time ls -la')).toBe(false)
+    expect(bash('timeout 60 npx tsc --noEmit')).toBe(false)
+    expect(bash('echo "/usr/bin/time -o f -f %M crontab -r"')).toBe(false)
+    expect(bash('git commit -m "gate: time -p crontab -r"')).toBe(false)
+  })
+})
+
 describe('ffc45c28: what stays allowed', () => {
   it('a read behind the wrapper, as without it', () => {
     expect(bash('sudo -n crontab -l')).toBe(false)
