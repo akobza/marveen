@@ -122,13 +122,23 @@ const LAUNCHCTL_SUBCOMMAND = String.raw`(?=\s*$|\s+-|\s+[a-z][a-z-]*(?:\s|$))`
 // already had one: the measured `for f in x.service x.timer; do cp ... "$U/$f";
 // done` puts `do cp` at the start.
 const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*`
+// ...and after `sudo` WITH options or `timeout <duration>`, which SCHED_PREFIX does
+// not read (it takes a bare `sudo` only). Measured 2026-09-30 (ffc45c28): `sudo -n
+// crontab -r`, `sudo -u root crontab -r` and `timeout 60 crontab -r` passed, on
+// develop too, while `sudo crontab -r` was denied. The timer check below already
+// read these: `sudo -n tee /etc/systemd/system/x.timer` was the one real write the
+// plain prefix missed among 3250 measured commands (cc8e80d7). The options that
+// take a value are named, so `sudo -n tee` keeps `tee` as the command; the same
+// for timeout's `-s <signal>` and `-k <duration>` (`timeout -s KILL 60 crontab -r`
+// passed with the earlier `-\S+` branch, which took `KILL` for the duration).
+const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+)\s+)*`
 const SCHEDULER_RX = new RegExp(
-  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
+  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
   'i',
 )
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
-const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
 
 // --- the one systemd-run form this gate allows ----------------------------------
 //
@@ -245,12 +255,8 @@ const SYSTEMCTL_VALUE_OPTS = new Set([
   '-o', '--output', '-s', '--signal', '--kill-whom', '--kill-value', '--job-mode', '--root', '--image',
   '--what', '--timestamp', '--preset-mode', '--when', '--drop-in', '--message', '--check-inhibitors',
 ])
-// The command word of a segment, as for SCHEDULER_RX, also after a shell keyword
-// (SHELL_KEYWORDS, above), and after `sudo` WITH options (`sudo -n tee
-// /etc/systemd/system/x.timer` was the one real write the plain prefix missed
-// among 3250 measured commands; the options that take a value are named, so
-// `sudo -n tee` keeps `tee` as the command) or `timeout <duration>`.
-const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+-\S+)*\s+\S+)\s+)*`
+// The command word of a segment, as for SCHEDULER_RX: after a shell keyword
+// (SHELL_KEYWORDS) and a wrapper (WRAPPER_PREFIX), both defined above.
 const TIMER_CMD_RX = new RegExp(
   String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
   'gi',
