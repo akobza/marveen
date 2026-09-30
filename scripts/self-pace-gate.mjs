@@ -114,13 +114,21 @@ const AT_INVOCATION = String.raw`(?=\s*$|\s+-|\s*<|\s+(?:now|noon|midnight|teati
 // prose. End-of-segment and a flag stay DENIED -- a bare `launchctl` is
 // interactive, still a real vector.
 const LAUNCHCTL_SUBCOMMAND = String.raw`(?=\s*$|\s+-|\s+[a-z][a-z-]*(?:\s|$))`
+// The command word of a segment, and also after a shell keyword that starts a
+// command inside a loop, a condition or a group. Measured 2026-09-30 (90a2257b):
+// SCHEDULER_RX had no keyword branch, so `if true; then crontab -r; fi`,
+// `for i in 1; do crontab -r; done`, `while false; do at now; done`, `{ crontab
+// -r; }` and `! crontab -r` all passed, while the timer check below (cc8e80d7)
+// already had one: the measured `for f in x.service x.timer; do cp ... "$U/$f";
+// done` puts `do cp` at the start.
+const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*`
 const SCHEDULER_RX = new RegExp(
-  String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
+  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
   'i',
 )
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
-const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
 
 // --- the one systemd-run form this gate allows ----------------------------------
 //
@@ -133,7 +141,8 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_
 // that outlives the call, so it schedules nothing. The operator accepted exactly
 // this form and asked for a documented exception here instead of a blind spot.
 // So this ONE form -- these options in this order, unquoted, at a command
-// position, nothing (no sudo, env, path) in front of the binary -- is transparent
+// position (also after a shell keyword, as SCHEDULER_RX reads one), nothing (no
+// sudo, env, path) in front of the binary -- is transparent
 // to the gate: the prefix is replaced by a command separator, and the command
 // after `--` is judged as if it were run directly, so a scheduler, a timer or a
 // pane injection behind the prefix is still denied. Every other systemd-run (an
@@ -141,7 +150,7 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_
 // property, another order) is not this form and stays denied by SCHEDULER_RX.
 // The label charset is the one sf-heavy writes (tr -c 'A-Za-z0-9_.-' '-').
 const SF_HEAVY_SCOPE_RX = new RegExp(
-  String.raw`(^|[;&|(\`\n])([ \t]*)systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--(?=[ \t]+[^\s;&|)\`])`,
+  String.raw`(^|[;&|(\`\n])([ \t]*${SHELL_KEYWORDS})systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--(?=[ \t]+[^\s;&|)\`])`,
   'g',
 )
 export function unwrapSfHeavyScope(command) {
@@ -215,14 +224,11 @@ const SYSTEMCTL_VALUE_OPTS = new Set([
   '-o', '--output', '-s', '--signal', '--kill-whom', '--kill-value', '--job-mode', '--root', '--image',
   '--what', '--timestamp', '--preset-mode', '--when', '--drop-in', '--message', '--check-inhibitors',
 ])
-// The command word of a segment, as for SCHEDULER_RX, and also after a shell
-// keyword that starts a command inside a loop or a condition: the measured
-// `for f in x.service x.timer; do cp ... "$U/$f"; done` puts `do cp` at the start.
-const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*`
-// ...and after `sudo` WITH options (`sudo -n tee /etc/systemd/system/x.timer` was
-// the one real write the plain prefix missed among 3250 measured commands; the
-// options that take a value are named, so `sudo -n tee` keeps `tee` as the
-// command) or `timeout <duration>`.
+// The command word of a segment, as for SCHEDULER_RX, also after a shell keyword
+// (SHELL_KEYWORDS, above), and after `sudo` WITH options (`sudo -n tee
+// /etc/systemd/system/x.timer` was the one real write the plain prefix missed
+// among 3250 measured commands; the options that take a value are named, so
+// `sudo -n tee` keeps `tee` as the command) or `timeout <duration>`.
 const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+-\S+)*\s+\S+)\s+)*`
 const TIMER_CMD_RX = new RegExp(
   String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
