@@ -84,6 +84,37 @@ describe('list-read section: what it says (c4e47223)', () => {
     expect(body).toMatch(/`rc=7` a kapcsolat hiánya/)
     expect(body).toMatch(/`000` a válasz nélküli/)
   })
+
+  // teszter 39374: rc=0 + http=200 + a parsed body is a whole RESPONSE, and a
+  // response the server cut at its limit passes all three. The section used to
+  // call that a complete list, with /api/messages as its example.
+  it('a whole response is not called a whole list any more', () => {
+    expect(body).not.toMatch(/A lista csak akkor teljes, ha `rc=0`/)
+    expect(body).toMatch(/A VÁLASZ csak akkor ép, ha `rc=0`, `http=200`/)
+    expect(body).toMatch(/Az ép válasz még NEM teljes lista/)
+    expect(body).toMatch(/a lista a korlátnál áll\), nemleges lelet TILOS/)
+  })
+
+  it('names each list endpoint\'s server-side limit (the numbers: list-read-limits.test.ts)', () => {
+    const bullet = (endpoint: string) => {
+      const start = body.indexOf(`  - \`GET ${endpoint}\``)
+      expect(start, `no bullet for ${endpoint}`).toBeGreaterThanOrEqual(0)
+      const next = body.indexOf('\n  - ', start + 1)
+      const end = next >= 0 ? next : body.indexOf('\n- ', start + 1)
+      return body.slice(start, end)
+    }
+    expect(bullet('/api/kanban')).toMatch(/korlát nélkül/)
+    expect(bullet('/api/kanban')).toMatch(/X-Total-Count/)
+    expect(bullet('/api/kanban/archived')).toMatch(/KANBAN_ARCHIVED_MAX_ROWS` beállítás \(alapérték 500,\s+legfeljebb 5000\)/)
+    expect(bullet('/api/kanban/archived')).toMatch(/`total < limit` a teljes, `total = limit` csonka lehet/)
+    // 39400: only status=pending filters; every other value is silently ignored.
+    expect(bullet('/api/messages?agent=')).toMatch(/CSAK a `status=pending` szűr, és az a teljes függő sort adja, korlát nélkül/)
+    expect(bullet('/api/messages?agent=')).toMatch(/HATÁSTALAN/)
+    expect(bullet('/api/messages?agent=')).toMatch(/alapból 50, legfeljebb 200 sor/)
+    expect(bullet('/api/messages?agent=')).toMatch(/`before=<a kapott legkisebb id>`/)
+    expect(bullet('/api/memories')).toMatch(/alapból 50, legfeljebb 200 sor/)
+    expect(bullet('/api/memories')).toMatch(/`truncated=true`-t mond a korlátnál \(lapozás: `offset=`\)/)
+  })
 })
 
 describe('list-read section: idempotent insert and update', () => {
