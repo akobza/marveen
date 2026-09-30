@@ -544,9 +544,41 @@ export function unwrapSfHeavyScope(command) {
 // drop-in). A file elsewhere under it (a `retired/` folder) is never loaded.
 const UNIT_DIR_RX = /(?:^|\/)systemd\/(?:user|system)(?:\.control)?(?:\/[^/]+\.(?:wants|requires|upholds|d))?\/?$/
 // A line of script code (python, node) that writes, copies or links a file.
-// `open(` is followed lazily to its mode argument: the path expression often has
-// parentheses of its own (`open(os.path.expanduser('...'), 'w')`).
-const SCRIPT_WRITE_RX = /\bopen\s*\(.*?,\s*['"][wax]b?\+?['"]|\.write_(?:text|bytes)\s*\(|\b(?:writeFileSync|appendFileSync|copyFileSync|symlinkSync|renameSync)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(|\bos\.(?:symlink|rename|replace)\s*\(/
+// `open(` counts with a write mode after it on the line: the path expression often
+// has parentheses of its own (`open(os.path.expanduser('...'), 'w')`). The mode is
+// looked for after the FIRST `open(` only, which finds it whenever any `open(` has
+// one after it: as `open\s*\(.*?,` the regex looked after every `open(` to the end
+// of the line, and 30000 of them took 0.9 s (ffc45c28, measured on cb4fb725).
+const SCRIPT_OPEN_RX = /\bopen\s*\(/g
+const SCRIPT_MODE_RX = /,\s*['"][wax]b?\+?['"]/g
+const SCRIPT_CALL_RX = /\.write_(?:text|bytes)\s*\(|\b(?:writeFileSync|appendFileSync|copyFileSync|symlinkSync|renameSync)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(|\bos\.(?:symlink|rename|replace)\s*\(/
+function scriptWrites(line) {
+  if (SCRIPT_CALL_RX.test(line)) return true
+  SCRIPT_OPEN_RX.lastIndex = 0
+  const o = SCRIPT_OPEN_RX.exec(line)
+  if (!o) return false
+  SCRIPT_MODE_RX.lastIndex = o.index + o[0].length
+  return SCRIPT_MODE_RX.test(line)
+}
+// ...and a timer unit's path on the same line: a unit directory, then `.timer` later
+// in the same word (`\S*\.timer\b` after the directory). Where each word ends is
+// computed once, so many directory mentions in one word are not each read to its end.
+const UNIT_DIR_MENTION_RX = /systemd\/(?:user|system)(?:\.control)?\//gi
+function namesTimerUnitPath(line) {
+  const timers = [...line.matchAll(/\.timer\b/gi)].map((m) => m.index)
+  if (timers.length === 0) return false
+  const n = line.length
+  const wordEnd = new Int32Array(n + 1)
+  wordEnd[n] = n
+  for (let i = n - 1; i >= 0; i--) wordEnd[i] = isWs(line.charCodeAt(i)) ? i : wordEnd[i + 1]
+  let t = 0
+  for (const m of line.matchAll(UNIT_DIR_MENTION_RX)) {
+    const from = m.index + m[0].length
+    while (t < timers.length && timers[t] < from) t++
+    if (t < timers.length && timers[t] < wordEnd[from]) return true
+  }
+  return false
+}
 // systemctl verbs that only READ state, or that DISARM a timer.
 const SYSTEMCTL_SAFE_VERBS = new Set([
   'status', 'show', 'cat', 'help', 'list-units', 'list-timers', 'list-unit-files', 'list-dependencies',
@@ -676,12 +708,103 @@ function writeTargets(bin, args) {
   return none
 }
 
-// A file written from a heredoc in the command: `cat > inst.sh <<'EOF' ... EOF`.
-const HEREDOC_FILE_RX = /(?:^|[\n;&|])[^\n]*?>\s*(["']?)([^\s"'<>;|&]+)\1[^\n]*?<<-?\s*(['"]?)([A-Za-z_]\w*)\3[^\n]*\n([\s\S]*?)\n[ \t]*\4[ \t]*(?=\n|$)/g
+// A file written from a heredoc in the command: `cat > inst.sh <<'EOF' ... EOF`, as
+// [file, body] pairs: an output redirect's target on the opener's line (its `>` may end
+// the line before), and the body up to the first line that is only the tag. An opener
+// inside a body already taken is part of that body. As one regex, the opener was looked
+// for after every `>` of a line to the line's end, and 20000 redirects into a unit
+// directory took over 20 s (ffc45c28, measured on cb4fb725); here the openers, the
+// targets and the tag lines are each found once, and `ran` (the files the command runs)
+// is asked once per opener.
+function heredocInstallers(command, ran) {
+  const s = String(command ?? '')
+  const out = []
+  if (!s.includes('<<')) return out
+  const tagLines = new Map() // the starts of the lines that are only a tag (after a newline), by tag
+  for (let ls = s.indexOf('\n') + 1; ls > 0;) {
+    const nl = s.indexOf('\n', ls)
+    const m = /^[ \t]*([A-Za-z_]\w*)[ \t]*$/.exec(s.slice(ls, nl === -1 ? s.length : nl))
+    if (m) (tagLines.get(m[1]) ?? tagLines.set(m[1], []).get(m[1])).push(ls)
+    ls = nl + 1
+  }
+  const targets = [] // [where the target word starts, the file], in order
+  for (const m of s.matchAll(/>\s*(["']?)([^\s"'<>;|&]+)\1/g)) targets.push([m.index + m[0].length - m[1].length - m[2].length, m[2]])
+  const tagAt = new Map() // per tag, the first tag line not yet passed
+  let taken = 0
+  let lineStart = 0
+  let nextNl = s.indexOf('\n')
+  let t = 0
+  for (const m of s.matchAll(/<<-?\s*(['"]?)([A-Za-z_]\w*)\1/g)) {
+    const o = m.index
+    if (o < taken) continue
+    while (nextNl !== -1 && nextNl < o) { lineStart = nextNl + 1; nextNl = s.indexOf('\n', lineStart) }
+    while (t < targets.length && targets[t][0] < lineStart) t++
+    if (t >= targets.length || targets[t][0] >= o) continue // no redirect on the opener's line
+    const openEnd = o + m[0].length
+    const nl = nextNl !== -1 && openEnd <= nextNl ? nextNl : s.indexOf('\n', openEnd)
+    if (nl === -1) continue
+    const lines = tagLines.get(m[2]) ?? []
+    let k = tagAt.get(m[2]) ?? 0
+    while (k < lines.length && lines[k] < nl + 2) k++
+    tagAt.set(m[2], k)
+    if (k >= lines.length) continue // no closing tag line
+    const close = lines[k]
+    const closeEnd = s.indexOf('\n', close)
+    taken = closeEnd === -1 ? s.length : closeEnd
+    for (let j = t; j < targets.length && targets[j][0] < o; j++) {
+      if (ran(targets[j][1])) { out.push([targets[j][1], s.slice(nl + 1, close - 1)]); break }
+    }
+  }
+  return out
+}
+
+// The files a command runs (the installer rule): at a command position of the masked
+// command, as the first operand of a shell, `source` or `.` (options without an `n`:
+// `bash -n` only parses), or as the command itself; one pair of quotes around the
+// word dropped. A word ends at a space, `;`, `&`, `|`, `(` or `)`, so the words after
+// the starts do not overlap, and each is read once.
+function ranFiles(masked) {
+  const s = String(masked ?? '')
+  const n = s.length
+  const files = new Set()
+  const next = new Int32Array(n + 1) // the first non-space at or after i
+  next[n] = n
+  for (let i = n - 1; i >= 0; i--) next[i] = isWs(s.charCodeAt(i)) ? next[i + 1] : i
+  const wordAt = (i) => {
+    let j = i
+    while (j < n && !isWs(s.charCodeAt(j)) && !';&|()'.includes(s[j])) j++
+    return [s.slice(i, j), j]
+  }
+  const add = (w) => files.add(w.replace(/^["']/, '').replace(/["']$/, ''))
+  const read = (a) => {
+    let i = next[a]
+    const [w, e] = wordAt(i)
+    if (!w) return
+    add(w)
+    if (!['bash', 'sh', 'zsh', 'dash', 'source', '.'].includes(w) || e >= n || !isWs(s.charCodeAt(e))) return
+    for (i = next[e]; ;) {
+      const [o, oe] = wordAt(i)
+      const option = /^--[\w-]+$/.test(o) || (/^-[A-Za-z]+$/.test(o) && !o.includes('n'))
+      if (!option || oe >= n || !isWs(s.charCodeAt(oe))) break
+      i = next[oe]
+    }
+    const [f] = wordAt(i)
+    if (f) add(f)
+  }
+  read(0)
+  for (let i = 0; i < n; i++) if (';&|(\n'.includes(s[i])) read(i + 1)
+  return files
+}
 
 // Does this Bash command arm a systemd timer, or write a timer unit into a unit
 // directory? `depth` bounds the installer recursion below.
 function armsSystemdTimer(command, naiveSegs, depth = 0) {
+  // The argument reading below costs what it scans. A command inside `$(...)` reads
+  // its arguments to the `)`, and nested substitutions with no close each read the
+  // rest of the segment again (ffc45c28, measured on cb4fb725: 20000 nested `$(systemctl
+  // status` over 20 s). A real command scans its segments a few times at most; past
+  // this budget the command is denied, as one the gate cannot read in time.
+  let budget = 16 * String(command ?? '').length + 65536
   // The segments the shell really has (masked: quotes and heredoc bodies blank),
   // and the same spans with only the heredoc bodies blank: quoted arguments are
   // read from those. The two strings have the same length (maskInertLiterals
@@ -747,6 +870,8 @@ function armsSystemdTimer(command, naiveSegs, depth = 0) {
       // a command that starts a substitution ends where the substitution does
       let rest = b.slice((key - cut) / 3)
       const close = cut === 2 ? rest.indexOf('`') : cut === 1 ? rest.indexOf(')') : -1
+      budget -= close === -1 ? rest.length : close
+      if (budget < 0) return true
       if (close !== -1) rest = rest.slice(0, close)
       const { words: args } = shellWords(rest)
       if (bin === 'systemctl') {
@@ -770,22 +895,18 @@ function armsSystemdTimer(command, naiveSegs, depth = 0) {
   // creations wrote `install-...-timer.sh` from a heredoc, then `bash` ran it): the
   // body is checked as commands when the command runs that very file with a shell.
   if (depth < 2 && masked != null) {
-    const hereRx = new RegExp(HEREDOC_FILE_RX.source, HEREDOC_FILE_RX.flags) // fresh: see cmdRx
-    let h
-    while ((h = hereRx.exec(String(command ?? '')))) {
-      const file = h[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      // run at a command position (the `cat > file` line itself is not one), with a
-      // shell, `source`/`.`, or as ./file; in `masked` a quoted body is blank, so a
-      // message that merely SAYS `bash inst.sh` runs nothing. `bash -n` only parses
-      // (measured: in 7 of the 8 commands this rule met among 3250 real ones, the
-      // arming script was only syntax-checked), so a short option with `n` is no run.
-      const runs = new RegExp(String.raw`(?:^|[;&|(\n])\s*(?:(?:bash|sh|zsh|dash|source|\.)\s+(?:(?:--[\w-]+|-(?![A-Za-z]*n)[A-Za-z]+)\s+)*)?["']?(?:\./)?${file}["']?(?=\s|$|[;&|)])`)
-      const body = h[5]
-      if (runs.test(masked) && armsSystemdTimer(body, splitSegments(body), depth + 1)) return true
+    // run at a command position (the `cat > file` line itself is not one), with a
+    // shell, `source`/`.`, or as ./file; in `masked` a quoted body is blank, so a
+    // message that merely SAYS `bash inst.sh` runs nothing. `bash -n` only parses
+    // (measured: in 7 of the 8 commands this rule met among 3250 real ones, the
+    // arming script was only syntax-checked), so a short option with `n` is no run.
+    const run = ranFiles(masked)
+    for (const [, body] of heredocInstallers(command, (f) => run.has(f) || run.has('./' + f))) {
+      if (armsSystemdTimer(body, splitSegments(body), depth + 1)) return true
     }
   }
   // A script's own write call (python/node, e.g. in a heredoc body), per line.
-  return naiveSegs.some((seg) => SCRIPT_WRITE_RX.test(seg) && /systemd\/(?:user|system)(?:\.control)?\/\S*\.timer\b/i.test(seg))
+  return naiveSegs.some((seg) => scriptWrites(seg) && namesTimerUnitPath(seg))
 }
 
 // The native file tools: a timer unit written straight into a unit directory.

@@ -63,6 +63,39 @@ describe('ffc45c28: a command position is read in linear time', () => {
   })
 })
 
+describe('ffc45c28: the timer check (cc8e80d7) in linear time', () => {
+  const unit = '~/.config/systemd/user'
+  it('nested substitutions whose arguments each ran to the end of the segment: denied by the reading budget', () => {
+    within('$(systemctl status '.repeat(20000) + 'demo.timer', true)
+    within('$(systemctl enable '.repeat(20000) + ') demo.timer', true)
+    within(BQ + 'systemctl status '.repeat(20000) + 'demo.timer', false)
+  })
+  it('many redirects, installers, open( calls and unit paths', () => {
+    within(`> ${unit}/x `.repeat(20000), false)
+    within(`cat > i.sh <<${Q}EOF${Q}${NL}x${NL}EOF${NL}`.repeat(5000) + 'bash i.sh', false)
+    within(`cat > i.sh <<${Q}EOF${Q}${NL}`.repeat(5000) + 'bash i.sh demo.timer', false)
+    within('demo.timer ' + 'open('.repeat(60000), false)
+    within('open(p, ' + Q + 'w' + Q + ') demo.timer ' + 'systemd/user/'.repeat(20000) + 'x', false)
+    within('tee ' + 'a '.repeat(20000) + `${unit}/demo.timer`, true)
+    within('cp ' + 'demo.timer '.repeat(20000) + `${unit}/`, true)
+  })
+  it('a real command with several substitutions is far from the budget', () => {
+    expect(bash('systemctl --user status $(systemctl --user list-timers --all | head -3) $(systemctl --user show -p Id demo-guard.timer)')).toBe(false)
+  })
+  it('the installer rule: every redirect on the line counts, and a file run by source, . or ./', () => {
+    const body = `<<${Q}EOF${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}EOF${NL}`
+    // before, only the first redirect of the line was read: here /dev/null, which is never run
+    expect(bash(`cat 2>/dev/null > i.sh ${body}bash i.sh`)).toBe(true)
+    expect(bash(`cat > i.sh ${body}source i.sh`)).toBe(true)
+    expect(bash(`cat > i.sh ${body}. ./i.sh`)).toBe(true)
+    expect(bash(`cat > i.sh ${body}chmod +x i.sh && ./i.sh`)).toBe(true)
+    expect(bash(`cat > i.sh ${body}sh -e i.sh`)).toBe(true)
+    // CONTROLS: parsed only, or never written (an opener inside another body is its text)
+    expect(bash(`cat > i.sh ${body}bash -n i.sh`)).toBe(false)
+    expect(bash(`cat > a.sh <<${Q}EOF${Q}${NL}cat > b.sh <<${Q}X${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}X${NL}EOF${NL}bash b.sh`)).toBe(false)
+  })
+})
+
 describe('ffc45c28: what the loop reads that the regexes did not', () => {
   it('a wrapper by its path, and -- at the end of its options', () => {
     expect(bash('/usr/bin/env crontab -r')).toBe(true)
