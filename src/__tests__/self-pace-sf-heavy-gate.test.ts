@@ -134,6 +134,40 @@ describe('90a2257b on develop 3f336c2c: a heredoc behind the tail is read as the
   })
 })
 
+describe('90a2257b: the form is read in linear time (the hook fails open after 10 s)', () => {
+  const timed = (command: string): { deny: boolean; ms: number } => {
+    const t0 = performance.now()
+    const deny = bash(command)
+    return { deny, ms: performance.now() - t0 }
+  }
+  it('variables in the time file, with a tail that is not the form: each split of the names was retried', () => {
+    for (const file of ['$AA'.repeat(28), `"${'$AA'.repeat(28)}`]) {
+      const r = timed(`${P} /usr/bin/time -o ${file} -f %N true; systemd-run --on-active=60 x`)
+      expect(r.deny).toBe(true)
+      expect(r.ms).toBeLessThan(1000)
+    }
+  })
+  it('a run of keyword lines with no form after it: every line was read to the end again', () => {
+    const none = timed(('then' + NL).repeat(60000) + 'true')
+    expect(none.deny).toBe(false)
+    expect(none.ms).toBeLessThan(1000)
+    const other = timed(('then' + NL).repeat(60000) + 'systemd-run --user --scope true')
+    expect(other.deny).toBe(true)
+    expect(other.ms).toBeLessThan(1000)
+    const ok = timed(('then' + NL).repeat(30000) + `${P} ${T} npx tsc --noEmit`)
+    expect(ok.deny).toBe(false)
+    expect(ok.ms).toBeLessThan(1000)
+    const bad = timed(('then' + NL).repeat(30000) + `${P} ${T} crontab -r`)
+    expect(bad.deny).toBe(true)
+    expect(bad.ms).toBeLessThan(1000)
+  })
+  it('a variable name is read whole, and the form with variables in the file name still unwraps', () => {
+    expect(bash(`${P} /usr/bin/time -o $AA$BB$CC -f %M npx tsc --noEmit`)).toBe(false)
+    expect(bash(`${P} /usr/bin/time -o "$SFH_FILE" -f %M npx tsc --noEmit`)).toBe(false)
+    expect(bash(`${P} /usr/bin/time -o $AA$BB$CC -f %M crontab -r`)).toBe(true)
+  })
+})
+
 describe('90a2257b: controls', () => {
   it('prose that quotes the form stays allowed, even with a scheduler after it', () => {
     expect(bash(`echo "${P} ${T} crontab -r"`)).toBe(false)

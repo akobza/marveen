@@ -157,9 +157,21 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_
 // command substitution or a backquote, because whatever sits in the removed tail
 // is never judged. Any other tail (none, no -o, another format, an expansion in
 // the file name) is not the form, and the whole systemd-run stays denied.
-const SF_HEAVY_TIME_FILE = String.raw`(?:(?:[A-Za-z0-9_./+:@%-]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})+|'[^'\n]*'|"(?:[A-Za-z0-9_./+:@% -]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})*")`
+// A variable in the file name is read whole: `$AB` is the variable AB, never the
+// variable A and a letter B. Measured 2026-09-30 (fejleszto, after teszter 39223):
+// with both readings open, a tail that is not the form (`-f %N`) was retried over
+// every way to split the names, exponentially: 26 variables of two letters took 1 s
+// in a 214-byte command, 32 of them would pass the hook's 10 s limit, and the hook
+// fails open. One reading per character keeps the match linear.
+const SF_HEAVY_VAR = String.raw`\$[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])|\$\{[A-Za-z_][A-Za-z0-9_]*\}`
+const SF_HEAVY_TIME_FILE = String.raw`(?:(?:[A-Za-z0-9_./+:@%-]|${SF_HEAVY_VAR})+|'[^'\n]*'|"(?:[A-Za-z0-9_./+:@% -]|${SF_HEAVY_VAR})*")`
+// The keywords in front of the form, on the form's own line. With `\s+` they ran over
+// the newlines, and every newline is a start of its own, so a run of 30000 `then`
+// lines was read again from each line (7.5 s on 150 KB). A keyword on an earlier
+// line adds nothing: the newline after it is the start the form is read from.
+const SF_HEAVY_KEYWORDS = SHELL_KEYWORDS.replace(/\\s/g, '[ \\t]')
 const SF_HEAVY_SCOPE_RX = new RegExp(
-  String.raw`(^|[;&|(\`\n])([ \t]*${SHELL_KEYWORDS})systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--[ \t]+/usr/bin/time[ \t]+-o[ \t]+${SF_HEAVY_TIME_FILE}[ \t]+-f[ \t]+%M(?=[ \t]+[^\s;&|)\`])`,
+  String.raw`(^|[;&|(\`\n])([ \t]*${SF_HEAVY_KEYWORDS})systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--[ \t]+/usr/bin/time[ \t]+-o[ \t]+${SF_HEAVY_TIME_FILE}[ \t]+-f[ \t]+%M(?=[ \t]+[^\s;&|)\`])`,
   'g',
 )
 export function unwrapSfHeavyScope(command) {
