@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 // @ts-expect-error -- plain .mjs hook script, no types
-import { gateDecision } from '../../scripts/self-pace-gate.mjs'
+import { gateDecision, selfPaceShape } from '../../scripts/self-pace-gate.mjs'
 
 // ffc45c28 (teszter 39223/39224, fejlesztes-vezeto 54307): the PreToolUse hook fails OPEN after
 // 10 s, so a gate that is slow on some input is a bypass for whatever that input carries. The
@@ -93,6 +93,48 @@ describe('ffc45c28: the timer check (cc8e80d7) in linear time', () => {
     // CONTROLS: parsed only, or never written (an opener inside another body is its text)
     expect(bash(`cat > i.sh ${body}bash -n i.sh`)).toBe(false)
     expect(bash(`cat > a.sh <<${Q}EOF${Q}${NL}cat > b.sh <<${Q}X${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}X${NL}EOF${NL}bash b.sh`)).toBe(false)
+  })
+})
+
+describe('ffc45c28 on develop: the three A-then-B self-pace patterns in linear time (fejlesztes-vezeto 54618)', () => {
+  // develop 6158290b's regexes as they were: the reference selfPaceShape must equal
+  const OLD = [
+    /\btmux\b[\s\S]*\b(send-keys|paste-buffer|run-shell|set-buffer)\b/i,
+    /\b(nohup|setsid|disown)\b[\s\S]*\bclaude\b/i,
+    /\bclaude\b[\s\S]*(?:^|[\s'"])\/loop(?=[\s'"]|$)/i,
+  ]
+  const old = (seg: string): boolean => OLD.some((re) => re.test(seg))
+  it('the same answer as the old regexes, on hand-picked and 20000 generated segments', () => {
+    const hand = ['tmux send-keys -t x go', 'nohup claude -p x', 'claude /loop 5m', 'claude -p "/loop x"',
+      'ls ~/.claude/skills/loop/SKILL.md', 'tmux ls', 'claude /loopy', 'send-keys tmux', 'claude' + NL + '/loop',
+      "claude'/loop'", '/loop claude', 'TMUX SEND-KEYS', 'setsid x claude']
+    for (const seg of hand) expect(selfPaceShape(seg), seg).toBe(old(seg))
+    // a fixed-seed generator over the words the patterns name and their near misses
+    let seed = 20260930
+    const rnd = (): number => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 4294967296 }
+    const T = ['tmux', 'send-keys', 'paste-buffer', 'run-shell', 'set-buffer', 'nohup', 'setsid', 'disown', 'claude', '/loop',
+      "'/loop'", '"/loop"', '/loop-x', 'x/loop', 'tmuxx', 'xclaude', 'claude2', 'send-keysx', 'CLAUDE', 'Tmux', 'Send-Keys',
+      '.claude', 'a', '-', '/', "'", '"']
+    const SEP = [' ', '', NL, '\t', "'", '"', '/', '-']
+    let yes = 0
+    let differ = 0
+    for (let i = 0; i < 20000; i++) {
+      let seg = ''
+      const k = 1 + Math.floor(rnd() * 8)
+      for (let j = 0; j < k; j++) seg += T[Math.floor(rnd() * T.length)] + SEP[Math.floor(rnd() * SEP.length)]
+      const want = old(seg)
+      if (want) yes++
+      if (selfPaceShape(seg) !== want) differ++
+    }
+    expect(differ).toBe(0)
+    // both answers well represented, or the equivalence says little
+    expect(yes).toBeGreaterThan(1000)
+    expect(20000 - yes).toBeGreaterThan(1000)
+  })
+  it('a run of A with no B (quadratic before: 30000 claude 3.5 s)', () => {
+    within('claude '.repeat(30000) + SCHED, true)
+    within('tmux '.repeat(30000) + 'x', false)
+    within('nohup '.repeat(30000) + 'x', false)
   })
 })
 

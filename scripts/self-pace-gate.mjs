@@ -46,13 +46,14 @@ const SELF_PACE_TOOLS = new Set([
 // Bash command patterns that achieve self-pace by another route. These are
 // tested per COMMAND SEGMENT (see splitSegments), so a token in one part of a
 // compound command never trips a pattern that belongs to another part.
+// Each is a pair: A, then anywhere later in the segment B (as a regex, A[\s\S]*B).
 const SELF_PACE_BASH_PATTERNS = [
   // tmux pane injection -- every write-subcommand that can push keys/text/commands
   // into a pane (the actual incident vector), not just send-keys. [\s\S] (not
   // [^\n]) so an intra-segment newline cannot split the match.
-  /\btmux\b[\s\S]*\b(send-keys|paste-buffer|run-shell|set-buffer)\b/i,
+  [/\btmux\b/gi, /\b(send-keys|paste-buffer|run-shell|set-buffer)\b/gi],
   // self-backgrounding that relaunches claude (nohup/setsid/disown + claude)
-  /\b(nohup|setsid|disown)\b[\s\S]*\bclaude\b/i,
+  [/\b(nohup|setsid|disown)\b/gi, /\bclaude\b/gi],
   // the loop slash-skill driven from a shell. `/loop` must be in SLASH-COMMAND
   // position -- a standalone token (segment-start / whitespace / quote before it,
   // whitespace / quote / end after it) -- never a PATH segment. The old
@@ -64,8 +65,24 @@ const SELF_PACE_BASH_PATTERNS = [
   // a PATH collided with a call pattern; the fix is to match the invocation SHAPE.
   // Every real form stays denied: `claude /loop 5m`, `claude -p "/loop x"`,
   // `claude '/loop'`, bare `claude /loop`.
-  /\bclaude\b[\s\S]*(?:^|[\s'"])\/loop(?=[\s'"]|$)/i,
+  [/\bclaude\b/gi, /(?:^|[\s'"])\/loop(?=[\s'"]|$)/gi],
 ]
+// Does the segment have one of these shapes? B is looked for after the FIRST A only:
+// any later A has less text after it, so the answer is the one A[\s\S]*B gives. As
+// that regex, every A was tried against the whole rest of the segment, and a run of
+// A without B was quadratic (ffc45c28, measured on develop 6158290b: 30000 `claude`
+// 3.5 s, 30000 `tmux` or `nohup` 1.8 s; the hook fails open after 10 s). B keeps its
+// `^` meaning the segment's start, which it never is after an A, as before.
+export function selfPaceShape(seg) {
+  const s = String(seg ?? '')
+  return SELF_PACE_BASH_PATTERNS.some(([a, b]) => {
+    a.lastIndex = 0
+    const m = a.exec(s)
+    if (!m) return false
+    b.lastIndex = m.index + m[0].length
+    return b.test(s)
+  })
+}
 
 // OS-level schedulers + delayed exec (cron / launchd / systemd / at / batch): the
 // shell route to the same self-pace the CronCreate tool-deny blocks at the runtime
@@ -1331,7 +1348,7 @@ export function gateDecision(toolName, toolInput, depth = 0) {
       // what catches a real `subprocess.run(['tmux','send-keys',...])` inside a
       // heredoc body (measured 2026-08-05). Quote-aware segments here would have
       // dropped the detection of this gate's own founding incident vector.
-      if (SELF_PACE_BASH_PATTERNS.some((re) => re.test(normalizeShellEvasion(seg)))) return { deny: true }
+      if (selfPaceShape(normalizeShellEvasion(seg))) return { deny: true }
       // self-schedule store: block WRITE only (a read/grep is legit diagnostics)
       if (SCHEDULE_STORE_RX.test(seg) && WRITE_INTENT_RX.test(seg)) return { deny: true }
       // dashboard schedule API: block WRITE methods only (GET list/pending is legit)
