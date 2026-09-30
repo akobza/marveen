@@ -106,25 +106,39 @@ function acceptsGzip(req: http.IncomingMessage): boolean {
  * exceeds GZIP_MIN_BYTES. Meant for the handful of heavy list endpoints
  * (kanban, messages, memories, ...) that dominate bandwidth on slow links;
  * json() itself is untouched because it has hundreds of call sites.
+ *
+ * c4e47223: the length is sent up front (Content-Length, the gzipped length on
+ * the gzip branch). The body is always built in full before the head goes out,
+ * so the length is known, and a reader can tell a body cut by a dashboard stop
+ * from a whole one by the length it was promised (curl: "transfer closed with N
+ * bytes remaining", exit 18) instead of by guessing from the JSON. Without it the
+ * response went out chunked, which also ends in exit 18 on a cut but promises no
+ * size. `extraHeaders` carries per-endpoint facts such as a list's X-Total-Count;
+ * it cannot override the framing.
  */
 export function jsonMaybeGzip(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   data: unknown,
   status = 200,
+  extraHeaders: Record<string, string> = {},
 ): void {
   const body = Buffer.from(JSON.stringify(data))
   const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'private, no-store',
     Vary: 'Accept-Encoding',
+    ...extraHeaders,
   }
   if (body.length > GZIP_MIN_BYTES && acceptsGzip(req)) {
+    const gz = gzipSync(body)
     headers['Content-Encoding'] = 'gzip'
+    headers['Content-Length'] = String(gz.length)
     res.writeHead(status, headers)
-    res.end(gzipSync(body))
+    res.end(gz)
     return
   }
+  headers['Content-Length'] = String(body.length)
   res.writeHead(status, headers)
   res.end(body)
 }
