@@ -165,6 +165,11 @@ const SHELL_KEYWORDS = String.raw`(?:(?:${[...KEYWORD_WORDS].map((w) => (w === '
 // %M"`), and there the bare reading keeps the command word after it. A wrapper is known
 // by its last path component, and `--` ends its options: both are new for all but time
 // (`/usr/bin/env crontab -r` and `nice -- crontab -r` passed).
+// sf-heavy (fejlesztes-vezeto 54258) runs its command in the memory guard's scope:
+// `sf-heavy [--no-wait] [--label NAME] [--] <command>`, the first word that is not one of
+// its options being the command (its own option loop, scripts/infra-ops/sf-heavy). Before,
+// `sf-heavy -- crontab -r` passed: the gate saw sf-heavy as the command. sf-heavy-ctl is no
+// wrapper: its arguments are a drain reason written to a file, a wait limit and --dry.
 const WRAPPERS = new Map(Object.entries({
   sudo: { valued: 'ugpcdrth', long: ['user', 'group', 'prompt', 'close-from', 'chdir', 'role', 'type', 'other-user', 'command-timeout', 'host'], bare: /^(?:-[a-z]+|--[\w-]+)$/i },
   timeout: { valued: 'sk', long: ['signal', 'kill-after'], bare: /^(?:-[a-z]+|--[\w-]+)$/i, needs: true },
@@ -181,9 +186,11 @@ const WRAPPERS = new Map(Object.entries({
   xargs: { valued: 'idelnpsa', bare: /^(?:-[a-z0]+|--[\w-]+(?:=\S+)?)$/i },
   time: { valued: 'of', long: ['output', 'format'], bare: /^(?:-[a-z]+|--[\w-]+)$/i },
   builtin: {},
+  'sf-heavy': { long: ['label'], bare: /^(?:--no-wait|--label=\S+)$/i },
 }))
 const WRAPPER_SPECS = [...WRAPPERS.values()]
 const WRAPPER_INDEX = new Map([...WRAPPERS.keys()].map((name, i) => [name, i]))
+const WRAPPER_NAME_MAX = Math.max(...[...WRAPPERS.keys()].map((name) => name.length))
 
 // --- where a command word starts: read by a loop -----------------------------------
 //
@@ -312,7 +319,7 @@ function forEachCommandPosition(s, allStarts, onCommand) {
       }
       ASSIGNMENT_START_RX.lastIndex = p
       if (ASSIGNMENT_START_RX.test(s)) push(nx, 0, cut)
-      if (e - k <= 7) {
+      if (e - k <= WRAPPER_NAME_MAX) {
         const wi = WRAPPER_INDEX.get(s.slice(k, e).toLowerCase())
         if (wi !== undefined) push(nx, 1 + 2 * wi, cut)
       }

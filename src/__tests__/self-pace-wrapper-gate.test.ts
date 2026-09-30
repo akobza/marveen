@@ -155,3 +155,26 @@ describe('ffc45c28: what stays allowed', () => {
     expect(bash(`cat > /tmp/msg.txt <<${Q}EOF${Q}${NL}sudo -n crontab -r${NL}timeout 60 crontab -r${NL}EOF`)).toBe(false)
   })
 })
+
+describe('ffc45c28 (5): sf-heavy runs its command, so the gate reads through it (fejlesztes-vezeto 54258)', () => {
+  // scripts/infra-ops/sf-heavy [--no-wait] [--label NAME] [--] <command>: the first word that is not one of its
+  // options is the command. Before, the gate saw sf-heavy as the command and `sf-heavy -- crontab -r` passed.
+  it('a scheduler, a timer, a pane injection or a shell script behind it is denied', () => {
+    expect(bash('sf-heavy -- crontab -r')).toBe(true)
+    expect(bash('sf-heavy -- systemd-run --user --on-active=60 /bin/true')).toBe(true)
+    expect(bash('sf-heavy crontab -r')).toBe(true)
+    expect(bash('sf-heavy --no-wait --label=demo crontab -r')).toBe(true)
+    expect(bash('sf-heavy --label demo -- at now')).toBe(true)
+    expect(bash('/opt/infra-ops/sf-heavy -- crontab -r')).toBe(true)
+    expect(bash('sf-heavy -- systemctl --user enable --now demo-guard.timer')).toBe(true)
+    expect(bash(`sf-heavy -- bash -c ${Q}crontab -r${Q}`)).toBe(true)
+    expect(bash(`sf-heavy -- bash <<${Q}EOF${Q}${NL}tmux send-keys -t demo go Enter${NL}EOF`)).toBe(true)
+  })
+  it('CONTROLS: a compile through it, a read of one own schedule, and sf-heavy-ctl, which runs no command', () => {
+    expect(bash('sf-heavy -- npm test')).toBe(false)
+    expect(bash('sf-heavy --label tsc -- npx tsc --noEmit')).toBe(false)
+    expect(bash('sf-heavy -- crontab -l')).toBe(false)
+    expect(bash('sf-heavy-ctl drain crontab -r')).toBe(false)
+    expect(bash('sf-heavy-ctl status')).toBe(false)
+  })
+})
