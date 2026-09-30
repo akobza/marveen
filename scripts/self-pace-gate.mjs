@@ -121,7 +121,20 @@ const LAUNCHCTL_SUBCOMMAND = String.raw`(?=\s*$|\s+-|\s+[a-z][a-z-]*(?:\s|$))`
 // -r; }` and `! crontab -r` all passed, while the timer check below (cc8e80d7)
 // already had one: the measured `for f in x.service x.timer; do cp ... "$U/$f";
 // done` puts `do cp` at the start.
-const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*`
+// `coproc` runs its command like a keyword does (fejlesztes-vezeto 53740, teszter 38794:
+// `coproc crontab -r` passed); with a NAME only in front of a compound command.
+const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{|coproc(?:\s+[A-Za-z_]\w*(?=\s*\{))?)\s+)*`
+// ...and at the head of a case arm (the same decision: `case x in *) crontab -r;; esac`
+// passed). splitSegments cuts at `;`, `|` and a newline, so an arm's pattern stands at
+// the start of its segment (`*) crontab -r`, or `b) ...` after `a|b)`), or after
+// `case <word> in` for the first arm. The word is optional: the masked view blanks a
+// quoted one (`case "$x" in`). Only at the start of a segment: in `$(date) at now` the
+// `date)` follows a `(`, and there it is an argument, not an arm. No `\s*` before the
+// pattern unless a `(` opens it: the masked view turns a heredoc body into one long run
+// of spaces, and two adjacent `\s*` over it backtrack quadratically (measured on the
+// corpus: 290 ms on a 23 KB command, against 8 ms before).
+const CASE_ARM = String.raw`(?:case\s+(?:\S+\s+)?in\s+)?(?:\(\s*)?[^()\s;&|]+\s*\)\s*`
+const SEG_START = String.raw`(^(?:${CASE_ARM})?|${SCHED_BOUNDARY}\s*)`
 // ...and after `sudo` WITH options or `timeout <duration>`, which SCHED_PREFIX does
 // not read (it takes a bare `sudo` only). Measured 2026-09-30 (ffc45c28): `sudo -n
 // crontab -r`, `sudo -u root crontab -r` and `timeout 60 crontab -r` passed, on
@@ -144,12 +157,12 @@ const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s
 // the bare branch keeps the command word after it.
 const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|env(?:\s+(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-[A-Za-z]*|--[\w-]+|[A-Za-z_]\w*=\S*))*|nice(?:\s+(?:-n\s*\S+|--adjustment(?:=|\s+)\S+|-\d+))*|nohup|command(?:\s+-p)+|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)(?:=|\s+)\S+))*|setsid(?:\s+(?:-[A-Za-z]+|--[\w-]+))*|flock(?:\s+(?:-[wEe]\s*\S+|--(?:timeout|conflict-exit-code)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|doas(?:\s+(?:-u\s*\S+|-[A-Za-z]+))*|runuser(?:\s+(?:-u\s*\S+|--user(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*(?:\s+--)?|xargs(?:\s+(?:-[IdEeLnPsa]\s*\S+|--[\w-]+(?:=\S+)?|-[A-Za-z0]+))*|(?:\S*/)?time(?:\s+(?:-[of]\s*\S+|--(?:output|format)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*)\s+)*`
 const SCHEDULER_RX = new RegExp(
-  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
+  String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
   'i',
 )
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
-const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+const SCHEDULER_READ_RX = new RegExp(String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
 
 // --- a command handed to a shell as text ------------------------------------------
 //
@@ -161,7 +174,7 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_
 // masking keeps the length, so the quoted argument is then taken from the same place
 // in the command itself and judged as a command of its own (gateDecision, depth <= 3).
 const SHELL_C_RX = new RegExp(
-  String.raw`(?:^|${SCHED_BOUNDARY}|\n)\s*${SHELL_KEYWORDS}${WRAPPER_PREFIX}(?:\S*/)?(?:bash|sh|dash|zsh|ksh|su|runuser|flock)\b[^;&|\n'"]*?\s-[A-Za-z]*c(?=\s)`,
+  String.raw`(?:^|${SCHED_BOUNDARY}|\n)\s*(?:${CASE_ARM})?${SHELL_KEYWORDS}${WRAPPER_PREFIX}(?:\S*/)?(?:bash|sh|dash|zsh|ksh|su|runuser|flock)\b[^;&|\n'"]*?\s-[A-Za-z]*c(?=\s)`,
   'g',
 )
 export function shellCScripts(command) {
@@ -301,7 +314,7 @@ const SYSTEMCTL_VALUE_OPTS = new Set([
 // The command word of a segment, as for SCHEDULER_RX: after a shell keyword
 // (SHELL_KEYWORDS) and a wrapper (WRAPPER_PREFIX), both defined above.
 const TIMER_CMD_RX = new RegExp(
-  String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
+  String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
   'gi',
 )
 

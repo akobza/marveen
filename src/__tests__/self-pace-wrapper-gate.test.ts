@@ -103,6 +103,41 @@ describe('ffc45c28 (3): GNU time and the time keyword, by path and with options 
   })
 })
 
+describe('ffc45c28 (4): a case arm and coproc (fejlesztes-vezeto 53740, teszter 38794)', () => {
+  const SCHED = ['crontab -r', 'at now < x', 'systemd-run --user --on-active=60 true', 'systemctl --user enable --now x.timer']
+  it('the measured forms: a scheduler at the head of a case arm, or after coproc', () => {
+    for (const s of SCHED) {
+      expect(bash(`case x in *) ${s};; esac`), s).toBe(true)
+      expect(bash(`coproc ${s}`), s).toBe(true)
+    }
+  })
+  it('other arms: a quoted word, several patterns, a later arm, a parenthesised pattern, lines, a wrapper, a script', () => {
+    expect(bash('case "$x" in *) crontab -r;; esac')).toBe(true)
+    expect(bash('case "$x" in a|b) crontab -r;; esac')).toBe(true)
+    expect(bash('case $1 in start) echo go;; *) crontab -r;; esac')).toBe(true)
+    expect(bash('case x in (*) crontab -r;; esac')).toBe(true)
+    expect(bash(`case x in${NL}  *)${NL}    crontab -r${NL}    ;;${NL}esac`)).toBe(true)
+    expect(bash('case x in *) sudo -n crontab -r;; esac')).toBe(true)
+    expect(bash(`case x in *) bash -c ${Q}crontab -r${Q};; esac`)).toBe(true)
+    expect(bash('coproc demo { crontab -r; }')).toBe(true)
+  })
+  it('what stays allowed: a read or an ordinary command in an arm, coproc of an ordinary command, prose, an argument after a substitution', () => {
+    expect(bash('case x in *) crontab -l;; esac')).toBe(false)
+    expect(bash('case x in start) echo ok;; *) ls;; esac')).toBe(false)
+    expect(bash('coproc cat')).toBe(false)
+    expect(bash('echo "case x in *) crontab -r;; esac"')).toBe(false)
+    expect(bash('echo $(date) at now')).toBe(false)
+  })
+  it('a long heredoc body does not slow the arm reading down (the hook has 10 s, and a timed-out hook lets the call through)', () => {
+    // measured 2026-09-30: a first version of the arm pattern backtracked quadratically over the blanked body,
+    // 5812 ms on this 104 KB command against 15 ms now
+    const cmd = `cat > /tmp/demo.txt <<${Q}EOF${Q}${NL}${('a'.repeat(79) + NL).repeat(1300)}EOF${NL}crontab -r`
+    const t0 = performance.now()
+    expect(bash(cmd)).toBe(true)
+    expect(performance.now() - t0).toBeLessThan(1000)
+  })
+})
+
 describe('ffc45c28: what stays allowed', () => {
   it('a read behind the wrapper, as without it', () => {
     expect(bash('sudo -n crontab -l')).toBe(false)
