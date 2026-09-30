@@ -15,7 +15,8 @@
 //     Claude scheduled_tasks.json directly, tmux send-keys into a session,
 //     POSTing a new schedule to the dashboard, or an OS scheduler (crontab / at /
 //     launchctl / systemd-run, and a systemd timer armed with systemctl or
-//     written into a unit directory).
+//     written into a unit directory). One exact systemd-run form, the memory
+//     guard's foreground scope, is allowed: see SF_HEAVY_SCOPE_RX.
 //
 // Why a hook and not only a permissions deny-list: permissive profiles launch
 // with --dangerously-skip-permissions. A whole-tool-name deny DOES survive that
@@ -120,6 +121,32 @@ const SCHEDULER_RX = new RegExp(
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
 const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+
+// --- the one systemd-run form this gate allows ----------------------------------
+//
+// Card 90a2257b (074645b4, ügyvezető 52651 K2). The memory guard on the fleet host
+// runs every heavy compile (tsc, next build) through scripts/infra-ops/sf-heavy,
+// which starts it in a FOREGROUND transient scope with a memory cap:
+//   systemd-run --user --scope --quiet --collect --slice=sf-heavy.slice
+//     --unit=sf-heavy-<label> -p MemoryMax=<size> -- <command>
+// A scope runs its command now and ends with it: no timer, no --on-*, no service
+// that outlives the call, so it schedules nothing. The operator accepted exactly
+// this form and asked for a documented exception here instead of a blind spot.
+// So this ONE form -- these options in this order, unquoted, at a command
+// position, nothing (no sudo, env, path) in front of the binary -- is transparent
+// to the gate: the prefix is replaced by a command separator, and the command
+// after `--` is judged as if it were run directly, so a scheduler, a timer or a
+// pane injection behind the prefix is still denied. Every other systemd-run (an
+// --on-* or timer option, no --scope, another slice or unit name, another
+// property, another order) is not this form and stays denied by SCHEDULER_RX.
+// The label charset is the one sf-heavy writes (tr -c 'A-Za-z0-9_.-' '-').
+const SF_HEAVY_SCOPE_RX = new RegExp(
+  String.raw`(^|[;&|(\`\n])([ \t]*)systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--(?=[ \t]+[^\s;&|)\`])`,
+  'g',
+)
+export function unwrapSfHeavyScope(command) {
+  return String(command ?? '').replace(SF_HEAVY_SCOPE_RX, (_, boundary, ws) => `${boundary}${ws};`)
+}
 
 // --- systemd timers -----------------------------------------------------------
 //
@@ -784,7 +811,13 @@ export function gateDecision(toolName, toolInput) {
     // it), so the URL/method args still match but the body text never does. A
     // separator OUTSIDE the payload still splits, so `curl -d '' x ; crontab -r`
     // is still caught.
-    const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(String(toolInput?.command ?? '')))))
+    // The one allowed systemd-run form (SF_HEAVY_SCOPE_RX) is unwrapped FIRST, so
+    // every check below judges the command it runs. First, because the heredoc
+    // stripper decides by the command that owns a heredoc whether its body runs:
+    // behind the prefix that owner is the command the scope runs, and in
+    // `systemd-run <the form> bash <<'EOF'` the body goes to bash. Unwrapped after
+    // it, the owner would read as systemd-run and the body would be blanked.
+    const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(unwrapSfHeavyScope(String(toolInput?.command ?? ''))))))
     // Per-segment so an unrelated token elsewhere in a compound command cannot
     // turn a legit read (store inspection, schedule-API GET) into a false deny.
     const naiveSegs = splitSegments(safeCommand)
