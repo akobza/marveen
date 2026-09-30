@@ -832,7 +832,8 @@ export function gateDecision(toolName, toolInput) {
     // behind the prefix that owner is the command the scope runs, and in
     // `systemd-run <the form> bash <<'EOF'` the body goes to bash. Unwrapped after
     // it, the owner would read as systemd-run and the body would be blanked.
-    const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(unwrapSfHeavyScope(String(toolInput?.command ?? ''))))))
+    const unwrapped = unwrapSfHeavyScope(String(toolInput?.command ?? ''))
+    const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(unwrapped))))
     // Per-segment so an unrelated token elsewhere in a compound command cannot
     // turn a legit read (store inspection, schedule-API GET) into a false deny.
     const naiveSegs = splitSegments(safeCommand)
@@ -861,8 +862,13 @@ export function gateDecision(toolName, toolInput) {
       // scheduler binaries: deny the exec/submit forms, allow pure read-listing
       if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) return { deny: true }
     }
-    // a systemd timer, armed with systemctl or written into a unit directory
-    if (armsSystemdTimer(safeCommand, naiveSegs)) return { deny: true }
+    // a systemd timer, armed with systemctl or written into a unit directory. The
+    // timer check masks the heredoc bodies itself, and reads one only where the
+    // command runs the file the body was written to (an installer written and run
+    // in one command), so it gets the command before stripHeredocBodies: a body
+    // that stripper blanks is exactly the one the installer rule has to read.
+    const timerCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(unwrapped)))
+    if (armsSystemdTimer(timerCommand, splitSegments(timerCommand))) return { deny: true }
   }
   return { deny: false }
 }

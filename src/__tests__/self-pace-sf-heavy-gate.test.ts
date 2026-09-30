@@ -113,9 +113,24 @@ describe('90a2257b: the command behind the tail is judged as if run directly', (
       'crontab -r', 'crontab -l', 'at now < x', 'atq', 'systemd-run --user --on-active=60 true',
       'systemctl --user enable --now x.timer', 'systemctl --user status x.timer', 'npx tsc --noEmit',
       `tmux send-keys -t demo ${Q}go${Q} Enter`, 'npm run build && crontab -r', 'echo ok',
+      `bash <<${Q}EOF${Q}${NL}tmux send-keys -t demo ${Q}go${Q} Enter${NL}EOF`,
+      `cat > i.sh <<${Q}EOF${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}EOF${NL}bash i.sh`,
     ]) {
       expect(bash(`${P} ${T} ${inner}`), inner).toBe(bash(inner))
     }
+  })
+})
+
+describe('90a2257b on develop 3f336c2c: a heredoc behind the tail is read as the command runs it', () => {
+  // develop blanks a heredoc body unless the command owning the redirect runs it; the
+  // owner behind the form is the command the scope runs, not systemd-run
+  it('a heredoc fed to a shell, and an installer written and run in the same command', () => {
+    expect(bash(`${P} ${T} bash <<${Q}EOF${Q}${NL}tmux send-keys -t demo ${Q}go${Q} Enter${NL}EOF`)).toBe(true)
+    expect(bash(`${P} ${T} cat > i.sh <<${Q}EOF${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}EOF${NL}bash i.sh`)).toBe(true)
+  })
+  it('CONTROLS: the same bodies written to a file and not run are data', () => {
+    expect(bash(`${P} ${T} cat > n.txt <<${Q}EOF${Q}${NL}tmux send-keys -t demo ${Q}go${Q} Enter${NL}EOF`)).toBe(false)
+    expect(bash(`${P} ${T} cat > i.sh <<${Q}EOF${Q}${NL}systemctl --user enable --now demo-guard.timer${NL}EOF`)).toBe(false)
   })
 })
 
