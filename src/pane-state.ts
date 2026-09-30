@@ -89,8 +89,13 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // rest of the line: the counters (comma-separated) directly after the mode
 // segment, then the end of the line. A quote of it inside prose is followed
 // by a closing quote or more words on the same line, so it still does not
-// match; a frame cut mid-word (`· 1 sh`) does not either.
-const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents)| · \d+ (?:shells?|monitors?)(?:, \d+ (?:shells?|monitors?))*[ \t]*(?=\r?\n|$))|\? for shortcuts/
+// match; a frame cut mid-word (`· 1 sh`) does not either. The bare form also
+// has to START its line the way the live footer does: exactly two spaces, the
+// mode glyph(s), one space, the mode. A raw copy of the footer in tool output
+// is indented (`  ⎿  ` on its first line, five spaces after), so it cannot
+// pass for the live footer; without this rule a dialog, a menu or a parked
+// input under such a line read idle (the tester, card a58a8ede).
+const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))|(?:^|\n) {2}[^\w\s]+ (?:[A-Za-z][\w-]* ){1,3}on · \d+ (?:shells?|monitors?)(?:, \d+ (?:shells?|monitors?))*[ \t]*(?=\r?\n|$)|\? for shortcuts/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.

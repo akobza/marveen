@@ -569,6 +569,15 @@ describe('detectPaneState', () => {
     }
   })
 
+  // The tester (card a58a8ede): a RAW bare footer line in the visible pane -- the output of
+  // `tmux capture-pane ... | tail -1` in a Bash tool result -- must not be taken for the footer.
+  it('keeps a parked input typing under a raw bare footer line in tool output', () => {
+    const raw = ['● Bash(tmux capture-pane -p -t x | awk NF | tail -1)', '  ⎿  ' + BARE_ONE_SHELL_FOOTER.trim(), ''].join('\n')
+    const typing = ['', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP, BARE_ONE_SHELL_FOOTER].join('\n')
+    expect(detectPaneState(raw + '\n' + typing)).toBe('typing')
+    expect(isReadyForPrompt(raw + '\n' + typing)).toBe(false)
+  })
+
   it('detects busy when "esc to interrupt" footer marker is present', () => {
     expect(detectPaneState(BUSY_FULL_FOOTER)).toBe('busy')
   })
@@ -2030,6 +2039,17 @@ describe('detectsPermissionDialog', () => {
   it('is false for an empty pane', () => {
     expect(detectsPermissionDialog('')).toBe(false)
     expect(detectsPermissionDialog('   \n  ')).toBe(false)
+  })
+
+  // The tester (card a58a8ede): a RAW bare footer line in tool output (its first line under
+  // the result glyph, the next one indented five spaces) must not hide a dialog or a menu.
+  it('still sees the dialog and the menu under a raw bare footer line in tool output', () => {
+    const raw = ['● Bash(tmux capture-pane -p -t x | awk NF | tail -1)', '  ⎿  ' + BARE_ONE_SHELL_FOOTER.trim(), '     ' + BARE_SHELL_AND_MONITOR_FOOTER.trim(), ''].join('\n')
+    for (const dialog of [PERMISSION_DIALOG, BASH_PERMISSION_DIALOG]) {
+      expect(detectsPermissionDialog(raw + '\n' + dialog)).toBe(true)
+      expect(detectPaneState(raw + '\n' + dialog)).toBe('unknown')
+    }
+    expect(detectsBlockingMenu(raw + '\n' + GENUINE_MENU)).toBe(true)
   })
 })
 
