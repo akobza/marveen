@@ -283,6 +283,20 @@ const IDLE_BACKGROUND_ONE_SHELL_HIDDEN = [
   '  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage',
 ].join('\n')
 
+// Claude Code 2.1.283+ (card a58a8ede): the footer of a session with background
+// work ends with the counters alone -- no ctrl+t, `↓ to manage` or `← for agents`
+// after them. Both lines below were captured live from fleet panes
+// (`tmux capture-pane -p`) on 2026-09-30 and are kept byte for byte. The 2- and
+// 3-shell forms (measured on 2026-09-26) differ only in the count and the plural,
+// so they are derived from the captured line instead of retyped.
+const BARE_ONE_SHELL_FOOTER = '  ⏵⏵ bypass permissions on · 1 shell'
+const BARE_SHELL_AND_MONITOR_FOOTER = '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor'
+const IDLE_BARE_ONE_SHELL = modeFooter(BARE_ONE_SHELL_FOOTER)
+const IDLE_BARE_TWO_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '2 shells'))
+const IDLE_BARE_THREE_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '3 shells'))
+const IDLE_BARE_SHELL_AND_MONITOR = modeFooter(BARE_SHELL_AND_MONITOR_FOOTER)
+const IDLE_BARE_MONITORS = modeFooter(BARE_SHELL_AND_MONITOR_FOOTER.replace('1 shell, 1 monitor', '2 monitors'))
+
 // Wedged thinking-block API error. An assistant turn ended with the
 // 400 about thinking blocks that "cannot be modified"; the pane shows
 // the tool-output chrome (`⎿  API Error: ...`), a past-tense thinking
@@ -497,7 +511,7 @@ describe('detectPaneState', () => {
     expect(detectPaneState(IDLE_BACKGROUND_ONE_SHELL_HIDDEN)).toBe('idle')
   })
 
-  it('does NOT classify a truncated "· N shell" prefix as idle', () => {
+  it('does NOT classify a footer cut mid-word ("· 1 sh") as idle', () => {
     // Defense in depth: the shells-variant requires either the
     // "· N shells · ctrl+t" marker or the "· N shells · ↓ to manage"
     // marker, not just the bare "· N shell(s)" prefix. Two reasons we
@@ -513,14 +527,46 @@ describe('detectPaneState', () => {
     // The fixture is deliberately minimal: no other idle markers
     // (no "(shift+tab to cycle)", no "? for shortcuts") so the
     // assertion isolates the truncated-shells path specifically.
+    // Since Claude Code 2.1.283 the bare "· 1 shell" footer this test
+    // used to reject IS the complete live footer (card a58a8ede, the
+    // bare counter tests below), so the truncation is now cut mid-word;
+    // reason 2 (a quote in scrollback) is covered by the end-of-line tests.
     const truncated = [
       '',
       SEP,
       '❯ ',
       SEP,
-      '  ⏵⏵ bypass permissions on · 1 shell',
+      '  ⏵⏵ bypass permissions on · 1 sh',
     ].join('\n')
     expect(detectPaneState(truncated)).toBe('unknown')
+  })
+
+  // Claude Code 2.1.283+ (card a58a8ede): the bare counter tail is the whole
+  // footer of a session with background work. Before, every such pane read
+  // 'unknown', and the router did not deliver to it.
+  it.each([
+    ['· 1 shell (captured live)', IDLE_BARE_ONE_SHELL],
+    ['· 2 shells', IDLE_BARE_TWO_SHELLS],
+    ['· 3 shells', IDLE_BARE_THREE_SHELLS],
+    ['· 1 shell, 1 monitor (captured live)', IDLE_BARE_SHELL_AND_MONITOR],
+    ['· 2 monitors', IDLE_BARE_MONITORS],
+  ])('detects idle on the bare counter footer %s', (_label, pane) => {
+    expect(detectPaneState(pane)).toBe('idle')
+    expect(isReadyForPrompt(pane)).toBe(true)
+  })
+
+  it('reads the bare counter tail as idle only when it ends the line right after the mode', () => {
+    // A quote of the new footer inside prose: a closing quote and more words follow it.
+    const quotedProse = ['', SEP, '❯ ', SEP, '  Egy ügynök lábléce "' + BARE_ONE_SHELL_FOOTER.trim() + '" volt, a router nem kézbesített.'].join('\n')
+    // More text after the counters on the same line.
+    const trailingText = modeFooter(BARE_ONE_SHELL_FOOTER + ' running')
+    // The counter is not directly after the mode segment.
+    const notAfterMode = modeFooter('  ⏵⏵ bypass permissions on · tasks · 1 shell')
+    // Counters with no mode segment at all.
+    const noMode = modeFooter('  · 3 shells')
+    for (const pane of [quotedProse, trailingText, notAfterMode, noMode]) {
+      expect(detectPaneState(pane)).toBe('unknown')
+    }
   })
 
   it('detects busy when "esc to interrupt" footer marker is present', () => {

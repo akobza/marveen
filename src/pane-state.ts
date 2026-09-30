@@ -42,7 +42,8 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // "· ↓ to manage" tail after the shell count, rather than just the
 // bare "· N shell(s)" prefix. Two reasons:
 //   (a) one of these tails is always what Claude Code actually renders,
-//       so insisting on either rejects malformed or mid-render frames;
+//       so insisting on either rejects malformed or mid-render frames
+//       (true until Claude Code 2.1.283, see THE BARE COUNTER TAIL below);
 //   (b) it disambiguates the footer from scrollback content that
 //       happens to contain "bypass permissions on · 1 shell" verbatim
 //       (an echoed log line, a quoted message, etc.) which would
@@ -75,7 +76,21 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // scrollback still will not match; it needs the shift+tab hint or a `·`
 // separated idle action, which is UI chrome that prose does not carry.
 // `← for agents` is the FleetView tail on current builds; older tails kept.
-const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))|\? for shortcuts/
+//
+// THE BARE COUNTER TAIL (Claude Code 2.1.283+, card a58a8ede). Since the
+// 2026-09-26 update a session with background work ends the footer with the
+// counters alone: `⏵⏵ bypass permissions on · 1 shell` (`· 3 shells` with
+// three), and with a monitor running `⏵⏵ bypass permissions on · 1 shell,
+// 1 monitor` (both lines captured live from fleet panes on 2026-09-30) --
+// no ctrl+t, `↓ to manage` or `← for
+// agents` after them. The tail requirement above rejected every such pane:
+// the router read it 'unknown' and did not deliver, and the session-stuck
+// guard alerted 'not-ready'. The bare form is accepted only as the WHOLE
+// rest of the line: the counters (comma-separated) directly after the mode
+// segment, then the end of the line. A quote of it inside prose is followed
+// by a closing quote or more words on the same line, so it still does not
+// match; a frame cut mid-word (`· 1 sh`) does not either.
+const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents)| · \d+ (?:shells?|monitors?)(?:, \d+ (?:shells?|monitors?))*[ \t]*(?=\r?\n|$))|\? for shortcuts/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
