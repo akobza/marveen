@@ -5,8 +5,8 @@ import { gateDecision } from '../../scripts/self-pace-gate.mjs'
 // ffc45c28 (fejlesztes-vezeto 53354): the scheduler check did not read `sudo` with options or
 // `timeout <duration>` in front of the command word. Measured 2026-09-30 on develop and on the
 // branch base: `sudo -n crontab -r`, `sudo -u root crontab -r` and `timeout 60 crontab -r`
-// passed, while `sudo crontab -r` was denied. SCHEDULER_RX and its read exemption now take the
-// WRAPPER_PREFIX the timer check already had. Unit names and paths are made up.
+// passed, while `sudo crontab -r` was denied. The scheduler check and its read exemption now read
+// the wrappers the timer check already read. Unit names and paths are made up.
 const bash = (command: string): boolean => gateDecision('Bash', { command }).deny
 const NL = '\n'
 const Q = String.fromCharCode(39)

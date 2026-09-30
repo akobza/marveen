@@ -5,8 +5,8 @@ import { gateDecision } from '../../scripts/self-pace-gate.mjs'
 // 90a2257b, second part (fejlesztes-vezeto 53192): the scheduler check did not read a
 // command after a shell keyword. Measured 2026-09-30 on the branch base (a19fe570) and
 // on develop: all seven forms of the first test passed, the bare `crontab -r` was
-// denied. SCHEDULER_RX and its read exemption now take the SHELL_KEYWORDS prefix the
-// timer check already had. Unit names and paths are made up.
+// denied. The scheduler check and its read exemption now read the shell keywords the
+// timer check already read. Unit names and paths are made up.
 const bash = (command: string): boolean => gateDecision('Bash', { command }).deny
 const NL = '\n'
 const Q = String.fromCharCode(39)
@@ -31,7 +31,7 @@ describe('90a2257b (2): a scheduler after a shell keyword is denied', () => {
     expect(bash('while true; do if true; then crontab -r; fi; done')).toBe(true)
     expect(bash('if true; then launchctl load demo.plist; fi')).toBe(true)
   })
-  it('a keyword in front of the wrappers SCHEDULER_RX already reads (sudo, a path, VAR=val)', () => {
+  it('a keyword in front of the wrappers the scheduler check already reads (sudo, a path, VAR=val)', () => {
     expect(bash('if true; then sudo crontab -r; fi')).toBe(true)
     expect(bash('for i in 1; do /usr/bin/crontab -r; done')).toBe(true)
     expect(bash('if true; then EDITOR=true crontab -e; fi')).toBe(true)

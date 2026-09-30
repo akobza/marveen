@@ -69,18 +69,14 @@ const SELF_PACE_BASH_PATTERNS = [
 
 // OS-level schedulers + delayed exec (cron / launchd / systemd / at / batch): the
 // shell route to the same self-pace the CronCreate tool-deny blocks at the runtime
-// layer. Anchored to command position (segment start), but a leading wrapper is
-// allowed before the binary -- sudo/env/command/nice, a VAR=val environment, and
-// an absolute/relative path -- so `sudo crontab -r`, `/usr/bin/at now`,
-// `PATH=/bin crontab -` are all caught. Trailing \b(?!-) so it never fires on
-// "netstat" / "crontab-helper.sh"; (?!\s*=) so a bare NAME=value assignment
-// (`at=$(...)`) is not mistaken for the `at` binary.
-const SCHED_PREFIX = String.raw`(?:(?:[A-Za-z_]\w*=\S*|sudo|env|command|exec|nice|builtin|time)\s+)*(?:\S*/)?`
-// The command-boundary anchor includes `(` so a $(...) command substitution
-// (`X=$(crontab -)`) is caught, AND a backtick so a legacy `...` substitution
-// (`X=`crontab -r``) is caught too -- both run the enclosed command in a shell
-// context, so a scheduler binary immediately inside either is a real self-pace.
-const SCHED_BOUNDARY = '[;&|(`]'
+// layer. Read where a command word starts (forEachCommandPosition below): at the
+// start of a segment and inside a $(...) or backtick substitution, behind shell
+// keywords, VAR=val assignments and wrappers (sudo, env, command, nice, time, ...),
+// and with a path (`/usr/bin/at now`), so `sudo crontab -r`, `/usr/bin/at now`,
+// `PATH=/bin crontab -` and `X=$(crontab -)` are all caught. Trailing \b(?!-) so it
+// never fires on "netstat" / "crontab-helper.sh"; (?!\s*=) so a bare NAME=value
+// assignment (`at=$(...)`) is not mistaken for the `at` binary.
+//
 // `at` and `batch` are also ordinary English words, and splitSegments splits on
 // NEWLINES -- so a PROSE line inside a multi-line commit body ("at least 80% of
 // entries", "batch size is 50") lands at a segment start and looked exactly like
@@ -114,55 +110,277 @@ const AT_INVOCATION = String.raw`(?=\s*$|\s+-|\s*<|\s+(?:now|noon|midnight|teati
 // prose. End-of-segment and a flag stay DENIED -- a bare `launchctl` is
 // interactive, still a real vector.
 const LAUNCHCTL_SUBCOMMAND = String.raw`(?=\s*$|\s+-|\s+[a-z][a-z-]*(?:\s|$))`
-// The command word of a segment, and also after a shell keyword that starts a
-// command inside a loop, a condition or a group. Measured 2026-09-30 (90a2257b):
-// SCHEDULER_RX had no keyword branch, so `if true; then crontab -r; fi`,
-// `for i in 1; do crontab -r; done`, `while false; do at now; done`, `{ crontab
-// -r; }` and `! crontab -r` all passed, while the timer check below (cc8e80d7)
-// already had one: the measured `for f in x.service x.timer; do cp ... "$U/$f";
-// done` puts `do cp` at the start.
-// `coproc` runs its command like a keyword does (fejlesztes-vezeto 53740, teszter 38794:
-// `coproc crontab -r` passed); with a NAME only in front of a compound command.
-const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{|coproc(?:\s+[A-Za-z_]\w*(?=\s*\{))?)\s+)*`
+// A scheduler command word, and a pure READ-listing of one's own schedule (parity
+// with the store / schedule-API read exemptions: crontab -l, launchctl list/print,
+// atq). Both are sticky (`y`): they are tried only where a command word starts, and
+// what they read stays next to that word.
+const SCHED_CMD_RX = new RegExp(
+  String.raw`(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION}`,
+  'iy',
+)
+const SCHED_READ_CMD_RX = /crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b/iy
+
+// The shell keywords that start a command inside a loop, a condition or a group.
+// Measured 2026-09-30 (90a2257b): the scheduler check had no keyword branch, so `if
+// true; then crontab -r; fi`, `for i in 1; do crontab -r; done`, `while false; do at
+// now; done`, `{ crontab -r; }` and `! crontab -r` all passed, while the timer check
+// below (cc8e80d7) already had one: the measured `for f in x.service x.timer; do cp
+// ... "$U/$f"; done` puts `do cp` at the start. `coproc` runs its command like a
+// keyword does (fejlesztes-vezeto 53740, teszter 38794: `coproc crontab -r` passed);
+// with a NAME only in front of a compound command (`coproc NAME { ...; }`).
+// SHELL_KEYWORDS is the same list as a regex, for the sf-heavy form below.
+const KEYWORD_WORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{'])
+const SHELL_KEYWORDS = String.raw`(?:(?:${[...KEYWORD_WORDS].map((w) => (w === '{' ? '\\{' : w)).join('|')}|coproc(?:\s+[A-Za-z_]\w*(?=\s*\{))?)\s+)*`
 // ...and at the head of a case arm (the same decision: `case x in *) crontab -r;; esac`
 // passed). splitSegments cuts at `;`, `|` and a newline, so an arm's pattern stands at
 // the start of its segment (`*) crontab -r`, or `b) ...` after `a|b)`), or after
 // `case <word> in` for the first arm. The word is optional: the masked view blanks a
 // quoted one (`case "$x" in`). Only at the start of a segment: in `$(date) at now` the
-// `date)` follows a `(`, and there it is an argument, not an arm. No `\s*` before the
-// pattern unless a `(` opens it: the masked view turns a heredoc body into one long run
-// of spaces, and two adjacent `\s*` over it backtrack quadratically (measured on the
-// corpus: 290 ms on a 23 KB command, against 8 ms before).
-const CASE_ARM = String.raw`(?:case\s+(?:\S+\s+)?in\s+)?(?:\(\s*)?[^()\s;&|]+\s*\)\s*`
-const SEG_START = String.raw`(^(?:${CASE_ARM})?|${SCHED_BOUNDARY}\s*)`
-// ...and after `sudo` WITH options or `timeout <duration>`, which SCHED_PREFIX does
-// not read (it takes a bare `sudo` only). Measured 2026-09-30 (ffc45c28): `sudo -n
-// crontab -r`, `sudo -u root crontab -r` and `timeout 60 crontab -r` passed, on
-// develop too, while `sudo crontab -r` was denied. The timer check below already
-// read these: `sudo -n tee /etc/systemd/system/x.timer` was the one real write the
-// plain prefix missed among 3250 measured commands (cc8e80d7). The options that
-// take a value are named, so `sudo -n tee` keeps `tee` as the command; the same
-// for timeout's `-s <signal>` and `-k <duration>` (`timeout -s KILL 60 crontab -r`
-// passed with the earlier `-\S+` branch, which took `KILL` for the duration).
-// The other common wrappers are read the same way (fejlesztes-vezeto 53434, measured
-// 2026-09-30: a scheduler passed behind each): env with options, nice with an
-// adjustment, nohup, command -p (only -p runs the command; -v and -V look it up),
-// exec -a, stdbuf, setsid, flock <file>, doas, runuser, and xargs as the head of a
-// pipeline segment (`... | xargs crontab -r`).
-// And GNU time or the shell keyword `time`, by path too, with its options (teszter
-// 38794, fejlesztes-vezeto 53671): `/usr/bin/time crontab -r`, `/usr/bin/time -o f
-// -f %M crontab -r` and `time -p crontab -r` passed, on develop too. The bare
-// option branch is there on purpose: the masked view blanks a quoted value
-// (`-f "%e %M"`), so the valued branch would take the next word for the value, and
-// the bare branch keeps the command word after it.
-const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|env(?:\s+(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-[A-Za-z]*|--[\w-]+|[A-Za-z_]\w*=\S*))*|nice(?:\s+(?:-n\s*\S+|--adjustment(?:=|\s+)\S+|-\d+))*|nohup|command(?:\s+-p)+|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)(?:=|\s+)\S+))*|setsid(?:\s+(?:-[A-Za-z]+|--[\w-]+))*|flock(?:\s+(?:-[wEe]\s*\S+|--(?:timeout|conflict-exit-code)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|doas(?:\s+(?:-u\s*\S+|-[A-Za-z]+))*|runuser(?:\s+(?:-u\s*\S+|--user(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*(?:\s+--)?|xargs(?:\s+(?:-[IdEeLnPsa]\s*\S+|--[\w-]+(?:=\S+)?|-[A-Za-z0]+))*|(?:\S*/)?time(?:\s+(?:-[of]\s*\S+|--(?:output|format)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*)\s+)*`
-const SCHEDULER_RX = new RegExp(
-  String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
-  'i',
-)
-// ...but allow a pure READ-listing of one's own schedule (parity with the store /
-// schedule-API read exemptions): crontab -l, launchctl list/print, atq.
-const SCHEDULER_READ_RX = new RegExp(String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+// `date)` follows a `(`, and there it is an argument, not an arm. The arm is
+// `(?:case\s+(?:\S+\s+)?in\s+)?(?:\(\s*)?[^()\s;&|]+\s*\)\s*`, read from word
+// boundaries computed once (forEachCommandPosition): tried at every start of a whole
+// command, its pattern word ran over a run of backticks from each of them (30000
+// backticks: 1.9 s before, as a regex).
+
+// The wrappers a command position is read through, with what each takes in front of
+// the command it runs. Measured 2026-09-30 (ffc45c28, on develop too): `sudo -n
+// crontab -r`, `sudo -u root crontab -r` and `timeout 60 crontab -r` passed, while
+// `sudo crontab -r` was denied; the timer check below already read these (`sudo -n
+// tee /etc/systemd/system/x.timer` was the one real write the plain prefix missed
+// among 3250 measured commands, cc8e80d7). The other common wrappers are read the same
+// way (fejlesztes-vezeto 53434: a scheduler passed behind each): env with options and
+// assignments, nice with an adjustment, nohup, command -p (only -p runs the command;
+// -v and -V look it up), exec -a, stdbuf, setsid, flock <file>, doas, runuser, xargs as
+// the head of a pipeline segment (`... | xargs crontab -r`), and GNU time or the shell
+// keyword time with its options (teszter 38794, fejlesztes-vezeto 53671: `/usr/bin/time
+// -o f -f %M crontab -r` and `time -p crontab -r` passed).
+//
+// valued: option letters that take a value, attached (`-uroot`) or as the next word;
+// separate: letters whose value is always the next word; long: long options with a
+// value (`--user=x` or `--user x`); bare: an option word without a value; needs: a word
+// the wrapper takes after its options (timeout's duration, flock's lock file). Letters
+// and names in any case, as the regexes read them with the i flag. The reader follows
+// every reading of an option word at once (valued, bare, and the end of the options),
+// so reading one wrong costs nothing: the masked view blanks a quoted value (`-f "%e
+// %M"`), and there the bare reading keeps the command word after it. A wrapper is known
+// by its last path component, and `--` ends its options: both are new for all but time
+// (`/usr/bin/env crontab -r` and `nice -- crontab -r` passed).
+const WRAPPERS = new Map(Object.entries({
+  sudo: { valued: 'ugpcdrth', long: ['user', 'group', 'prompt', 'close-from', 'chdir', 'role', 'type', 'other-user', 'command-timeout', 'host'], bare: /^(?:-[a-z]+|--[\w-]+)$/i },
+  timeout: { valued: 'sk', long: ['signal', 'kill-after'], bare: /^(?:-[a-z]+|--[\w-]+)$/i, needs: true },
+  env: { valued: 'ucs', long: ['unset', 'chdir', 'split-string'], bare: /^(?:-[a-z]*|--[\w-]+|[a-z_]\w*=\S*)$/i },
+  nice: { valued: 'n', long: ['adjustment'], bare: /^-\d+$/ },
+  nohup: {},
+  command: { bare: /^-p$/i },
+  exec: { separate: 'a', bare: /^-[cl]+$/i },
+  stdbuf: { valued: 'ioe', long: ['input', 'output', 'error'] },
+  setsid: { bare: /^(?:-[a-z]+|--[\w-]+)$/i },
+  flock: { valued: 'we', long: ['timeout', 'conflict-exit-code'], bare: /^(?:-[a-z]+|--[\w-]+)$/i, needs: true },
+  doas: { valued: 'u', bare: /^-[a-z]+$/i },
+  runuser: { valued: 'u', long: ['user'], bare: /^(?:-[a-z]+|--[\w-]+)$/i },
+  xargs: { valued: 'idelnpsa', bare: /^(?:-[a-z0]+|--[\w-]+(?:=\S+)?)$/i },
+  time: { valued: 'of', long: ['output', 'format'], bare: /^(?:-[a-z]+|--[\w-]+)$/i },
+  builtin: {},
+}))
+const WRAPPER_SPECS = [...WRAPPERS.values()]
+const WRAPPER_INDEX = new Map([...WRAPPERS.keys()].map((name, i) => [name, i]))
+
+// --- where a command word starts: read by a loop -----------------------------------
+//
+// ffc45c28 (teszter 39223/39224, fejlesztes-vezeto 54307): the words in front of a
+// command word were read by regexes, and their alternatives overlapped: an option that
+// takes a value or none (`sudo -u`), a wrapper word two parts both read (`sudo`,
+// `time`), `\s` over the newlines that also start a command, `(?:\S*/)?` from every
+// `(`. Where no command word followed, the backtracking grew with the input: `time `
+// x30000 + `true; crontab -r` (150 KB) took 10.05 s, and the hook FAILS OPEN after
+// 10 s, so a slow gate is a bypass. Measured before this change (kimenet/ffc45c28
+// redos-meres-3/4): 40 option words of `sudo -u`, `time -o` or `timeout -s` over 20 s;
+// 150 000 newlines over 20 s; on develop 6158290b too, 30000 `sudo(` 2.3 s.
+//
+// So a loop walks the words. From each start it follows every way to read them --
+// keyword, assignment, wrapper, each reading of an option word -- and reports each
+// place where a command word can start. A (word, state) pair is taken once, however
+// many readings lead to it, so the time is linear in the command. It reads every
+// prefix the regexes read, and the few more named at WRAPPERS.
+
+// What a JS regex \s matches, by char code: the loop splits words where \S+ ends.
+function isWs(c) {
+  return c === 32 || (c >= 9 && c <= 13) || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff
+}
+
+const ASSIGNMENT_START_RX = /[A-Za-z_]\w*=/y
+const IDENTIFIER_WORD_RX = /[A-Za-z_]\w*(?=\s)/y
+// cut: what closes the substitution a command position is in (0 nothing, 1 `)`, 2 a
+// backtick), for the timer check, which reads a command's arguments up to it.
+const cutOf = (text) => (text.includes('`') ? 2 : text.includes('(') ? 1 : 0)
+
+// Calls onCommand(position, wordEnd, cut, name) once for each place in `s` where a
+// command word can start, and each cut it can start in; name is where the last path
+// component of the word starts. The starts: the start of `s`, where a
+// case arm may stand; after each `(` and backtick; and with allStarts -- for a view
+// that is a whole command, not one segment -- after each `;`, `&`, `|` and newline too,
+// with a case arm after each start.
+function forEachCommandPosition(s, allStarts, onCommand) {
+  const n = s.length
+  if (n === 0) return
+  // where the word at i ends (i itself on a space), and where the next word starts
+  const end = new Int32Array(n + 1)
+  const next = new Int32Array(n + 1)
+  end[n] = n
+  next[n] = n
+  for (let i = n - 1; i >= 0; i--) {
+    const ws = isWs(s.charCodeAt(i))
+    end[i] = ws ? i : end[i + 1]
+    next[i] = ws ? next[i + 1] : i
+  }
+  // where a case arm's pattern word ([^()\s;&|]+) from i ends
+  const runEnd = new Int32Array(n + 1)
+  runEnd[n] = n
+  for (let i = n - 1; i >= 0; i--) {
+    const c = s[i]
+    runEnd[i] = isWs(s.charCodeAt(i)) || c === '(' || c === ')' || c === ';' || c === '&' || c === '|' ? i : runEnd[i + 1]
+  }
+  // at the end of each word, the last `/` in it (-1: none)
+  const slash = new Int32Array(n + 1)
+  let last = -1
+  for (let i = 0; i <= n; i++) {
+    if (i === n || isWs(s.charCodeAt(i))) { slash[i] = last; last = -1 } else if (s.charCodeAt(i) === 47) last = i
+  }
+  const states = 2 * WRAPPER_SPECS.length + 1 // 0: a command position; 1 + 2w: wrapper w's options; 2 + 2w: its needed word
+  const seen = new Uint32Array(Math.ceil((n * states * 3) / 32)) // one bit per (position, state, cut)
+  const stack = []
+  const push = (p, state, cut) => {
+    if (p >= n) return
+    const key = (p * states + state) * 3 + cut
+    const bit = 1 << (key & 31)
+    if (seen[key >>> 5] & bit) return
+    seen[key >>> 5] |= bit
+    stack.push(p, state, cut)
+  }
+  // where the command after a case arm that stands at q starts (-1: no arm there)
+  const armEnd = (q) => {
+    if (q < n && s[q] === '(') q = next[q + 1]
+    if (q >= n || runEnd[q] === q) return -1
+    const c = next[runEnd[q]]
+    return c < n && s[c] === ')' ? next[c + 1] : -1
+  }
+  const wordIs = (q, w) => q < n && end[q] - q === w.length && end[q] < n && s.slice(q, end[q]).toLowerCase() === w
+  const start = (a, cut, arm) => {
+    const p = next[a]
+    push(p, 0, cut)
+    if (!arm || p >= n) return
+    const arms = [armEnd(p)]
+    if (wordIs(p, 'case')) {
+      const w = next[end[p]] // case <word> in, or case in
+      if (w < n && end[w] < n && wordIs(next[end[w]], 'in')) arms.push(armEnd(next[end[next[end[w]]]]))
+      if (wordIs(w, 'in')) arms.push(armEnd(next[end[w]]))
+    }
+    // the cut matters in a segment, where only its start has an arm; a whole command's
+    // starts are read for a shell word, which has no cut
+    for (const e of arms) if (e > 0) push(e, 0, cut || (allStarts ? 0 : cutOf(s.slice(p, e))))
+  }
+  start(0, 0, true)
+  for (let i = 0; i < n; i++) {
+    const c = s[i]
+    if (c === '(') start(i + 1, 1, allStarts)
+    else if (c === '`') start(i + 1, 2, allStarts)
+    else if (allStarts && (c === ';' || c === '&' || c === '|' || c === '\n')) start(i + 1, 0, true)
+  }
+  while (stack.length) {
+    const cut = stack.pop()
+    const state = stack.pop()
+    const p = stack.pop()
+    const e = end[p]
+    const nx = next[e]
+    if (state === 0) {
+      const k = slash[e] >= p ? slash[e] + 1 : p
+      onCommand(p, e, cut, k)
+      if (e >= n) continue // the prefix words below are all followed by a space
+      if (e - p <= 6) {
+        const w = s.slice(p, e).toLowerCase()
+        if (KEYWORD_WORDS.has(w)) push(nx, 0, cut)
+        if (w === 'coproc') {
+          push(nx, 0, cut)
+          // `coproc NAME { ...; }`: the group after the name
+          IDENTIFIER_WORD_RX.lastIndex = nx
+          if (nx < n && IDENTIFIER_WORD_RX.test(s) && IDENTIFIER_WORD_RX.lastIndex === end[nx]) {
+            const b = next[end[nx]]
+            if (b < n && s[b] === '{' && end[b] === b + 1) push(b, 0, cut)
+          }
+        }
+      }
+      ASSIGNMENT_START_RX.lastIndex = p
+      if (ASSIGNMENT_START_RX.test(s)) push(nx, 0, cut)
+      if (e - k <= 7) {
+        const wi = WRAPPER_INDEX.get(s.slice(k, e).toLowerCase())
+        if (wi !== undefined) push(nx, 1 + 2 * wi, cut)
+      }
+      continue
+    }
+    const spec = WRAPPER_SPECS[(state - 1) >> 1]
+    if ((state & 1) === 0) { // the word the wrapper needs, then the command
+      if (e < n) push(nx, 0, cut)
+      continue
+    }
+    const after = spec.needs ? state + 1 : 0
+    push(p, after, cut) // the options may end before this word
+    if (e >= n) continue // an option is followed by a space
+    const word = s.slice(p, e)
+    const valueNext = () => { if (nx < n && end[nx] < n) push(next[end[nx]], state, cut) }
+    if (word === '--') push(nx, after, cut)
+    if (spec.bare && spec.bare.test(word)) push(nx, state, cut)
+    if (word.length >= 2 && word[0] === '-' && word[1] !== '-') {
+      const letter = word[1].toLowerCase()
+      if (spec.valued && spec.valued.includes(letter)) {
+        if (word.length === 2) valueNext()
+        else push(nx, state, cut)
+      }
+      if (spec.separate && spec.separate.includes(letter) && word.length === 2) valueNext()
+    }
+    if (spec.long && word.startsWith('--')) {
+      const eq = word.indexOf('=')
+      if (spec.long.includes((eq === -1 ? word.slice(2) : word.slice(2, eq)).toLowerCase())) {
+        if (eq === -1) valueNext()
+        else if (eq < word.length - 1) push(nx, state, cut)
+      }
+    }
+  }
+}
+
+// The match of a sticky command-word regex in the word s[p, e): at p, or after a `/`
+// in it (a path), the last `/` first, as `(?:\S*/)?` read it. Per regex, `memo` holds
+// for each word end the last place after a `/` where the regex matches, so the words
+// that start inside one token (after a `(`) share one scan of it.
+function commandWordMatch(s, p, e, rx, memo) {
+  let at = memo.get(e)
+  if (at === undefined) {
+    at = -1
+    let a = e
+    while (a > 0 && !isWs(s.charCodeAt(a - 1))) a--
+    for (let j = e - 2; j >= a; j--) {
+      if (s.charCodeAt(j) !== 47) continue
+      rx.lastIndex = j + 1
+      if (rx.test(s)) { at = j + 1; break }
+    }
+    memo.set(e, at)
+  }
+  rx.lastIndex = at > p ? at : p
+  return rx.exec(s)
+}
+
+// Does this segment run a scheduler (and not only list one's own schedule)?
+function schedulesInSegment(seg) {
+  const memoRun = new Map()
+  const memoRead = new Map()
+  let runs = false
+  let reads = false
+  forEachCommandPosition(seg, false, (p, e) => {
+    if (!runs && commandWordMatch(seg, p, e, SCHED_CMD_RX, memoRun)) runs = true
+    if (!reads && commandWordMatch(seg, p, e, SCHED_READ_CMD_RX, memoRead)) reads = true
+  })
+  return runs && !reads
+}
 
 // --- a command handed to a shell as text ------------------------------------------
 //
@@ -173,26 +391,59 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`${SEG_START}${SHELL_KEYWORDS}${W
 // MASKED command, so a heredoc body or quoted prose that only mentions one is not read;
 // masking keeps the length, so the quoted argument is then taken from the same place
 // in the command itself and judged as a command of its own (gateDecision, depth <= 3).
-const SHELL_C_RX = new RegExp(
-  String.raw`(?:^|${SCHED_BOUNDARY}|\n)\s*(?:${CASE_ARM})?${SHELL_KEYWORDS}${WRAPPER_PREFIX}(?:\S*/)?(?:bash|sh|dash|zsh|ksh|su|runuser|flock)\b[^;&|\n'"]*?\s-[A-Za-z]*c(?=\s)`,
-  'g',
-)
+// The -c option is the first word of the form -...c after the shell word, before any
+// `;`, `&`, `|`, newline or quote, and the script is the quoted word right after it.
+const SHELL_C_WORD_RX = /(?:bash|sh|dash|zsh|ksh|su|runuser|flock)\b/iy
 export function shellCScripts(command) {
   const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
   const view = maskInertLiterals(src, { strict: false }) ?? src
-  const out = []
-  for (const m of view.matchAll(SHELL_C_RX)) {
-    let at = m.index + m[0].length
-    while (at < src.length && /[ \t]/.test(src[at])) at++
-    if (src[at] === "'") {
-      const end = src.indexOf("'", at + 1)
-      if (end > at) out.push(src.slice(at + 1, end))
-    } else if (src[at] === '"') {
-      let j = at + 1
-      while (j < src.length && src[j] !== '"') j += src[j] === '\\' ? 2 : 1
-      if (j < src.length) out.push(src.slice(at + 1, j).replace(/\\(["\\$`])/g, '$1'))
+  const n = view.length
+  // the first ; & | newline or quote at or after i; the first -...c option (a space,
+  // a dash, letters ending in c, a space) at or after i, and where it ends
+  const stopAt = new Int32Array(n + 1)
+  const optAt = new Int32Array(n + 1)
+  const optEnd = new Int32Array(n + 1)
+  stopAt[n] = n
+  optAt[n] = n
+  for (let i = n - 1; i >= 0; i--) {
+    const c = view[i]
+    stopAt[i] = c === ';' || c === '&' || c === '|' || c === '\n' || c === "'" || c === '"' ? i : stopAt[i + 1]
+    optAt[i] = optAt[i + 1]
+    if (isWs(view.charCodeAt(i)) && view[i + 1] === '-') {
+      let j = i + 2
+      while (j < n && /[A-Za-z]/.test(view[j])) j++
+      if (j > i + 2 && view[j - 1] === 'c' && j < n && isWs(view.charCodeAt(j))) { optAt[i] = i; optEnd[i] = j }
     }
   }
+  // where a quoted string opened at i closes, as the shell reads it
+  const sq = new Int32Array(n + 2)
+  const dq = new Int32Array(n + 2)
+  sq[n] = sq[n + 1] = dq[n] = dq[n + 1] = -1
+  for (let i = n - 1; i >= 0; i--) {
+    sq[i] = src[i] === "'" ? i : sq[i + 1]
+    dq[i] = src[i] === '"' ? i : src[i] === '\\' ? dq[Math.min(i + 2, n)] : dq[i + 1]
+  }
+  const memo = new Map()
+  const scripts = new Set() // by the position the script starts at
+  const out = []
+  forEachCommandPosition(view, true, (p, e) => {
+    const m = commandWordMatch(view, p, e, SHELL_C_WORD_RX, memo)
+    if (!m) return
+    const ne = m.index + m[0].length
+    const k = optAt[ne]
+    if (k >= n || stopAt[ne] < k) return
+    let at = optEnd[k]
+    while (at < n && (src[at] === ' ' || src[at] === '\t')) at++
+    if (scripts.has(at)) return
+    scripts.add(at)
+    if (src[at] === "'") {
+      const close = sq[at + 1]
+      if (close !== -1) out.push(src.slice(at + 1, close))
+    } else if (src[at] === '"') {
+      const close = dq[at + 1]
+      if (close !== -1) out.push(src.slice(at + 1, close).replace(/\\(["\\$`])/g, '$1'))
+    }
+  })
   return out
 }
 
@@ -207,13 +458,13 @@ export function shellCScripts(command) {
 // that outlives the call, so it schedules nothing. The operator accepted exactly
 // this form and asked for a documented exception here instead of a blind spot.
 // So this ONE form -- these options in this order, unquoted, at a command
-// position (also after a shell keyword, as SCHEDULER_RX reads one), nothing (no
+// position (also after a shell keyword, as the scheduler check reads one), nothing (no
 // sudo, env, path) in front of the binary -- is transparent
 // to the gate: the prefix and the time tail are replaced by a command separator,
 // and the command after them is judged as if it were run directly, so a scheduler,
 // a timer or a pane injection behind the prefix is still denied. Every other systemd-run (an
 // --on-* or timer option, no --scope, another slice or unit name, another
-// property, another order) is not this form and stays denied by SCHEDULER_RX.
+// property, another order) is not this form and stays denied by the scheduler check.
 // The label charset is the one sf-heavy writes (tr -c 'A-Za-z0-9_.-' '-').
 // The GNU time tail is part of the form (teszter 38794): it goes with the prefix,
 // so the gate judges the command behind it exactly as if it ran on its own.
@@ -250,7 +501,7 @@ export function unwrapSfHeavyScope(command) {
 // wrote the unit files into ~/.config/systemd/user, then ran `systemctl --user
 // enable --now <name>.timer` -- and the timer's job messaged the agent's own
 // queue on a finding, so the agent woke up on turns it had scheduled for itself,
-// twice in an hour. SCHEDULER_RX catches `systemd-run` (a transient timer in one
+// twice in an hour. The scheduler check catches `systemd-run` (a transient timer in one
 // call), but neither of these steps: `systemctl` is not a scheduler binary, and
 // writing a file is not an invocation.
 //
@@ -271,11 +522,11 @@ export function unwrapSfHeavyScope(command) {
 // journalctl, cat/ls/grep/diff on a unit file, copying a unit file OUT of the
 // directory. So do stopping and disabling a timer, and running a .service once.
 //
-// Like SCHEDULER_RX, both shell checks read what the SHELL would run: quoted text
+// Like the scheduler check, both shell checks read what the SHELL would run: quoted text
 // and heredoc bodies are inert (maskInertLiterals), so a message or a card
 // comment that quotes the very command is not a deny. A unit name or a path in
 // quotes is still an argument, so those are read from the command with only the
-// heredoc bodies blanked. Unlike SCHEDULER_RX, one `"...$(...)..."` does not
+// heredoc bodies blanked. Unlike the scheduler check, one `"...$(...)..."` does not
 // send the WHOLE command to the naive split: measured on 3250 real commands that
 // mention systemctl, a unit directory or a timer, that fallback let the prose of
 // quoted heredoc bodies (messages, card comments) read as commands, and most of
@@ -283,8 +534,7 @@ export function unwrapSfHeavyScope(command) {
 // stays visible (maskInertLiterals `strict: false`).
 //
 // KNOWN LIMITATIONS, the same class as the other anchored checks: a wrapper that
-// neither SCHED_PREFIX nor WRAPPER_PREFIX knows (`bash -c '...'`, `xargs`, `nice
-// -n 5 ...`), a command fed to an interpreter as a quoted heredoc (`bash
+// WRAPPERS does not know, a command fed to an interpreter as a quoted heredoc (`bash
 // <<'EOF'`, `ssh host bash -s <<'EOF'`), a unit name that only a runtime
 // expansion yields, an existing timer edited through a script's argv, and a
 // script file that does it all (the gate sees `bash install.sh`, not what it runs).
@@ -311,12 +561,9 @@ const SYSTEMCTL_VALUE_OPTS = new Set([
   '-o', '--output', '-s', '--signal', '--kill-whom', '--kill-value', '--job-mode', '--root', '--image',
   '--what', '--timestamp', '--preset-mode', '--when', '--drop-in', '--message', '--check-inhibitors',
 ])
-// The command word of a segment, as for SCHEDULER_RX: after a shell keyword
-// (SHELL_KEYWORDS) and a wrapper (WRAPPER_PREFIX), both defined above.
-const TIMER_CMD_RX = new RegExp(
-  String.raw`${SEG_START}${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)`,
-  'gi',
-)
+// The command words that arm a timer or write a file, read where a command word
+// starts (forEachCommandPosition), as for the scheduler check.
+const TIMER_CMD_WORD_RX = /(systemctl|tee|cp|mv|install|ln|rsync|dd|sed)\b(?!-)(?!\s*=)/iy
 
 // A unit argument that names a timer: <x>.timer, a glob, or a brace form
 // (x.{service,timer}). A `)` or backtick closing a substitution, or punctuation
@@ -487,14 +734,19 @@ function armsSystemdTimer(command, naiveSegs, depth = 0) {
     const b = bseg.slice(lead)
     const { words, outTargets } = shellWords(b)
     if (outTargets.some(writesTimerFile)) return true
-    // a fresh regex per call: a /g regex keeps lastIndex, and this function recurses
-    const cmdRx = new RegExp(TIMER_CMD_RX.source, TIMER_CMD_RX.flags)
-    let cm
-    while ((cm = cmdRx.exec(m))) {
-      const bin = cm[2].toLowerCase()
+    // the segment's command words that arm or write, each with where its arguments
+    // start and the substitution it is in; one per such place
+    const found = new Map()
+    const memo = new Map()
+    forEachCommandPosition(m, false, (p, e, cut) => {
+      const cm = commandWordMatch(m, p, e, TIMER_CMD_WORD_RX, memo)
+      if (cm) found.set((cm.index + cm[0].length) * 3 + cut, cm[1].toLowerCase())
+    })
+    for (const [key, bin] of found) {
+      const cut = key % 3
       // a command that starts a substitution ends where the substitution does
-      let rest = b.slice(cm.index + cm[0].length)
-      const close = cm[1].includes('`') ? rest.indexOf('`') : cm[1].includes('(') ? rest.indexOf(')') : -1
+      let rest = b.slice((key - cut) / 3)
+      const close = cut === 2 ? rest.indexOf('`') : cut === 1 ? rest.indexOf(')') : -1
       if (close !== -1) rest = rest.slice(0, close)
       const { words: args } = shellWords(rest)
       if (bin === 'systemctl') {
@@ -566,8 +818,8 @@ const HTTP_WRITE_RX = /(-X\s*(POST|PUT|PATCH|DELETE)|--request\s+(POST|PUT|PATCH
 //     enough (the quoted ; must be immediately followed by a blocked binary at a
 //     segment start) that a full shell-tokenizer is not warranted here.
 //   - A $(...) or backtick substitution that assigns a scheduler result
-//     (`X=$(crontab -)`, `X=`crontab -``) is caught by SCHEDULER_RX's boundary
-//     anchor, which now includes both `(` and the backtick.
+//     (`X=$(crontab -)`, `X=`crontab -``) is caught by the scheduler check, which
+//     reads a command position after both `(` and the backtick.
 export function splitSegments(command) {
   return String(command ?? '')
     .replace(/\\\r?\n/g, ' ')
@@ -587,7 +839,7 @@ export function splitSegments(command) {
 // grep pattern quoted inside an inter-agent message,
 //   Minta: stop.sh <bar> launchctl <bar> com.janna.dashboard
 // The `<bar>` split it, the middle piece trimmed down to the bare word
-// `launchctl`, and SCHEDULER_RX's end-of-segment branch reads a bare `launchctl`
+// `launchctl`, and the scheduler check's end-of-segment branch reads a bare `launchctl`
 // as a real (interactive) invocation -- correctly, for a real command line.
 // Nothing was scheduled; five messages simply never went out. From outside, a
 // hard-gate denial is indistinguishable from an agent that stayed silent.
@@ -618,8 +870,8 @@ export function splitSegments(command) {
 // NOTE ON THE SHAPE OF THIS FIX. The first attempt made the SEGMENTER
 // quote-aware and left the regexes alone. It failed one corpus case:
 //   echo 'grep: foo <bar> crontab <bar> bar'
-// stayed denied, because SCHEDULER_RX carries its OWN boundary anchor
-// (SCHED_BOUNDARY includes the bar), so it re-finds a command position INSIDE a
+// stayed denied, because the scheduler regex carried its OWN boundary anchor
+// (the bar among them), so it re-found a command position INSIDE a
 // segment. Keeping the quoted text in the segment at all was the mistake. The
 // `launchctl` cases passed only by luck -- LAUNCHCTL_SUBCOMMAND's lookahead
 // happened to reject the following bar. So the primitive is not "split more
@@ -718,8 +970,8 @@ export function maskInertLiterals(command, { quotes = true, strict = true } = {}
 // single-quoted '...', ANSI-C $'...', and double-quoted "..." WITHOUT
 // $(...)/backtick. A payload that can run a command substitution (double-quoted
 // with $(...) / backticks) is left intact so a real command-substitution payload
-// is not blanked. Such a payload is then still denied by SCHEDULER_RX, whose
-// boundary anchor recognises both `$(` and the backtick as a command boundary,
+// is not blanked. Such a payload is then still denied by the scheduler check, which
+// reads both `$(` and the backtick as the start of a command,
 // so a scheduler binary inside either substitution form is caught. The data FLAG
 // itself is kept, so HTTP-write detection (-d /
 // --data) is unchanged; the URL and method args live OUTSIDE the payload, so a
@@ -778,11 +1030,11 @@ export function stripDataPayloads(seg) {
 // and same literal-only quote handling as stripDataPayloads: single-quoted,
 // ANSI-C $'...', and double-quoted WITHOUT $(...)/backtick are blanked; a
 // double-quoted message that CAN command-substitute (`git commit -m "$(crontab
-// -r)"`) is left intact so SCHEDULER_RX still catches the real substitution.
+// -r)"`) is left intact so the scheduler check still catches the real substitution.
 // Scoped to git commit/tag/stash so a `-m` on an unrelated binary is untouched.
 // Heredoc bodies are DATA, not commands. A worker writing a real commit message
 // through `git commit -F - <<EOF … EOF` had the turn denied because one prose
-// line happened to start with "at " -- which SCHEDULER_RX reads as the `at`
+// line happened to start with "at " -- which the scheduler check reads as the `at`
 // scheduler at a segment start. A heredoc body is data, so blank it before any
 // pattern runs. Handles <<- for tab-indented bodies.
 //
@@ -790,7 +1042,7 @@ export function stripDataPayloads(seg) {
 // <<"EOF") is literal: the shell performs no expansion inside it, so blanking is
 // safe. An UNQUOTED marker (<<EOF) is not -- the shell expands $(...) and
 // backticks in that body at exec time, so blanking one would hide a live
-// command substitution from SCHEDULER_RX and the gate would stop seeing
+// command substitution from the scheduler check and the gate would stop seeing
 // something that really runs:
 //
 //     git commit -m "$(cat <<EOF
@@ -813,9 +1065,9 @@ export function stripDataPayloads(seg) {
 // remote/container executor.
 const HEREDOC_INTERPRETER_RX = /^(?:bash|sh|zsh|dash|ksh|ash|python[0-9.]*|node|nodejs|ruby|perl|php|ssh)$/
 
-function heredocOwnerRunsBody(before) {
-  // `before` is the command text up to the << redirect; the owner is the first
-  // word of the last command segment.
+// The owner, as it stood (develop): the first word of the last command piece after
+// the pass-through prefixes.
+function ownerByPrefixList(before) {
   const seg = before.split(/\n|;|\|\|?|&&?|\(|\{/).pop() ?? ''
   const tokens = seg.trim().split(/\s+/).filter(Boolean)
   // Pass-through prefixes that do not change what runs the body.
@@ -831,6 +1083,30 @@ function heredocOwnerRunsBody(before) {
   return false
 }
 
+// `string` up to `offset` is the command before the << redirect. The owner is read from
+// the command segment the redirect stands in (after the last newline, ;, | or &), and
+// besides the first word above, a SHELL is found as any command word the reader finds
+// there (ffc45c28): through a wrapper with options the pass-through list does not know,
+// `timeout 60 bash <<'EOF'`, `sudo -u root bash <<'EOF'`, `setsid bash <<'EOF'` and
+// `nice -n 5 bash <<'EOF'` fed their body to bash, and the body was blanked. Only a
+// shell: a body a wrapped python runs is python, and read as shell lines its prose
+// strings were measured to deny real commands (5 in the 26653 of the corpus).
+const HEREDOC_SHELL_RX = /^(?:bash|sh|zsh|dash|ksh|ash|ssh)$/
+function heredocOwnerRunsBody(string, offset) {
+  let a = offset
+  while (a > 0 && !'\n;|&'.includes(string[a - 1])) a--
+  const seg = string.slice(a, offset)
+  if (ownerByPrefixList(seg)) return true
+  let runs = false
+  forEachCommandPosition(seg, false, (p, e, cut, k) => {
+    if (runs || e - k > 24) return
+    const word = seg.slice(k, e)
+    if (HEREDOC_SHELL_RX.test(word)) runs = true
+    else if (['docker', 'podman', 'kubectl'].includes(word) && /(?:^|\s)exec(?=\s|$)/.test(seg.slice(e))) runs = true
+  })
+  return runs
+}
+
 export function stripHeredocBodies(command) {
   const cmd = String(command ?? '')
   if (!/<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*/.test(cmd)) return cmd
@@ -841,7 +1117,7 @@ export function stripHeredocBodies(command) {
       if (!literal && (body.includes('$(') || body.includes('`'))) return full
       // A quoted body the shell will not expand is still executed when an
       // interpreter/remote-executor owns the redirect -- keep it visible then.
-      if (heredocOwnerRunsBody(string.slice(0, offset))) return full
+      if (heredocOwnerRunsBody(string, offset)) return full
       return `${open}\n${close}`
     },
   )
@@ -908,7 +1184,7 @@ export function gateDecision(toolName, toolInput, depth = 0) {
     // it, the owner would read as systemd-run and the body would be blanked.
     const unwrapped = unwrapSfHeavyScope(String(toolInput?.command ?? ''))
     const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(unwrapped))))
-    // A script handed to a shell as text (SHELL_C_RX) is judged as a command of its own.
+    // A script handed to a shell as text (shellCScripts) is judged as a command of its own.
     if (depth < 3) {
       for (const script of shellCScripts(safeCommand)) {
         if (gateDecision('Bash', { command: script }, depth + 1).deny) return { deny: true }
@@ -940,7 +1216,7 @@ export function gateDecision(toolName, toolInput, depth = 0) {
     const masked = maskInertLiterals(safeCommand)
     for (const seg of (masked == null ? naiveSegs : splitSegments(masked))) {
       // scheduler binaries: deny the exec/submit forms, allow pure read-listing
-      if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) return { deny: true }
+      if (schedulesInSegment(seg)) return { deny: true }
     }
     // a systemd timer, armed with systemctl or written into a unit directory. The
     // timer check masks the heredoc bodies itself, and reads one only where the
