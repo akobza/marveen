@@ -9,6 +9,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { Readable } from 'node:stream'
 import { gunzipSync } from 'node:zlib'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { initDatabase, createKanbanCard } from '../db.js'
 import { tryHandleKanban } from '../web/routes/kanban.js'
 import { jsonMaybeGzip } from '../web/http-helpers.js'
@@ -73,11 +75,72 @@ describe('GET /api/kanban: length and count up front (c4e47223)', () => {
 })
 
 describe('jsonMaybeGzip: the framing cannot be overridden by an extra header', () => {
-  it('a caller-supplied Content-Length is replaced by the real one', () => {
+  // Every key of the head object that names `header`, whatever its case: node
+  // sends each key as its own line, so two keys are two lines on the wire.
+  const named = (headers: Record<string, string>, header: string) =>
+    Object.keys(headers).filter((k) => k.toLowerCase() === header)
+  const call = (extra: Record<string, string>, reqHeaders: Record<string, string> = {}, data: unknown = { ok: true }) => {
     const out: Out = { status: 0, headers: {}, body: Buffer.alloc(0) }
-    const req: any = { headers: {} }
-    jsonMaybeGzip(req, fakeRes(out), { ok: true }, 200, { 'Content-Length': '999', 'X-Total-Count': '1' })
+    jsonMaybeGzip({ headers: reqHeaders } as any, fakeRes(out), data, 200, extra)
+    return out
+  }
+  const big = { cards: Array.from({ length: 80 }, (_, i) => ({ id: `c${i}`, title: `Card ${i} with some words` })) }
+
+  it('a caller-supplied Content-Length is replaced by the real one', () => {
+    const out = call({ 'Content-Length': '999', 'X-Total-Count': '1' })
     expect(out.headers['Content-Length']).toBe(String(out.body.length))
     expect(out.headers['X-Total-Count']).toBe('1')
+  })
+
+  it('a LOWERCASE content-length is dropped too: one Content-Length, the real one (teszter 39374)', () => {
+    const out = call({ 'content-length': '1', 'X-Total-Count': '1' })
+    expect(named(out.headers, 'content-length')).toEqual(['Content-Length'])
+    expect(out.headers['Content-Length']).toBe(String(out.body.length))
+    expect(out.headers['X-Total-Count']).toBe('1')
+  })
+
+  it('an extra Content-Encoding does not mark the PLAIN branch as gzip (teszter 39374)', () => {
+    const out = call({ 'Content-Encoding': 'gzip' })
+    expect(named(out.headers, 'content-encoding')).toEqual([])
+    expect(JSON.parse(out.body.toString('utf-8'))).toEqual({ ok: true })
+  })
+
+  it('on the gzip branch an extra content-encoding (any case) cannot replace gzip', () => {
+    const out = call({ 'content-encoding': 'identity' }, { 'accept-encoding': 'gzip' }, big)
+    expect(named(out.headers, 'content-encoding')).toEqual(['Content-Encoding'])
+    expect(out.headers['Content-Encoding']).toBe('gzip')
+    expect(JSON.parse(gunzipSync(out.body).toString('utf-8')).cards).toHaveLength(80)
+  })
+
+  it('an extra Transfer-Encoding is dropped: the length stays the framing', () => {
+    const out = call({ 'Transfer-Encoding': 'chunked' })
+    expect(named(out.headers, 'transfer-encoding')).toEqual([])
+    expect(out.headers['Content-Length']).toBe(String(out.body.length))
+  })
+
+  it('a non-framing extra replaces the default in any case, as ONE line', () => {
+    const out = call({ 'cache-control': 'no-cache' })
+    expect(named(out.headers, 'cache-control')).toEqual(['cache-control'])
+    expect(out.headers['cache-control']).toBe('no-cache')
+  })
+
+  it('on the wire: a lowercase content-length extra leaves exactly one length line, and the body parses', async () => {
+    const server = http.createServer((req, res) => jsonMaybeGzip(req, res, { ok: true }, 200, { 'content-length': '1' }))
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const { port } = server.address() as AddressInfo
+    try {
+      const got = await new Promise<{ raw: string[]; body: string }>((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {
+          let body = ''
+          res.on('data', (d) => { body += String(d) })
+          res.on('end', () => resolve({ raw: res.rawHeaders, body }))
+        }).on('error', reject)
+      })
+      const lengthLines = got.raw.filter((_, i) => i % 2 === 0 && got.raw[i].toLowerCase() === 'content-length')
+      expect(lengthLines).toHaveLength(1)
+      expect(JSON.parse(got.body)).toEqual({ ok: true })
+    } finally {
+      server.close()
+    }
   })
 })

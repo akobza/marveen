@@ -101,6 +101,13 @@ function acceptsGzip(req: http.IncomingMessage): boolean {
   return /(^|,)\s*gzip\s*(;\s*q=(?!0(\.0*)?\s*(,|$))[\d.]+)?\s*(,|$)/i.test(value)
 }
 
+// The helper owns the framing. An extra header could otherwise set it: header
+// names are case-insensitive on the wire but not as object keys, so a lowercase
+// `content-length` went out NEXT TO the real one (curl exit 8), and an extra
+// `Content-Encoding: gzip` stayed on the plain branch, marking plain JSON as
+// gzip (teszter 39374, c4e47223 (1)). Extras with these names are dropped.
+const FRAMING_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding'])
+
 /**
  * Like json() but gzips the body when the client accepts it and the payload
  * exceeds GZIP_MIN_BYTES. Meant for the handful of heavy list endpoints
@@ -114,7 +121,7 @@ function acceptsGzip(req: http.IncomingMessage): boolean {
  * bytes remaining", exit 18) instead of by guessing from the JSON. Without it the
  * response went out chunked, which also ends in exit 18 on a cut but promises no
  * size. `extraHeaders` carries per-endpoint facts such as a list's X-Total-Count;
- * it cannot override the framing.
+ * it cannot override the framing, in any letter case (see FRAMING_HEADERS).
  */
 export function jsonMaybeGzip(
   req: http.IncomingMessage,
@@ -128,7 +135,14 @@ export function jsonMaybeGzip(
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'private, no-store',
     Vary: 'Accept-Encoding',
-    ...extraHeaders,
+  }
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    const lower = name.toLowerCase()
+    if (FRAMING_HEADERS.has(lower)) continue
+    // One line per header name: an extra replaces a default whatever its case,
+    // instead of going out next to it.
+    for (const key of Object.keys(headers)) if (key.toLowerCase() === lower) delete headers[key]
+    headers[name] = value
   }
   if (body.length > GZIP_MIN_BYTES && acceptsGzip(req)) {
     const gz = gzipSync(body)
