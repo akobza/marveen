@@ -136,21 +136,30 @@ const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_
 // runs every heavy compile (tsc, next build) through scripts/infra-ops/sf-heavy,
 // which starts it in a FOREGROUND transient scope with a memory cap:
 //   systemd-run --user --scope --quiet --collect --slice=sf-heavy.slice
-//     --unit=sf-heavy-<label> -p MemoryMax=<size> -- <command>
+//     --unit=sf-heavy-<label> -p MemoryMax=<size> -- /usr/bin/time -o <file> -f %M <command>
 // A scope runs its command now and ends with it: no timer, no --on-*, no service
 // that outlives the call, so it schedules nothing. The operator accepted exactly
 // this form and asked for a documented exception here instead of a blind spot.
 // So this ONE form -- these options in this order, unquoted, at a command
 // position (also after a shell keyword, as SCHEDULER_RX reads one), nothing (no
 // sudo, env, path) in front of the binary -- is transparent
-// to the gate: the prefix is replaced by a command separator, and the command
-// after `--` is judged as if it were run directly, so a scheduler, a timer or a
-// pane injection behind the prefix is still denied. Every other systemd-run (an
+// to the gate: the prefix and the time tail are replaced by a command separator,
+// and the command after them is judged as if it were run directly, so a scheduler,
+// a timer or a pane injection behind the prefix is still denied. Every other systemd-run (an
 // --on-* or timer option, no --scope, another slice or unit name, another
 // property, another order) is not this form and stays denied by SCHEDULER_RX.
 // The label charset is the one sf-heavy writes (tr -c 'A-Za-z0-9_.-' '-').
+// The GNU time tail is part of the form (teszter 38794): it goes with the prefix,
+// so the gate judges the command behind it exactly as if it ran on its own.
+// Before, /usr/bin/time was the command the gate saw, and a scheduler behind it
+// went through. The tail is exactly `/usr/bin/time -o <file> -f %M`, the file a
+// plain word, a plain $NAME or ${NAME}, or a quoted string of those: never a
+// command substitution or a backquote, because whatever sits in the removed tail
+// is never judged. Any other tail (none, no -o, another format, an expansion in
+// the file name) is not the form, and the whole systemd-run stays denied.
+const SF_HEAVY_TIME_FILE = String.raw`(?:(?:[A-Za-z0-9_./+:@%-]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})+|'[^'\n]*'|"(?:[A-Za-z0-9_./+:@% -]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})*")`
 const SF_HEAVY_SCOPE_RX = new RegExp(
-  String.raw`(^|[;&|(\`\n])([ \t]*${SHELL_KEYWORDS})systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--(?=[ \t]+[^\s;&|)\`])`,
+  String.raw`(^|[;&|(\`\n])([ \t]*${SHELL_KEYWORDS})systemd-run[ \t]+--user[ \t]+--scope[ \t]+--quiet[ \t]+--collect[ \t]+--slice=sf-heavy\.slice[ \t]+--unit=sf-heavy-[A-Za-z0-9_.-]+[ \t]+-p[ \t]+MemoryMax=[1-9][0-9]*[KMGT]?[ \t]+--[ \t]+/usr/bin/time[ \t]+-o[ \t]+${SF_HEAVY_TIME_FILE}[ \t]+-f[ \t]+%M(?=[ \t]+[^\s;&|)\`])`,
   'g',
 )
 export function unwrapSfHeavyScope(command) {

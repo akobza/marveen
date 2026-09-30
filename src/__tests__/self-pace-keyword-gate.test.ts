@@ -11,6 +11,8 @@ const bash = (command: string): boolean => gateDecision('Bash', { command }).den
 const NL = '\n'
 const Q = String.fromCharCode(39)
 const SF = 'systemd-run --user --scope --quiet --collect --slice=sf-heavy.slice --unit=sf-heavy-tsc-4242 -p MemoryMax=16G --'
+// The real form ends with the GNU time tail (teszter 38794); the tail is part of the allowed form.
+const T = '/usr/bin/time -o /tmp/sfh-demo.txt -f %M'
 
 describe('90a2257b (2): a scheduler after a shell keyword is denied', () => {
   it('the seven measured forms', () => {
@@ -53,8 +55,8 @@ describe('90a2257b (2): what stays allowed', () => {
     expect(bash(`cat > /tmp/msg.txt <<${Q}EOF${Q}${NL}then crontab -r${NL}do at now${NL}{ crontab -r; }${NL}EOF`)).toBe(false)
   })
   it('the sf-heavy scope after a keyword stays allowed; a scheduler behind it stays denied', () => {
-    expect(bash(`if true; then ${SF} npx tsc --noEmit; fi`)).toBe(false)
-    expect(bash(`for i in 1; do ${SF} npx tsc --noEmit; done`)).toBe(false)
-    expect(bash(`if true; then ${SF} crontab -r; fi`)).toBe(true)
+    expect(bash(`if true; then ${SF} ${T} npx tsc --noEmit; fi`)).toBe(false)
+    expect(bash(`for i in 1; do ${SF} ${T} npx tsc --noEmit; done`)).toBe(false)
+    expect(bash(`if true; then ${SF} ${T} crontab -r; fi`)).toBe(true)
   })
 })
