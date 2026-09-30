@@ -1252,20 +1252,111 @@ function heredocOwnerRunsBody(string, offset) {
   return runs
 }
 
+// The heredocs of a command, exactly as the regex
+//   /(<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2)([\s\S]*?)(^\s*\3\s*$)/gm
+// matches them, in one pass: [{ offset, open, quote, body, close }]. As that regex, an
+// opener with no closing line read the rest of the command looking for one, and a run
+// of them was quadratic (ffc45c28, measured on develop 6158290b: 20000 unclosed `<<EOF`
+// lines 3.4 s, `<<-EOF` lines 4.6 s; the hook fails open after 10 s). Here the lines
+// that can close a heredoc (only whitespace around a tag) are indexed once, by tag.
+// The regex's own readings are kept: an unquoted tag with no closing line of its own
+// is closed by a line of a shorter prefix of it (the regex backtracks into the tag),
+// `<<<` is read from its second `<`, the closing match starts at the first line start
+// of the whitespace before its tag (\s spans lines), and it ends before the last line
+// break of the whitespace after it.
+export function heredocSpans(command) {
+  const s = String(command ?? '')
+  const n = s.length
+  const out = []
+  if (!s.includes('<<')) return out
+  const isBreak = (i) => { const c = s.charCodeAt(i); return c === 10 || c === 13 || c === 0x2028 || c === 0x2029 }
+  const lineStarts = [0] // every position `^` holds at (after a line break)
+  for (let i = 0; i < n; i++) if (isBreak(i)) lineStarts.push(i + 1)
+  const firstLineStartFrom = (x) => { // the first line start >= x
+    let lo = 0
+    let hi = lineStarts.length
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (lineStarts[mid] < x) lo = mid + 1; else hi = mid }
+    return lo < lineStarts.length ? lineStarts[lo] : -1
+  }
+  // the lines that are only a tag with whitespace around it: by tag, [line start, tag position], in order
+  const tagLines = new Map()
+  for (let k = 0; k < lineStarts.length; k++) {
+    const ls = lineStarts[k]
+    const le = k + 1 < lineStarts.length ? lineStarts[k + 1] - 1 : n
+    let a = ls
+    while (a < le && isWs(s.charCodeAt(a))) a++
+    let b = le
+    while (b > a && isWs(s.charCodeAt(b - 1))) b--
+    if (b > a && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s.slice(a, b))) {
+      const tag = s.slice(a, b)
+      if (!tagLines.has(tag)) tagLines.set(tag, [])
+      tagLines.get(tag).push([ls, a])
+    }
+  }
+  // the closing match of `tag` for a body that starts at bs: [its start, its end], or null
+  const closeFor = (tag, bs) => {
+    const lines = tagLines.get(tag)
+    if (!lines) return null
+    let lo = 0
+    let hi = lines.length
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (lines[mid][0] < bs) lo = mid + 1; else hi = mid }
+    if (lo >= lines.length) return null
+    const a = lines[lo][1]
+    let w = a // the whitespace before the tag, back to the last non-space
+    while (w > 0 && isWs(s.charCodeAt(w - 1))) w--
+    const start = firstLineStartFrom(Math.max(bs, w))
+    let e = a + tag.length // the whitespace after it, then back to its last line break
+    while (e < n && isWs(s.charCodeAt(e))) e++
+    if (e < n) while (!isBreak(e - 1)) e--
+    return [start, e < n ? e - 1 : n]
+  }
+  const OPEN_RX = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)/y
+  let from = 0
+  for (let i = s.indexOf('<<'); i !== -1; i = s.indexOf('<<', i + 1)) {
+    if (i < from) continue
+    OPEN_RX.lastIndex = i
+    const m = OPEN_RX.exec(s)
+    if (!m) continue
+    const quote = m[1]
+    const word = m[2]
+    const tagAt = i + m[0].length - word.length
+    let found = null
+    if (quote) {
+      if (s[tagAt + word.length] === quote) {
+        const c = closeFor(word, tagAt + word.length + 1)
+        if (c) found = [word, tagAt + word.length + 1, c]
+      }
+    } else {
+      for (let k = word.length; k >= 1 && !found; k--) {
+        const c = closeFor(word.slice(0, k), tagAt + k)
+        if (c) found = [word.slice(0, k), tagAt + k, c]
+      }
+    }
+    if (!found) continue
+    const [, bodyStart, [closeStart, closeEnd]] = found
+    out.push({ offset: i, open: s.slice(i, bodyStart), quote, body: s.slice(bodyStart, closeStart), close: s.slice(closeStart, closeEnd) })
+    from = closeEnd
+  }
+  return out
+}
+
 export function stripHeredocBodies(command) {
   const cmd = String(command ?? '')
   if (!/<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*/.test(cmd)) return cmd
-  return cmd.replace(
-    /(<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2)([\s\S]*?)(^\s*\3\s*$)/gm,
-    (full, open, quote, _marker, body, close, offset, string) => {
-      const literal = quote === "'" || quote === '"'
-      if (!literal && (body.includes('$(') || body.includes('`'))) return full
-      // A quoted body the shell will not expand is still executed when an
-      // interpreter/remote-executor owns the redirect -- keep it visible then.
-      if (heredocOwnerRunsBody(string, offset)) return full
-      return `${open}\n${close}`
-    },
-  )
+  let out = ''
+  let at = 0
+  for (const { offset, open, quote, body, close } of heredocSpans(cmd)) {
+    const end = offset + open.length + body.length + close.length
+    const literal = quote === "'" || quote === '"'
+    out += cmd.slice(at, offset)
+    if (!literal && (body.includes('$(') || body.includes('`'))) out += cmd.slice(offset, end)
+    // A quoted body the shell will not expand is still executed when an
+    // interpreter/remote-executor owns the redirect -- keep it visible then.
+    else if (heredocOwnerRunsBody(cmd, offset)) out += cmd.slice(offset, end)
+    else out += `${open}\n${close}`
+    at = end
+  }
+  return out + cmd.slice(at)
 }
 
 export function stripGitCommitMessages(command) {

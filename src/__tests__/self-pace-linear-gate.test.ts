@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 // @ts-expect-error -- plain .mjs hook script, no types
-import { gateDecision, selfPaceShape } from '../../scripts/self-pace-gate.mjs'
+import { gateDecision, heredocSpans, selfPaceShape } from '../../scripts/self-pace-gate.mjs'
 
 // ffc45c28 (teszter 39223/39224, fejlesztes-vezeto 54307): the PreToolUse hook fails OPEN after
 // 10 s, so a gate that is slow on some input is a bypass for whatever that input carries. The
@@ -135,6 +135,47 @@ describe('ffc45c28 on develop: the three A-then-B self-pace patterns in linear t
     within('claude '.repeat(30000) + SCHED, true)
     within('tmux '.repeat(30000) + 'x', false)
     within('nohup '.repeat(30000) + 'x', false)
+  })
+})
+
+describe('ffc45c28 on develop: the heredoc bodies found in one pass (fejlesztes-vezeto 54618)', () => {
+  // develop 6158290b's regex as it was: the reference heredocSpans must equal, match for match
+  const OLD_RX = /(<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2)([\s\S]*?)(^\s*\3\s*$)/gm
+  const oldSpans = (s: string): unknown[] =>
+    [...s.matchAll(OLD_RX)].map((m) => ({ offset: m.index, open: m[1], quote: m[2], body: m[4], close: m[5] }))
+  const ch = (code: number): string => String.fromCharCode(code)
+  it('the same matches as the old regex: its readings of a tag prefix, <<<, line breaks and whitespace lines', () => {
+    const hand = [
+      `cat <<EOF${NL}x${NL}EOF`, `cat <<EOF${NL}EOF`, `cat <<-EOF${NL}\tx${NL}\tEOF${NL}`, `cat <<${Q}EOF${Q}${NL}x${NL}EOF${NL}y`,
+      `cat <<EOFX${NL}x${NL}EOF${NL}`, `cat <<<EOF${NL}x${NL}EOF`, `cat <<${Q}EOF${NL}x${NL}EOF`, `cat <<EOF${NL}x${NL}${NL}${NL}  EOF${NL}${NL}${NL}z`,
+      `cat <<EOF\r${NL}x\r${NL}EOF\r${NL}`, `cat <<EOF\rx\rEOF\r`, `a <<A <<B${NL}x${NL}A${NL}y${NL}B${NL}`, `cat <<EOF${NL}x${NL}EOF x${NL}EOF${NL}`,
+      `cat <<${NL}EOF${NL}x${NL}EOF`, `cat <<EOF`, `cat <<EOF   ${NL}${NL}  EOF`, `cat <<EOF${ch(0x2028)}x${ch(0x2028)}EOF${ch(0x2029)}y`,
+      `cat <<EOF${NL}x${NL}${ch(0xa0)}EOF${ch(0xa0)}${NL}`, `<<<<<<EOF${NL}EOF`, `cat <<ABC${NL}AB${NL}A${NL}`, `cat <<${Q}ABC${Q}${NL}AB${NL}ABC${NL}`,
+    ]
+    for (const s of hand) expect(heredocSpans(s), JSON.stringify(s)).toEqual(oldSpans(s))
+    let seed = 20260930
+    const rnd = (): number => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 4294967296 }
+    const T = ['cat <<EOF', 'cat <<-EOF', `cat <<${Q}EOF${Q}`, 'cat <<"EOF"', 'cat <<EOFX', 'cat <<<EOF', 'cat <<E', 'bash <<X',
+      `tee <<${Q}X`, '<<', 'EOF', '  EOF  ', '\tEOF', 'EOFX', 'EO', 'E', 'X', ' X ', 'x', '', ' ', '\t', '$(date)', 'a <<EOF <<X', 'EOF x']
+    const BR = [NL, NL, NL, '\r' + NL, ' ', '']
+    let withSpans = 0
+    let differ = 0
+    for (let i = 0; i < 20000; i++) {
+      let s = ''
+      const k = 1 + Math.floor(rnd() * 10)
+      for (let j = 0; j < k; j++) s += T[Math.floor(rnd() * T.length)] + BR[Math.floor(rnd() * BR.length)]
+      const want = oldSpans(s)
+      if (want.length) withSpans++
+      if (JSON.stringify(heredocSpans(s)) !== JSON.stringify(want)) differ++
+    }
+    expect(differ).toBe(0)
+    expect(withSpans).toBeGreaterThan(1000)
+    expect(20000 - withSpans).toBeGreaterThan(1000)
+  })
+  it('a run of unclosed openers (quadratic before: 20000 <<EOF lines 3.4 s, <<-EOF lines 4.6 s)', () => {
+    within(`cat <<EOF${NL}`.repeat(20000) + 'crontab -r', true)
+    within(`cat <<-EOF${NL}\t`.repeat(20000) + 'crontab -r', true)
+    within(`cat <<${Q}EOF${Q} x${NL}`.repeat(20000) + 'crontab -r', true)
   })
 })
 
