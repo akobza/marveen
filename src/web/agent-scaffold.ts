@@ -2153,6 +2153,74 @@ export function ensureMessageCloseSection(name: string): void {
   atomicWriteFileSync(claudeMdPath, updated)
 }
 
+// ---- List read: a negative finding only from a COMPLETE list (c4e47223) ----
+//
+// A negative claim read off a list endpoint ("no such card", "0 pending", "no
+// memory of it") is only true when the response was COMPLETE. During a dashboard
+// stop or restart the request is cut or gets no answer at all; `curl -s` says
+// nothing about it, and the head of a cut body can pass for a shorter list with a
+// line counter or a tolerant reader. Reported on this install (2026-09-14, a
+// 14-minute outage): two reads in a row counted 283, then 596 of 774 cards, with
+// HTTP 000, and a duplicate card was opened around it. The endpoint builds the
+// whole list in memory and sends it in one piece, so a cut body is never valid
+// JSON and curl exits 18 on it: the check belongs to the READER, and the reader
+// is the agent, so the rule ships as a section.
+const LISTREAD_BEGIN = '<!-- BEGIN GENERATED: list-read (auto-generated, do not edit by hand) -->'
+const LISTREAD_END = '<!-- END GENERATED: list-read -->'
+const LISTREAD_BLOCK_RE = new RegExp(
+  `${LISTREAD_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${LISTREAD_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+export function buildListReadBody(name: string): string {
+  return [
+    '## Lista-olvasás: nemleges lelet csak teljes válaszból',
+    '',
+    'Egy lista-végpontból (`GET /api/kanban`, `GET /api/messages?agent=`, `GET /api/memories`) levont NEMLEGES',
+    'állítás ("nincs ilyen lap", "0 függő üzenet", "erről nincs emlék") csak akkor igaz, ha a válasz TELJES volt.',
+    'Egy leálló vagy újrainduló dashboard alatt a kérés félbeszakad, vagy választ sem kap; a `curl -s` ezt nem írja',
+    'ki, és egy félbeszakadt törzs eleje egy sor-számlálónak (`grep -c`) vagy egy tűrő olvasónak rövidebb, de',
+    'valódinak látszó lista lehet. Jelentett eset (2026-09-14, 14 perces kiesés): két egymás utáni olvasás 283,',
+    'majd 596 lapot számolt a 774-ből, HTTP 000 mellett, és a kiesés körül duplikátum-lap nyílt.',
+    '',
+    '- A curl kilépési kódját és a HTTP-kódot KÜLÖN mérd, a törzset szigorú JSON-olvasóval olvasd:',
+    '```bash',
+    `code=$(curl -sS -o /tmp/lista-${name}.json -w '%{http_code}' -H "Authorization: Bearer $(cat ${tokenPath})" ${dashboardOrigin}/api/kanban); rc=$?`,
+    `echo "rc=$rc http=$code"; python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" /tmp/lista-${name}.json`,
+    '```',
+    '  A lista csak akkor teljes, ha `rc=0`, `http=200`, és a `json.load` hiba nélkül fut. `rc=18` a félbeszakadt',
+    '  átvitel, `rc=7` a kapcsolat hiánya, a `000` a válasz nélküli kérés.',
+    '- Ha bármelyik feltétel hiányzik, nemleges lelet TILOS: se "nincs ilyen lap", se "0 függő", se új lap',
+    '  nyitása a "nem találtam" alapján. Várj, és olvasd újra, amíg teljes választ kapsz.',
+    '- Darabszámot a JSON elemszámából mondj, ne `grep`-pel számolt sorokból.',
+  ].join('\n')
+}
+
+// Idempotently ensures the list-read block is present and current in the
+// agent's CLAUDE.md; same contract as ensureMessageCloseSection, called from
+// the same two surfaces (web.ts for the main agent, agent-process.ts for the rest).
+export function ensureListReadSection(name: string): void {
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const block = `${LISTREAD_BEGIN}\n${buildListReadBody(name)}\n${LISTREAD_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  const updated = LISTREAD_BLOCK_RE.test(existing)
+    ? existing.replace(LISTREAD_BLOCK_RE, block)
+    : existing.trimEnd() + '\n\n' + block + '\n'
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
 // Idempotently ensures the autonomy-wiring block is present and current in the
 // agent's CLAUDE.md. Called on every startAgentProcess() alongside
 // ensureFleetRosterSection() so that existing agents receive the block
