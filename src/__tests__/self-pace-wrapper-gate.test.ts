@@ -36,6 +36,41 @@ describe('ffc45c28: a scheduler behind an option sudo or a timeout is denied', (
   })
 })
 
+describe('ffc45c28 (2): the other common wrappers and a script handed to a shell (fejlesztes-vezeto 53434)', () => {
+  it('env, nice, nohup, command -p and exec -a with their options', () => {
+    for (const c of ['env -i crontab -r', 'env -u HOME crontab -r', 'env - crontab -r', 'nice -n 10 crontab -r', 'nice -10 crontab -r',
+      'nohup crontab -r', 'nohup at now', 'command -p crontab -r', 'exec -a demo crontab -r']) {
+      expect(bash(c)).toBe(true)
+    }
+  })
+  it('xargs at the head of a pipeline segment, stdbuf, setsid, flock, doas, runuser', () => {
+    for (const c of ['echo x | xargs crontab -r', 'ls | xargs -I{} crontab {}', 'printf x | xargs -0 -n 1 crontab', 'stdbuf -oL crontab -r',
+      'stdbuf -o L crontab -r', 'setsid crontab -r', 'flock /tmp/demo.lock crontab -r', 'doas crontab -r',
+      'runuser -u root -- crontab -r']) {
+      expect(bash(c)).toBe(true)
+    }
+  })
+  it('a script handed to a shell as text: bash -c, sh -c, bash -lc, su -c, flock -c, nested', () => {
+    expect(bash(`bash -c ${Q}crontab -r${Q}`)).toBe(true)
+    expect(bash('sh -c "crontab -r"')).toBe(true)
+    expect(bash(`bash -lc ${Q}at now${Q}`)).toBe(true)
+    expect(bash(`su -c ${Q}crontab -r${Q} root`)).toBe(true)
+    expect(bash(`flock /tmp/demo.lock -c ${Q}crontab -r${Q}`)).toBe(true)
+    expect(bash(`bash -c "sh -c ${Q}crontab -r${Q}"`)).toBe(true)
+    expect(bash(`cd /tmp && bash -c ${Q}systemctl --user enable --now demo-guard.timer${Q}`)).toBe(true)
+  })
+  it('what stays allowed: a read or a lookup, an ordinary shell script, prose that quotes one', () => {
+    expect(bash('env crontab -l')).toBe(false)
+    expect(bash('command -v crontab')).toBe(false)
+    expect(bash(`bash -c ${Q}echo hi; ls -la${Q}`)).toBe(false)
+    expect(bash('nice -n 10 npx tsc --noEmit')).toBe(false)
+    expect(bash('ls | xargs -I{} echo {}')).toBe(false)
+    expect(bash(`echo "bash -c ${Q}crontab -r${Q}"`)).toBe(false)
+    expect(bash(`git commit -m "gate: bash -c ${Q}crontab -r${Q}"`)).toBe(false)
+    expect(bash(`cat > /tmp/demo.sh <<${Q}EOF${Q}${NL}bash -c ${Q}crontab -r${Q}${NL}nohup at now${NL}EOF`)).toBe(false)
+  })
+})
+
 describe('ffc45c28: what stays allowed', () => {
   it('a read behind the wrapper, as without it', () => {
     expect(bash('sudo -n crontab -l')).toBe(false)

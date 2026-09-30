@@ -131,7 +131,12 @@ const SHELL_KEYWORDS = String.raw`(?:(?:do|then|else|elif|if|while|until|!|\{)\s
 // take a value are named, so `sudo -n tee` keeps `tee` as the command; the same
 // for timeout's `-s <signal>` and `-k <duration>` (`timeout -s KILL 60 crontab -r`
 // passed with the earlier `-\S+` branch, which took `KILL` for the duration).
-const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+)\s+)*`
+// The other common wrappers are read the same way (fejlesztes-vezeto 53434, measured
+// 2026-09-30: a scheduler passed behind each): env with options, nice with an
+// adjustment, nohup, command -p (only -p runs the command; -v and -V look it up),
+// exec -a, stdbuf, setsid, flock <file>, doas, runuser, and xargs as the head of a
+// pipeline segment (`... | xargs crontab -r`).
+const WRAPPER_PREFIX = String.raw`(?:(?:sudo(?:\s+(?:-[ugpCDrtUTh]\s*\S+|--(?:user|group|prompt|close-from|chdir|role|type|other-user|command-timeout|host)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*|timeout(?:\s+(?:-[sk]\s*\S+|--(?:signal|kill-after)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|env(?:\s+(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-[A-Za-z]*|--[\w-]+|[A-Za-z_]\w*=\S*))*|nice(?:\s+(?:-n\s*\S+|--adjustment(?:=|\s+)\S+|-\d+))*|nohup|command(?:\s+-p)+|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)(?:=|\s+)\S+))*|setsid(?:\s+(?:-[A-Za-z]+|--[\w-]+))*|flock(?:\s+(?:-[wEe]\s*\S+|--(?:timeout|conflict-exit-code)(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*\s+\S+|doas(?:\s+(?:-u\s*\S+|-[A-Za-z]+))*|runuser(?:\s+(?:-u\s*\S+|--user(?:=|\s+)\S+|-[A-Za-z]+|--[\w-]+))*(?:\s+--)?|xargs(?:\s+(?:-[IdEeLnPsa]\s*\S+|--[\w-]+(?:=\S+)?|-[A-Za-z0]+))*)\s+)*`
 const SCHEDULER_RX = new RegExp(
   String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(?:(?:crontab|systemd-run)\b(?!-)(?!\s*=)|launchctl\b(?!-)(?!\s*=)${LAUNCHCTL_SUBCOMMAND}|(?:batch|at)\b(?!-)(?!\s*=)${AT_INVOCATION})`,
   'i',
@@ -139,6 +144,38 @@ const SCHEDULER_RX = new RegExp(
 // ...but allow a pure READ-listing of one's own schedule (parity with the store /
 // schedule-API read exemptions): crontab -l, launchctl list/print, atq.
 const SCHEDULER_READ_RX = new RegExp(String.raw`(^|${SCHED_BOUNDARY}\s*)${SHELL_KEYWORDS}${WRAPPER_PREFIX}${SCHED_PREFIX}(crontab\s+-l\b|launchctl\s+(?:list|print|dumpstate|blame|examine)\b|atq\b)`, 'i')
+
+// --- a command handed to a shell as text ------------------------------------------
+//
+// `bash -c '<script>'`, `sh -c "<script>"`, `su -c '<script>' <user>` and `flock <file>
+// -c '<script>'` run their quoted argument, which every check here reads as inert text.
+// Measured 2026-09-30 (ffc45c28, fejlesztes-vezeto 53434): `bash -c 'crontab -r'` and
+// `sh -c "crontab -r"` passed. The shell word is looked for at a command position in the
+// MASKED command, so a heredoc body or quoted prose that only mentions one is not read;
+// masking keeps the length, so the quoted argument is then taken from the same place
+// in the command itself and judged as a command of its own (gateDecision, depth <= 3).
+const SHELL_C_RX = new RegExp(
+  String.raw`(?:^|${SCHED_BOUNDARY}|\n)\s*${SHELL_KEYWORDS}${WRAPPER_PREFIX}(?:\S*/)?(?:bash|sh|dash|zsh|ksh|su|runuser|flock)\b[^;&|\n'"]*?\s-[A-Za-z]*c(?=\s)`,
+  'g',
+)
+export function shellCScripts(command) {
+  const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
+  const view = maskInertLiterals(src, { strict: false }) ?? src
+  const out = []
+  for (const m of view.matchAll(SHELL_C_RX)) {
+    let at = m.index + m[0].length
+    while (at < src.length && /[ \t]/.test(src[at])) at++
+    if (src[at] === "'") {
+      const end = src.indexOf("'", at + 1)
+      if (end > at) out.push(src.slice(at + 1, end))
+    } else if (src[at] === '"') {
+      let j = at + 1
+      while (j < src.length && src[j] !== '"') j += src[j] === '\\' ? 2 : 1
+      if (j < src.length) out.push(src.slice(at + 1, j).replace(/\\(["\\$`])/g, '$1'))
+    }
+  }
+  return out
+}
 
 // --- the one systemd-run form this gate allows ----------------------------------
 //
@@ -826,7 +863,7 @@ export function normalizeShellEvasion(seg) {
 }
 
 // Pure decision: does this tool call set up self-pace / self-injection?
-export function gateDecision(toolName, toolInput) {
+export function gateDecision(toolName, toolInput, depth = 0) {
   const name = String(toolName ?? '')
   if (SELF_PACE_TOOLS.has(name)) return { deny: true }
   // Native file tools writing the self-schedule store would bypass any Bash regex.
@@ -852,6 +889,12 @@ export function gateDecision(toolName, toolInput) {
     // it, the owner would read as systemd-run and the body would be blanked.
     const unwrapped = unwrapSfHeavyScope(String(toolInput?.command ?? ''))
     const safeCommand = stripProseArguments(stripDataPayloads(stripGitCommitMessages(stripHeredocBodies(unwrapped))))
+    // A script handed to a shell as text (SHELL_C_RX) is judged as a command of its own.
+    if (depth < 3) {
+      for (const script of shellCScripts(safeCommand)) {
+        if (gateDecision('Bash', { command: script }, depth + 1).deny) return { deny: true }
+      }
+    }
     // Per-segment so an unrelated token elsewhere in a compound command cannot
     // turn a legit read (store inspection, schedule-API GET) into a false deny.
     const naiveSegs = splitSegments(safeCommand)
