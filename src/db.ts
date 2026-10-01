@@ -4027,6 +4027,11 @@ export function backfillNeedsWarning(pending: number, embedded: number): boolean
   return pending > 0 && embedded === 0
 }
 
+// The host (and port) of the embedding endpoint for a log line: no scheme, path or userinfo.
+export function embedHostOf(url: string): string {
+  try { return new URL(url).host } catch { return 'unparseable' }
+}
+
 export async function generateEmbedding(text: string): Promise<number[] | null> {
   try {
     const resp = await fetch(`${EMBED_URL}/api/embeddings`, {
@@ -4035,6 +4040,20 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
       body: JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 2000) }),
       signal: AbortSignal.timeout(TOOL_TIMEOUTS['ollama-embedding']),
     })
+    if (!resp.ok) {
+      // 22cedf69: an HTTP error answer used to be parsed as JSON and came back as null with no log line at all, so a
+      // backend answering 500/503 under load stayed unseen for days (0c053df4). Same rule as an unreachable backend:
+      // the first failure of an outage at WARN, repeats at debug. The host only, never the full URL.
+      const level = decideEmbeddingFailureLevel(embeddingBackendWarned)
+      embeddingBackendWarned = true
+      logger[level](
+        { status: resp.status, embedHost: embedHostOf(EMBED_URL), embedModel: EMBED_MODEL },
+        level === 'warn'
+          ? `Embedding generation failed -- the embedding backend answered HTTP ${resp.status}. Memory search runs FTS-only until it recovers; further failures are logged at debug.`
+          : 'Embedding generation failed (backend still answering an error)',
+      )
+      return null
+    }
     const data = await resp.json() as { embedding?: number[] }
     if (!data.embedding || data.embedding.length === 0) return null
     embeddingBackendWarned = false

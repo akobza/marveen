@@ -46,10 +46,14 @@ export default defineConfig({
     //    the live-install gate above: that one inspects the CHECKOUT, and ~/.ssh is
     //    HOME-scoped -- a clean worktree run leaked 62 real keys (ENROLL813,
     //    2026-09-15). A seam, not a gate: it sets state, so it lives in its own file.
+    //  - ollama-test-url-seam: point OLLAMA_URL and EMBED_URL at a dead loopback
+    //    port, so a run from a checkout with no .env never reaches a live Ollama on
+    //    the host (22cedf69). A seam like the one above: an existing value is kept.
     setupFiles: [
       './src/__tests__/setup/assert-not-live-install.ts',
       './src/__tests__/setup/assert-supported-node.ts',
       './src/__tests__/setup/default-ssh-dir-seam.ts',
+      './src/__tests__/setup/ollama-test-url-seam.ts',
     ],
   },
 })

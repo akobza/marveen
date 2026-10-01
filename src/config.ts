@@ -357,7 +357,13 @@ export const FLEET_PYTHON_VENV = resolveFleetVenvDir(PROJECT_ROOT, homedir(), pr
 // existing installs keep the same allowlist as before. Not a Settings-page
 // key, so it stays a plain env read (not routed through the override layer).
 export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
-export const OLLAMA_URL = cfg('OLLAMA_URL') ?? 'http://localhost:11434'
+// MARVEEN_TEST_OLLAMA_URL is a TEST seam (card 22cedf69): src/__tests__/setup/ollama-test-url-seam.ts sets it in every
+// vitest worker, and while it is set it is the Ollama address for OLLAMA_URL and EMBED_URL alike, ahead of
+// config-overrides.json and .env. Without it a checkout with no .env falls back to http://localhost:11434, and on a host
+// that runs Ollama for production that is the production instance: the suite's memory saves fired embedding requests
+// at it (measured 2026-09-29/30, card 0c053df4). Nothing outside the suite sets it, so an install behaves as before.
+const TEST_OLLAMA_URL = process.env['MARVEEN_TEST_OLLAMA_URL'] || undefined
+export const OLLAMA_URL = TEST_OLLAMA_URL ?? cfg('OLLAMA_URL') ?? 'http://localhost:11434'
 // Ollama model that tiers memories during /api/memories/import. Empty = off:
 // every chunk goes to warm with no model call, instead of guessing a model.
 export const MEMORY_IMPORT_CATEGORIZE_MODEL = (cfg('MEMORY_IMPORT_CATEGORIZE_MODEL') ?? '').trim()
@@ -485,7 +491,7 @@ export const HEARTBEAT_CALENDAR_ID = (cfg('HEARTBEAT_CALENDAR_ID') ?? '').trim()
 //
 // Empty EMBED_URL = use OLLAMA_URL and EMBED_DIMS 0 = no truncation, so an
 // install that sets nothing keeps exactly the previous behaviour.
-export const EMBED_URL = cfg('EMBED_URL') || OLLAMA_URL
+export const EMBED_URL = TEST_OLLAMA_URL || cfg('EMBED_URL') || OLLAMA_URL
 export const EMBED_MODEL = cfg('EMBED_MODEL') ?? 'nomic-embed-text'
 const rawEmbedDims = parseInt(cfg('EMBED_DIMS') ?? '0', 10)
 export const EMBED_DIMS = Number.isFinite(rawEmbedDims) && rawEmbedDims > 0 ? rawEmbedDims : 0
