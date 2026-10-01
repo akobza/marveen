@@ -1,23 +1,60 @@
 #!/usr/bin/env python3
 """
-Shared quiet-hours check for the Telegram progress hooks (submit / stop / watchdog).
+Shared quiet-hours check for the Telegram hooks (submit / stop / reply-guard / watchdog).
 
 Config: <state_dir>/quiet-hours.json, e.g.
-  {"<OWNER_CHAT_ID>": {"start": "23:00", "end": "07:00", "tz": "Europe/Budapest"}}
-Missing, empty or unparseable config -> in_quiet() is False for every chat, so the
-hooks behave exactly as before. Windows may wrap midnight (start > end).
-Why: an owner asked (three times, last 2026-09-11 23:17Z) for NO message between
-23:00 and 07:00, not even an auto-reply; on 2026-09-12 00:0xZ the Stop hook's
-transcript fallback delivered a message into that window anyway.
+  {"<chat_id>": {"start": "23:00", "end": "07:00", "tz": "Europe/Budapest"}}
+Windows may wrap midnight (start > end).
+
+Why this file lives in the repo (card e6680b3c): until 2026-09-22 it existed ONLY in
+~/.claude/hooks, which is not version controlled. On 2026-09-12 15:32:53Z an update run
+(update.sh -> scripts/sync-hooks.sh -> install-*-hook.sh) copied the repo versions of the
+sibling hooks over their locally patched copies and the quiet-hours branch was lost; the
+module itself survived only because it was not on the installer's copy list. The hooks now
+import it from their OWN directory, so an installer can never again ship a hook whose
+quiet-hours dependency is missing.
+
+⛔ FAIL-OPEN IS THE DEFAULT, AND THAT IS DELIBERATE: a missing or unparseable config makes
+in_quiet() False for every chat, i.e. the hooks behave as if no quiet hours were configured.
+That is the right default for a notification path (never block delivery because a config is
+absent) -- but it is silent, and a silent fail-open is exactly how the 2026-09-12 regression
+went unnoticed for ten days. Callers that want to KNOW must ask config_state() and log it;
+see the reply-guard and the watchdog for the shape.
 """
 import os, json, datetime
 
 CONFIG_NAME = "quiet-hours.json"
 
+# config_state() return values -- a caller can log these; they are not error conditions.
+STATE_OK = "ok"              # file exists, parsed, at least one chat configured
+STATE_EMPTY = "empty"        # file exists and parses, but configures no chat
+STATE_MISSING = "missing"    # no such file at state_dir
+STATE_UNREADABLE = "unreadable"  # exists but could not be read or parsed
+
+
+def config_path(state_dir):
+    return os.path.join(state_dir, CONFIG_NAME)
+
+
+def config_state(state_dir):
+    """Why a quiet-hours lookup found nothing. ⛔ The point is to tell MISSING from EMPTY:
+    both make in_quiet() return False, but only one of them is a deployment defect."""
+    path = config_path(state_dir)
+    if not os.path.exists(path):
+        return STATE_MISSING
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return STATE_UNREADABLE
+    if not isinstance(d, dict):
+        return STATE_UNREADABLE
+    return STATE_OK if d else STATE_EMPTY
+
 
 def load(state_dir):
     try:
-        with open(os.path.join(state_dir, CONFIG_NAME), encoding="utf-8") as f:
+        with open(config_path(state_dir), encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
     except Exception:
