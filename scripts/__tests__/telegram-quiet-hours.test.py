@@ -92,7 +92,14 @@ print("\n=== C) A WATCHDOG KAPUJA")
 wd = betolt("telegram_progress_watchdog", "telegram_progress_watchdog.py")
 ok("a _quiet_chats fuggveny letezik", hasattr(wd, "_quiet_chats"))
 with tempfile.TemporaryDirectory() as d:
-    config_ir(d, {CHAT: {"start": "00:00", "end": "23:59", "tz": TZ}})   # gyakorlatilag mindig csendes
+    # A window around NOW, not "00:00-23:59": [start, end) leaves 23:59 out, so this check failed
+    # one minute a day (measured 2026-10-01 21:59Z, 23:59 Budapest). The module handles a window
+    # that wraps midnight, so two hours around the local time is quiet whatever the clock says.
+    from zoneinfo import ZoneInfo
+    _most = datetime.datetime.now(ZoneInfo(TZ))
+    _kezd = (_most - datetime.timedelta(hours=1)).strftime("%H:%M")
+    _vege = (_most + datetime.timedelta(hours=1)).strftime("%H:%M")
+    config_ir(d, {CHAT: {"start": _kezd, "end": _vege, "tz": TZ}})
     pend = [{"chat_id": CHAT, "message_id": 1}, {"chat_id": "999", "message_id": 2}]
     csendes = wd._quiet_chats(d, pend)
     ok("a csendes chatet megtalalja", CHAT in [str(x) for x in csendes], str(csendes))
