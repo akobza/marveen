@@ -293,6 +293,61 @@ export function detectsPastePlaceholder(pane: string): boolean {
 // HORIZONTAL. At least 10 in a run to ignore stray `-` glyphs.
 const BOX_SEP_RX = /^─{10,}/
 
+// THE LIVE FOOTER IS THE ONE RIGHT BELOW THE INPUT BOX (card a38182bd). Every
+// idle-footer probe below used to accept a footer-looking line ANYWHERE in the
+// capture (IDLE_FOOTER_RX on the whole pane, or the FIRST matching line). The
+// visible screen does carry such lines: a tool that printed a raw footer (a
+// footer-measuring script, a quoted capture) leaves `⏵⏵ bypass permissions on
+// (shift+tab to cycle)` above whatever comes next. Measured 2026-09-30 with
+// The tester's probe (card a58a8ede) on the develop file and on the v2: a
+// permission dialog, a Bash dialog, the MCP menu or a parked input under such a
+// line read state=idle, ready=true, and the dialog and menu detectors said
+// false -- the router would deliver into the dialog and the monitor would not
+// see it.
+//
+// So a footer line counts only when it is the LAST footer-looking line of the
+// capture AND a box separator sits at most FOOTER_BELOW_BOX_MAX_LINES rows above
+// it. Measured on 74 live fleet panes (three captures, 2026-09-30 06:54Z,
+// 08:26Z, 10:08Z): the footer was 2 rows below the box in 63 (a statusline
+// between), 1 row in 6, 5 rows in 1 (a three-line warning block and the
+// statusline between), and absent in 4; 8 leaves room above the measured 5.
+// A real footer farther than that reads 'unknown', never 'idle': the router
+// waits instead of delivering, which is the safe direction.
+const FOOTER_BELOW_BOX_MAX_LINES = 8
+
+/** Index of the live idle footer line, or -1 (see FOOTER_BELOW_BOX_MAX_LINES). */
+function liveFooterIndex(lines: string[]): number {
+  let footerIdx = -1
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (IDLE_FOOTER_RX.test(lines[i])) { footerIdx = i; break }
+  }
+  if (footerIdx < 0) return -1
+  for (let k = 1; k <= FOOTER_BELOW_BOX_MAX_LINES && footerIdx - k >= 0; k++) {
+    if (BOX_SEP_RX.test(lines[footerIdx - k])) return footerIdx
+  }
+  return -1
+}
+
+function hasLiveFooter(pane: string): boolean {
+  return liveFooterIndex(pane.split('\n')) >= 0
+}
+
+// The dialog and menu detectors take the footer as a VETO: the real prompt is
+// live, so dialog text on screen can only be a quote. Two of them answer with
+// keystrokes (the model-consent and the first-run dialogs), so besides the live
+// footer a footer-looking LAST content line still vetoes: a frame without the
+// input box keeps the quote-proofing it had (none of the 74 measured panes
+// showed one, but a keystroke path should not rest on that). This does not
+// bring back the a38182bd hole: a dialog, a menu or a box always renders BELOW
+// a footer line a tool printed, so that line is never the last one.
+function footerVetoesDialog(pane: string): boolean {
+  const lines = pane.split('\n')
+  if (liveFooterIndex(lines) >= 0) return true
+  let end = lines.length
+  while (end > 0 && lines[end - 1].trim() === '') end--
+  return end > 0 && IDLE_FOOTER_RX.test(lines[end - 1])
+}
+
 // Prompt line inside the input box. `❯` followed by at least one
 // horizontal whitespace and then a non-whitespace character means the
 // user (or a send-keys that didn't submit) parked text there.
@@ -513,12 +568,9 @@ const ERROR_BLOCK_LINES = 4
 export function detectsThinkingBlockError(pane: string): boolean {
   if (!pane) return false
   const lines = pane.split('\n')
-  // Find the footer from the bottom: the live footer is the last line of
-  // the pane, so a footer-looking line quoted in scrollback must not win.
-  let footerIdx = -1
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (IDLE_FOOTER_RX.test(lines[i])) { footerIdx = i; break }
-  }
+  // The live footer, as every probe reads it (liveFooterIndex): found from the
+  // bottom, so a footer-looking line quoted in scrollback must not win.
+  const footerIdx = liveFooterIndex(lines)
   if (footerIdx < 0) return false
   const start = Math.max(0, footerIdx - ERROR_LIVE_TAIL_LINES)
   const tail = lines.slice(start, footerIdx)
@@ -550,10 +602,11 @@ export function detectsThinkingBlockError(pane: string): boolean {
 // or a log line:
 //   (a) Not busy: a live turn (spinner / token counter / esc-to-interrupt) is
 //       never a parked menu.
-//   (b) No idle footer: a real modal hides the permission/shortcuts footer.
-//       capturePane uses `capture-pane -p` (visible screen only, no
-//       scrollback), so a quoted footer cannot linger from a past turn -- an
-//       idle footer present means the normal prompt is live, not a menu.
+//   (b) No idle footer where the prompt draws it (footerVetoesDialog): a real
+//       modal hides the permission/shortcuts footer below the input box. A
+//       footer-looking line higher up does not count: capturePane reads the
+//       visible screen only, but that screen can still show a raw footer a
+//       tool printed (card a38182bd).
 //   (c) The dismiss/navigation hint must sit in the live footer region (the
 //       bottom few lines), not anywhere in the pane, so a message body that
 //       quotes "Esc to cancel" does not trigger it.
@@ -578,7 +631,7 @@ export function detectsBlockingMenu(pane: string): boolean {
   const lines = pane.split('\n')
   const footerRegion = liveTailRegion(lines, MENU_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
-  if (IDLE_FOOTER_RX.test(pane)) return false
+  if (footerVetoesDialog(pane)) return false
   return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
 }
 
@@ -689,9 +742,9 @@ export function permissionPromptSummary(pane: string): PermissionPromptSummary |
 // picker (nobody can log in on the operator's behalf).
 //
 // Guards against a healthy session that merely quotes the dialog text follow
-// detectsBlockingMenu's discipline: a busy pane is never a gate, and a visible
-// idle footer means the real prompt is live (capture-pane -p sees only the
-// visible screen, so a quoted phrase always coexists with the live footer).
+// detectsBlockingMenu's discipline: a busy pane is never a gate, and an idle
+// footer where the prompt draws it means the real prompt is live
+// (footerVetoesDialog; a quoted phrase coexists with that footer).
 // The tmux-visible selection marker Claude Code draws on the active option.
 const CURSOR_GLYPH = '\u276f'
 
@@ -850,7 +903,7 @@ export function detectsFirstRunGate(pane: string): FirstRunGateKind | null {
   }
   const footerRegion = liveTailRegion(lines, LIVE_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return null
-  if (IDLE_FOOTER_RX.test(pane)) return null
+  if (footerVetoesDialog(pane)) return null
   for (const g of FIRST_RUN_GATES) {
     if (!g.rx.test(pane)) continue
     // The welcome banner also heads the NORMAL fresh-session layout (logo +
@@ -882,10 +935,11 @@ export function detectsFirstRunGate(pane: string): FirstRunGateKind | null {
 // uses usage credits" variant is covered without a new detector.
 //
 // Guards follow detectsFirstRunGate's discipline: a busy pane is never the
-// dialog, and a visible idle footer means the real prompt is live -- so a
-// reply/inter-agent message that merely QUOTES the dialog text (which
-// happened the very day this shipped) can never trigger a keystroke. The
-// confirm hint must sit in the live footer region, not anywhere in the pane.
+// dialog, and an idle footer where the prompt draws it (footerVetoesDialog)
+// means the real prompt is live -- so a reply/inter-agent message that merely
+// QUOTES the dialog text (which happened the very day this shipped) can never
+// trigger a keystroke.
+// The confirm hint must sit in the live footer region, not anywhere in the pane.
 const MODEL_CONSENT_TITLE_RX = /(?:now uses|runs on|requires) usage credits/
 const MODEL_CONSENT_CONTINUE_RX = /1\.\s*Continue with /
 const MODEL_CONSENT_CONFIRM_RX = /Enter to confirm/
@@ -925,7 +979,7 @@ export function detectsPermissionDialog(pane: string): boolean {
   }
   const footerRegion = liveTailRegion(lines, LIVE_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
-  if (IDLE_FOOTER_RX.test(pane)) return false
+  if (footerVetoesDialog(pane)) return false
   return PERMISSION_AMEND_RX.test(footerRegion)
     || (PERMISSION_QUESTION_RX.test(pane) && PERMISSION_YES_RX.test(pane))
 }
@@ -939,7 +993,7 @@ export function detectsModelConsentDialog(pane: string): boolean {
   }
   const footerRegion = liveTailRegion(lines, LIVE_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
-  if (IDLE_FOOTER_RX.test(pane)) return false
+  if (footerVetoesDialog(pane)) return false
   return MODEL_CONSENT_TITLE_RX.test(pane)
     && MODEL_CONSENT_CONTINUE_RX.test(pane)
     && MODEL_CONSENT_CONFIRM_RX.test(footerRegion)
@@ -1113,7 +1167,7 @@ export function detectPaneState(
   // defer rather than pile a second prompt on.
   if (detectsPastePlaceholder(pane)) return 'busy'
 
-  if (!IDLE_FOOTER_RX.test(pane)) {
+  if (!hasLiveFooter(pane)) {
     // Footer-less fresh-session / welcome-screen: a PARKED \u276F input box still
     // means the agent has a delivered message waiting to submit. Classify it
     // 'typing' (not 'unknown') so the stuck-input recovery stack can see and
@@ -1132,7 +1186,7 @@ export function detectPaneState(
   // Scan UPWARDS from the footer so we stay inside the live box and
   // don't pick up historical ❯ lines from scrollback.
   const lines = pane.split('\n')
-  const footerIdx = lines.findIndex(l => IDLE_FOOTER_RX.test(l))
+  const footerIdx = liveFooterIndex(lines)
   if (footerIdx >= 0) {
     let bottomSep = -1
     for (let i = footerIdx - 1; i >= 0; i--) {
@@ -1233,7 +1287,7 @@ function liveInputBoxFooterless(lines: string[]): string | null {
 
 function liveInputBox(pane: string): string | null {
   const lines = pane.split('\n')
-  const footerIdx = lines.findIndex(l => IDLE_FOOTER_RX.test(l))
+  const footerIdx = liveFooterIndex(lines)
   if (footerIdx < 0) return liveInputBoxFooterless(lines)
   let bottomSep = -1
   for (let i = footerIdx - 1; i >= 0; i--) {
@@ -1347,7 +1401,7 @@ export function shouldRetrySubmit(
 
   // Without an idle footer the pane is either not Claude Code or in an
   // unknown render state. Be conservative and skip.
-  if (!IDLE_FOOTER_RX.test(pane)) return false
+  if (!hasLiveFooter(pane)) return false
 
   const inputBox = liveInputBox(pane)
   if (inputBox == null) return false
@@ -1829,7 +1883,7 @@ export function overfullParkedInputTail(pane: string): string | null {
     if (rx.test(busyRegion)) return null
   }
   if (BUSY_ESC_TO_INTERRUPT_RX.test(liveTailRegion(lines, LIVE_FOOTER_REGION_LINES))) return null
-  const footerIdx = lines.findIndex(l => IDLE_FOOTER_RX.test(l))
+  const footerIdx = liveFooterIndex(lines)
   if (footerIdx < 0) return null
   let bottomSep = -1
   for (let i = footerIdx - 1; i >= 0; i--) {
