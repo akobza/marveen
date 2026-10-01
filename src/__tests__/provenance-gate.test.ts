@@ -613,6 +613,41 @@ describe('provenance-gate: system directive row verification (CTXBORITEK919)', (
       expect(log).not.toContain('trailer')
     })
 
+    // c515dc07: the agent's own background-task notice can also arrive as the remainder of a
+    // verified directive (the harness joined the two into one prompt). The trace rules hold on
+    // this path as well: the one log line carries the agent and the task id, an internal
+    // category asks for no message, and an unwritable log brings the lead notice back.
+    const OWN_TASK = [
+      '[SYSTEM NOTIFICATION - NOT USER INPUT]',
+      '<task-notification>',
+      '<task-id>c515trailer1</task-id>',
+      '<summary>A figyelo leallt: a lanc restart utan ujra indul</summary>',
+      '</task-notification>',
+    ].join('\n')
+
+    it('directive + an own background-task notice: trailer-self-task, agent and task id in the one log line, no message', () => {
+      const db = makeDb([[65, 'system', 'testagent', BODY, 'delivered']])
+      const dir = mkdtempSync(join(tmpdir(), 'prov-dir-'))
+      const { out, log } = runDirective(`${HEADER(65)}\n${BODY}\n\n${OWN_TASK}`, AGENT_CWD, db, dir)
+      expect(out).toContain('SAJAT HATTER-TASK EREDMENYE')
+      expect(out).toContain('A NYOM MEGVAN')
+      expect(out).not.toContain('/api/messages')
+      const lines = log.trim().split('\n')
+      expect(lines).toHaveLength(1)
+      expect(lines[0].split('\t')[2]).toMatch(
+        /^directive-verified-trailer,age=\d+s,trailer-self-task,self-task,agent=testagent,task=c515trailer1,restart$/,
+      )
+    })
+
+    it('directive + an own background-task notice with an unwritable log: the lead notice comes back here too', () => {
+      const db = makeDb([[66, 'system', 'testagent', BODY, 'delivered']])
+      const { out } = runDirective(`${HEADER(66)}\n${BODY}\n\n${OWN_TASK}`, AGENT_CWD, db, join(tmpdir(), 'no-such-dir-c515trailer'))
+      expect(out).toContain('SAJAT HATTER-TASK EREDMENYE')
+      expect(out).toContain('most NEM irhato')
+      expect(out).toContain('JELEZD a flotta-vezetonek')
+      expect(out).toContain('/api/messages')
+    })
+
     it('a stale row with a trailer is still unverifiable: the time bound is not bypassed by appending', () => {
       const db = makeDb([[65, 'system', 'testagent', BODY, 'delivered', 7200]])
       const { out } = runDirective(`${HEADER(65)}\n${BODY}\n\n${PEER}`, AGENT_CWD, db)
