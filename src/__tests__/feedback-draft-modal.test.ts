@@ -170,10 +170,26 @@ describe('detectsFeedbackDraftModal', () => {
     expect(detectsFeedbackDraftModal('   \n  \n')).toBe(false)
   })
 
-  it('documents WHY the detector is needed: the pane still reads idle', () => {
-    // This is the whole hazard. detectPaneState sees a normal idle footer, so
-    // delivery believes the pane is ready and writes into a swallowing modal.
-    expect(detectPaneState(REAL_MODAL_PANE)).toBe('idle')
+  it('reads the modal pane NOT idle, though its idle footer is on screen (b235cb20)', () => {
+    // The hazard of 2026-08-31: the footer said idle and delivery wrote into the
+    // swallowing modal. Since card b235cb20 detectPaneState checks the modal after
+    // the footer, so the injectors take the not-ready path, where
+    // clearFeedbackModalAndRecheck dismisses it.
+    expect(detectPaneState(REAL_MODAL_PANE)).toBe('unknown')
+  })
+
+  it('with the bare counter footer: the modal is not idle, the counter left after it is (b235cb20)', () => {
+    // The footer captured live on 2026-10-01; the modal box is the agent-samu capture's.
+    const footer = '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · 1 feedback draft'
+    const lines = REAL_MODAL_PANE.split('\n')
+    expect(lines[5].startsWith('╭')).toBe(true)
+    expect(lines[10].startsWith('╰')).toBe(true)
+    const withModal = [...lines.slice(0, -1), footer].join('\n')
+    const afterDismiss = [...lines.slice(0, 5), ...lines.slice(11, -1), footer].join('\n')
+    expect(detectsFeedbackDraftModal(withModal)).toBe(true)
+    expect(detectPaneState(withModal)).toBe('unknown')
+    expect(detectsFeedbackDraftModal(afterDismiss)).toBe(false)
+    expect(detectPaneState(afterDismiss)).toBe('idle')
   })
 })
 

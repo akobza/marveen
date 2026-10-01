@@ -95,7 +95,18 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // is indented (`  ⎿  ` on its first line, five spaces after), so it cannot
 // pass for the live footer; without this rule a dialog, a menu or a parked
 // input under such a line read idle (the tester, card a58a8ede).
-const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))|(?:^|\n) {2}[^\w\s]+ (?:[A-Za-z][\w-]* ){1,3}on · \d+ (?:shells?|monitors?)(?:, \d+ (?:shells?|monitors?))*[ \t]*(?=\r?\n|$)|\? for shortcuts/
+//
+// THE FEEDBACK-DRAFT COUNTER (card b235cb20). A session holding a
+// self-drafted feedback report adds ` · 1 feedback draft` after the
+// counters (captured live from a fleet pane on 2026-10-01: `⏵⏵ bypass
+// permissions on · 1 shell, 1 monitor · 1 feedback draft`), and the counter
+// stays after the draft modal closes. The bare form did not allow it, so such
+// a pane read 'unknown' with or without the modal and the router did not
+// deliver while the counter stood. It is accepted after the counters or on its
+// own (the alone and the plural forms are not captured, they follow the shape),
+// still as the whole rest of the line. The modal itself is not idle: see
+// detectsFeedbackDraftModal, which detectPaneState checks after the footer.
+const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))|(?:^|\n) {2}[^\w\s]+ (?:[A-Za-z][\w-]* ){1,3}on(?: · \d+ (?:shells?|monitors?)(?:, \d+ (?:shells?|monitors?))*(?: · \d+ feedback drafts?)?| · \d+ feedback drafts?)[ \t]*(?=\r?\n|$)|\? for shortcuts/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
@@ -1008,9 +1019,13 @@ export function detectsModelConsentDialog(pane: string): boolean {
 //   │ 1 to review · 2 to send · 0 to dismiss       │
 //   ╰──────────────────────────────────────────────╯
 // Unlike the resume/consent modals this one leaves the NORMAL IDLE FOOTER on
-// screen ("bypass permissions on … · 1 feedback draft"), so detectPaneState
-// still reads the pane as idle and delivery keeps "succeeding" into a pane
-// that swallows the keystrokes. IDLE_FOOTER_RX is therefore NOT usable as a
+// screen ("bypass permissions on … · 1 feedback draft"), so the footer alone
+// reads idle: on 2026-08-31 delivery kept "succeeding" into a pane that
+// swallowed the keystrokes. Since card b235cb20 detectPaneState checks this
+// detector after the footer and reads the pane 'unknown' while the modal is
+// up, so every injector takes its not-ready path, where
+// clearFeedbackModalAndRecheck dismisses the modal and asks again; the counter
+// left in the footer after that reads idle. IDLE_FOOTER_RX is NOT usable as a
 // negative guard here, and quote-proofing has to come from somewhere else:
 // the option line must sit INSIDE the modal's box border. A message that
 // merely quotes "1 to review · 2 to send · 0 to dismiss" renders in the
@@ -1179,6 +1194,10 @@ export function detectPaneState(
     }
     return 'unknown'
   }
+
+  // The feedback-draft modal keeps the idle footer on screen (card b235cb20):
+  // not ready, so the injectors take the not-ready path that dismisses it.
+  if (detectsFeedbackDraftModal(pane)) return 'unknown'
 
   if (detectsThinkingBlockError(pane)) return 'error'
 

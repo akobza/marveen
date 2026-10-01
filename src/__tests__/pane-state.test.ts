@@ -583,6 +583,27 @@ describe('detectPaneState', () => {
     }
   })
 
+  // Card b235cb20: the feedback-draft counter after the counters (the first line captured live from a fleet pane
+  // on 2026-10-01, byte for byte) and the counter left after the draft modal closes. The alone and the plural
+  // forms are not captured; they follow the shape.
+  it('reads the feedback-draft counter in the bare footer as idle', () => {
+    const live = modeFooter('  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · 1 feedback draft')
+    expect(detectPaneState(live)).toBe('idle')
+    expect(isReadyForPrompt(live)).toBe(true)
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 feedback draft'))).toBe('idle')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 2 shells · 2 feedback drafts'))).toBe('idle')
+  })
+
+  it('keeps the bare footer rules for the feedback-draft counter', () => {
+    for (const tail of [
+      '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback draft pending', // more text after it on the line
+      '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback d…', // cut on a narrow pane: still unknown
+      '  ⏵⏵ bypass permissions on · tasks · 1 feedback draft', // not directly after the mode
+    ]) {
+      expect(detectPaneState(modeFooter(tail))).toBe('unknown')
+    }
+  })
+
   // The tester (card a58a8ede): a RAW bare footer line in the visible pane -- the output of
   // `tmux capture-pane ... | tail -1` in a Bash tool result -- must not be taken for the footer.
   it('keeps a parked input typing under a raw bare footer line in tool output', () => {
