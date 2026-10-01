@@ -68,6 +68,16 @@ describe('overfullParkedInputTail', () => {
     expect(overfullParkedInputTail(PARKED_FITS)).toBeNull()
   })
 
+  // a38182bd (the tester): the live footer is the LAST footer line, so a parked text that itself quotes a
+  // footer line does not hide the box's bottom separator.
+  it('finds the tail when the parked text itself quotes a footer line', () => {
+    const rows = wrap(PROMPT).slice(-5)
+    const quoting = [...rows.slice(0, 2), '  ⏵⏵ bypass permissions on (shift+tab to cycle)', ...rows.slice(2), SEP, FOOTER, ''].join('\n')
+    const tail = overfullParkedInputTail(quoting)
+    expect(tail).not.toBeNull()
+    expect(tail!.endsWith('</scheduled-task>')).toBe(true)
+  })
+
   it('is null while the pane is busy', () => {
     expect(overfullParkedInputTail(BUSY_OVERFULL)).toBeNull()
   })

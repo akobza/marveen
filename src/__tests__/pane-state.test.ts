@@ -2126,6 +2126,34 @@ describe('detectsPermissionDialog', () => {
   })
 })
 
+// The tester (card a38182bd, ALACSONY): four call sites of the live footer were not pinned one by one -- the dialog
+// veto's live-footer branch, liveInputBox, the retry gate (and overfullParkedInputTail, in
+// sched-overfull-parked-input.test.ts). Each test below fails when its site goes back to the whole pane or to the
+// FIRST footer-looking line.
+describe('the live footer at each call site (a38182bd)', () => {
+  // The live prompt with rows after its footer: the footer is live but not the last content line.
+  const promptWithRowsAfterFooter = (above: string[]) => [...above, SEP, '❯ ', SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents', '  (agent row 1)', '  (agent row 2)'].join('\n')
+
+  it('the dialog and menu vetoes take the live footer even when rows follow it', () => {
+    expect(detectsBlockingMenu(promptWithRowsAfterFooter(['  ↑/↓ to navigate · Enter to confirm · Esc to cancel']))).toBe(false)
+    expect(detectsPermissionDialog(promptWithRowsAfterFooter(['  Do you want to proceed?', '  ❯ 1. Yes', '    2. No']))).toBe(false)
+  })
+
+  it('reads a parked input typing in a footerless frame with a raw footer line higher up', () => {
+    const footerless = [RAW_OLD_FOOTER_SCROLLBACK, '', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP].join('\n')
+    expect(detectPaneState(footerless)).toBe('typing')
+  })
+
+  it('the retry gate and the box it reads take the live footer, not the first footer-looking line', () => {
+    // A raw footer higher up does not hide the live box with the parked payload ...
+    expect(shouldRetrySubmit(RAW_OLD_FOOTER_SCROLLBACK + '\n' + STUCK_VERBATIM, PAYLOAD_HINT)).toBe(true)
+    // ... and does not stand in for a live footer in a frame that has none (the gate's conservative skip).
+    const footerlessPayload = [RAW_OLD_FOOTER_SCROLLBACK, '', SEP, `❯ ${PAYLOAD_HINT} cycle-043`, SEP].join('\n')
+    expect(shouldRetrySubmit(footerlessPayload, PAYLOAD_HINT)).toBe(false)
+  })
+})
+
 describe('detectsPastePlaceholder', () => {
   it('detects the `[Pasted text #N +X chars]` stub', () => {
     expect(detectsPastePlaceholder(PENDING_PASTE)).toBe(true)
