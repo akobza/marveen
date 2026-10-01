@@ -90,9 +90,14 @@ def probe(guard_path):
     sys.modules["ledger_lib"] = fake_ledger
 
     # in_quiet takes now=None -> datetime.now(tz); make it follow the fake clock.
-    sys.path.insert(0, os.path.join(REPO, "scripts", "hooks"))
-    sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+    # The module is the repo's, next to the guard: since e6680b3c the guard imports it from its own
+    # directory, and a copy under ~/.claude/hooks is not what ships. Measured 2026-10-01: the copy
+    # there had no config_state(), and a probe that preferred it crashed the merged guard.
+    hooks_dir = os.path.join(REPO, "scripts", "hooks")
+    sys.path.insert(0, hooks_dir)
     import telegram_quiet_hours as q
+    assert os.path.dirname(os.path.abspath(q.__file__)) == hooks_dir, (
+        "the probe must measure the repo's quiet-hours module, got %s" % q.__file__)
     real_in_quiet = getattr(q, "_real_in_quiet", q.in_quiet)
     q._real_in_quiet = real_in_quiet
     q.in_quiet = lambda sd, cid, now=None: real_in_quiet(
