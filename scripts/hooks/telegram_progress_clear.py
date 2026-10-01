@@ -168,12 +168,20 @@ def main():
 
     # Already nudged once (or loop guard tripped) and STILL no reply -> guaranteed
     # fallback: deliver the agent's final answer to the chat, then clear.
+    # Quiet hours: never deliver the transcript fallback into an owner's window
+    # (measured 2026-09-22 21:1xZ: fallback-delivered=True to <OWNER_CHAT_ID> at 23:1x Bp).
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import telegram_quiet_hours as _q
+        quiet = {str(p.get("chat_id")) for p in pend if _q.in_quiet(sd, p.get("chat_id"))}
+    except Exception:
+        quiet = set()
     answer = last_assistant_text(transcript)
     tok = token(sd)
     if tok:
         for p in pend:
             cid, mid = p.get("chat_id"), p.get("message_id")
-            if answer:
+            if answer and str(cid) not in quiet:
                 try:
                     api(tok, "sendMessage", {"chat_id": cid, "text": answer[:4000]})
                 except Exception as e:
