@@ -87,9 +87,11 @@ describe('az allowlist SZUK marad -- ez fontosabb, mint maga a javitas', () => {
     // szerepel KOMMENTBEN es egyszer string-literalkent (a forras neveben). Ami szamit,
     // az a tenyleges OLVASAS: a `process.env[...]` es a `process.env.KULCS` alak.
     const bracketReads = configTs.match(/process\.env\[/g) ?? []
-    const dotReads = configTs.match(/process\.env\.[A-Z_]/g) ?? []
+    // The one named exception: FLEET_PYTHON_VENV reads the CLAUDECLAW_ENV_DIR test seam (env.ts), which is a
+    // path for the .env itself, not a config value. Counted exactly, so the exception cannot cover a second read.
+    const dotReads = configTs.match(/process\.env\.[A-Z_]+/g) ?? []
     expect(bracketReads.length).toBe(1)
-    expect(dotReads.length).toBe(0)
+    expect(dotReads).toEqual(['process.env.CLAUDECLAW_ENV_DIR'])
     expect(configTs).toMatch(/return resolveBootValue\(process\.env\[key\], cfg\(key\)\)/)
   })
 

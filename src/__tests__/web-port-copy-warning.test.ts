@@ -119,6 +119,9 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
     // es egy ele tett komment-sor elrontana. Ez a hely ezen felul a dashboard
     // folyamataban fut, tehat a ket kapu mar megallitotta az indulast.
     ['src/web/bridge-enroll.ts', 'authorized_keys sor + base64 csomag: gepi fogyaszto'],
+    // The metrics script gets the dashboard origin as CLAW_DASHBOARD_ORIGIN in its environment: a machine
+    // consumer in the dashboard process, behind the same two gates.
+    ['src/web/heartbeat-metrics-inject.ts', 'CLAW_DASHBOARD_ORIGIN egy szkript kornyezeteben: gepi fogyaszto'],
   ])
 
   function irasHelyek(): string[] {

@@ -306,8 +306,8 @@ export function systemdStatusUnits(serviceId: string): string[] {
 // CHANNEL_PROVIDER, tokens), which is a much larger hole than the one being closed.
 // Any further key needs its own decision, not an edit to this array.
 //
-// CLAUDECLAW_ENV_DIR (env.ts:11) is untouched: it already reads process.env and is a
-// test seam for the .env path itself, not a config value.
+// CLAUDECLAW_ENV_DIR (env.ts:11, and FLEET_PYTHON_VENV below) is untouched: it already reads
+// process.env and is a test seam for the .env path itself, not a config value.
 const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT', 'WEB_HOST'] as const
 type BootKey = (typeof PROCESS_ENV_BOOT_KEYS)[number]
 
