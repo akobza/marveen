@@ -133,8 +133,9 @@ describe('channels.sh guard POSTs: source-pinned honest delivery (unsafe to exec
   const src = readFileSync(join(ROOT, 'scripts', 'channels.sh'), 'utf-8')
   it('every guard POST captures the HTTP code and logs a delivery failure', () => {
     // 80d46c59: the two trigger blocks became one verdict-driven block with ONE POST. The pin is
-    // the pairing (each guard POST has its honest-delivery line), not a hardcoded count of two.
-    const posts = src.match(/\\"from\\":\\"channels-sh-guard\\"/g) ?? []
+    // the pairing (each guard POST has its honest-delivery line), not a hardcoded count of two. The POST body
+    // carries the RESOLVED sender (ab5325c0, _guard_sender), so that is what a guard POST is counted by.
+    const posts = src.match(/\\"from\\":\\"\$\(_guard_sender\)\\"/g) ?? []
     const matches = src.match(/guard alert POST failed/g) ?? []
     expect(posts.length).toBeGreaterThan(0)
     expect(matches.length).toBe(posts.length)
