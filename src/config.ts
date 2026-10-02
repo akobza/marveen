@@ -293,27 +293,30 @@ export function systemdStatusUnits(serviceId: string): string[] {
   return [...new Set([`${serviceId}-dashboard`, serviceId, LEGACY_SERVICE_ID])]
 }
 
-// --- Boot-critical keys: process.env is allowed to win, for these two ONLY ----------
+// --- Boot-critical key: process.env is allowed to win, for this ONE key only ----------
 //
 // readEnvFile() reads the .env FILE and nothing else, so until now
 // `WEB_PORT=39876 node dist/index.js` came up SILENTLY on 3420: the variable was not
 // wrong, it was not consulted. That is worse than a rejected value, because the
 // operator has evidence they set it and the process has evidence it did not.
 //
-// The allowlist is deliberately TWO keys and lives in one named place. It is NOT a
+// The allowlist is deliberately ONE key and lives in one named place. It is NOT a
 // general process.env overlay: pouring the environment over the config would let an
 // inherited variable silently rewrite this install's identity (MAIN_AGENT_ID,
 // CHANNEL_PROVIDER, tokens), which is a much larger hole than the one being closed.
-// Any further key needs its own decision, not an edit to this array.
+// Any further key needs its own decision, not an edit to this array. WEB_HOST had one and
+// is OUT: it is the bind address, so an inherited WEB_HOST=0.0.0.0 (or ::) would open the
+// dashboard to the whole network and put the address into the CSRF allowlist, with nothing
+// validating it. It stays a .env-only key, read exactly as before this card.
 //
 // CLAUDECLAW_ENV_DIR (env.ts:11, and FLEET_PYTHON_VENV below) is untouched: it already reads
 // process.env and is a test seam for the .env path itself, not a config value.
-const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT', 'WEB_HOST'] as const
+const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT'] as const
 type BootKey = (typeof PROCESS_ENV_BOOT_KEYS)[number]
 
 // process.env > config-overrides.json > .env  (the caller applies the default).
 // An empty or whitespace-only value counts as UNSET at every layer, so a stray
-// `WEB_HOST=` cannot blank the host -- it falls through to the next source, the same
+// `WEB_PORT=` cannot blank the port -- it falls through to the next source, the same
 // way cfg() already treats an empty override.
 // Pure, so the ORDER can be asserted without booting the process or touching the
 // real .env -- the precedence is the thing this card changes, so it is the thing a
@@ -405,15 +408,13 @@ const webPortRaw = bootEnv('WEB_PORT')
 const webPortResolved = resolveWebPort(webPortRaw, 3420)
 export const WEB_PORT = webPortResolved.port
 
-const webHostRaw = bootEnv('WEB_HOST')
-export const WEB_HOST = webHostRaw?.value ?? '127.0.0.1'
+export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
 
-// Which source each boot-critical key actually came from. The startup log prints this:
+// Which source the boot-critical key actually came from. The startup log prints this:
 // "the variable was ignored" and "the variable was applied" look identical from outside,
 // and that ambiguity is exactly what this card exists to remove.
 export const BOOT_KEY_SOURCES: Record<BootKey, string> = {
   WEB_PORT: webPortRaw?.source ?? 'default',
-  WEB_HOST: webHostRaw?.source ?? 'default',
 }
 
 // The WEB_PORT value that was REJECTED, if any -- undefined on the healthy path.

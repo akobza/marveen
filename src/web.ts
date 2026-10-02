@@ -341,7 +341,7 @@ export function startWebServer(port = 3420): http.Server {
     // ignored" and "the variable was applied" produce identical output otherwise, and
     // that ambiguity is what let WEB_PORT be silently dropped (card b2cd0f43).
     logger.info(
-      { port, host: WEB_HOST, portSource: BOOT_KEY_SOURCES.WEB_PORT, hostSource: BOOT_KEY_SOURCES.WEB_HOST },
+      { port, host: WEB_HOST, portSource: BOOT_KEY_SOURCES.WEB_PORT },
       `Web dashboard: http://localhost:${port}`,
     )
     // Do NOT log the bearer token: launchd/journal/pipe captures of the

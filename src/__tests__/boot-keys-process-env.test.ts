@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveBootValue, parseWebPort } from '../config.js'
@@ -8,7 +8,7 @@ import { resolveBootValue, parseWebPort } from '../config.js'
 // rejected, it was never consulted. The operator had evidence they set it and the
 // process had evidence it did not.
 //
-// Both halves are tested here: that process.env now wins for the two named keys, and
+// Both halves are tested here: that process.env now wins for the one named key, and
 // that the allowlist stayed narrow. The second is the one that matters more: the fix
 // itself would be dangerous if it turned into a general process.env overlay.
 
@@ -28,7 +28,7 @@ describe('resolveBootValue: process.env > config-overrides/.env > default', () =
   })
 
   it('URES es CSAK-SZOKOZ ertek UNSET-nek szamit minden retegben', () => {
-    // `WEB_HOST=` nem blankolhatja a hostot: atesik a kovetkezo forrasra.
+    // `WEB_PORT=` nem blankolhatja a portot: atesik a kovetkezo forrasra.
     expect(resolveBootValue('', '3420')?.source).toBe('config-overrides.json/.env')
     expect(resolveBootValue('   ', '3420')?.source).toBe('config-overrides.json/.env')
     expect(resolveBootValue('', '')).toBeUndefined()
@@ -68,11 +68,39 @@ describe('parseWebPort: ervenytelen port eseten ALLJON MEG, ne induljon NaN-nel'
 describe('az allowlist SZUK marad -- ez fontosabb, mint maga a javitas', () => {
   const configTs = readFileSync(join(__dirname, '..', 'config.ts'), 'utf-8')
 
-  it('pontosan KET kulcs all a nevesitett listaban', () => {
+  it('pontosan EGY kulcs all a nevesitett listaban', () => {
     const m = configTs.match(/const PROCESS_ENV_BOOT_KEYS = \[([^\]]*)\]/)
     expect(m).not.toBeNull()
     const keys = m![1].split(',').map(k => k.trim().replace(/['"]/g, '')).filter(Boolean)
-    expect(keys).toEqual(['WEB_PORT', 'WEB_HOST'])
+    expect(keys).toEqual(['WEB_PORT'])
+  })
+
+  it('⛔ a WEB_HOST NEM jon a process.env-bol: egy orokolt 0.0.0.0 nem nyitja meg a dashboardot', async () => {
+    // The bind address stays .env-only. An inherited WEB_HOST must not reach WEB_HOST, the listen address.
+    const eredeti = process.env.WEB_HOST
+    try {
+      vi.resetModules()
+      process.env.WEB_HOST = '0.0.0.0'
+      const cfg = await import('../config.js')
+      expect(cfg.WEB_HOST).not.toBe('0.0.0.0')
+    } finally {
+      if (eredeti === undefined) delete process.env.WEB_HOST
+      else process.env.WEB_HOST = eredeti
+    }
+  })
+
+  it('⛔ KONTROLL: a WEB_PORT viszont tovabbra is a process.env-bol jon (a fenti nem a modszer hibaja)', async () => {
+    const eredeti = process.env.WEB_PORT
+    try {
+      vi.resetModules()
+      process.env.WEB_PORT = '39876'
+      const cfg = await import('../config.js')
+      expect(cfg.WEB_PORT).toBe(39876)
+      expect(cfg.BOOT_KEY_SOURCES).toEqual({ WEB_PORT: 'process.env' })
+    } finally {
+      if (eredeti === undefined) delete process.env.WEB_PORT
+      else process.env.WEB_PORT = eredeti
+    }
   })
 
   it('NINCS altalanos process.env-ratoltés a configra', () => {
