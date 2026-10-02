@@ -281,6 +281,14 @@ export function startWebServer(port = 3420): http.Server {
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
+      // A port the ENVIRONMENT chose is not ours to reclaim (card b2cd0f43): the reclaim below stops every
+      // own-UID node process on it, with no project-root check, and an inherited WEB_PORT can be another
+      // service's port. Stop the boot loudly instead.
+      if (BOOT_KEY_SOURCES.WEB_PORT === 'process.env') {
+        logger.error({ port, portSource: BOOT_KEY_SOURCES.WEB_PORT },
+          'Web port foglalt, es a WEB_PORT a process.env-bol jott: a portot nem szabaditom fel, kilepes')
+        process.exit(1)
+      }
       // Try to reclaim the port only if the listener is another node/dashboard
       // process owned by us. Blind `lsof -ti | xargs kill -9` would take down
       // whatever happens to be on the port (e.g. an unrelated dev server),
