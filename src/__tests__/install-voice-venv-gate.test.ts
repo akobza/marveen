@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, symlinkSync, chmodSync } from 'node:fs'
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, symlinkSync, chmodSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -58,6 +58,17 @@ function runStep2(dest: string): { code: number; out: string } {
   }
 }
 
+// Every scratch DEST this file creates, so the suite can remove them (c9f105dd). Three of the four hold a real venv
+// (about 13 MB each); left behind they filled the shared /tmp on every run.
+const scratchDirs: string[] = []
+
+/** A fresh scratch DEST under the OS temp dir, removed in afterAll whatever the test's outcome. */
+function scratchDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  scratchDirs.push(dir)
+  return dir
+}
+
 /** Reproduce the stub a partial install leaves: bin/ has python, but no pip. */
 function makeBrokenVenv(dest: string): void {
   const bin = join(dest, 'venv', 'bin')
@@ -93,8 +104,13 @@ describe('install-voice.sh step 2 venv gate', () => {
     execFileSync('bash', ['-c', 'python3 -m venv --help'], { stdio: 'ignore' })
   })
 
+  afterAll(() => {
+    // rmSync does not follow the venv's python symlinks: only the scratch tree goes.
+    for (const dir of scratchDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
   it('rebuilds a venv that exists but has no pip (the 09-21 regression)', () => {
-    const dest = mkdtempSync(join(tmpdir(), 'voice-broken-'))
+    const dest = scratchDir('voice-broken-')
     makeBrokenVenv(dest)
     expect(existsSync(join(dest, 'venv', 'bin', 'python'))).toBe(true)
     expect(existsSync(join(dest, 'venv', 'bin', 'pip'))).toBe(false)
@@ -108,7 +124,7 @@ describe('install-voice.sh step 2 venv gate', () => {
   })
 
   it('keeps the downloaded voice models when it rebuilds the venv', () => {
-    const dest = mkdtempSync(join(tmpdir(), 'voice-scope-'))
+    const dest = scratchDir('voice-scope-')
     makeBrokenVenv(dest)
     const model = makeVoices(dest)
 
@@ -124,7 +140,7 @@ describe('install-voice.sh step 2 venv gate', () => {
   })
 
   it('leaves a working venv untouched (idempotency is still the point)', () => {
-    const dest = mkdtempSync(join(tmpdir(), 'voice-ok-'))
+    const dest = scratchDir('voice-ok-')
     makeWorkingVenv(dest)
 
     const r = runStep2(dest)
@@ -136,7 +152,7 @@ describe('install-voice.sh step 2 venv gate', () => {
   })
 
   it('creates the venv when nothing is there yet', () => {
-    const dest = mkdtempSync(join(tmpdir(), 'voice-empty-'))
+    const dest = scratchDir('voice-empty-')
 
     const r = runStep2(dest)
 
