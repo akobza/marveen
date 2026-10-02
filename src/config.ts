@@ -334,8 +334,17 @@ export function resolveBootValue(
   return undefined
 }
 
+// A .env line `WEB_PORT=3420 # komment` reaches the file layer as "3420 # komment": the shared .env grammar
+// (env-parse.ts) drops whole-line comments, not trailing ones. The old parseInt read 3420 from it; the strict
+// parse below would refuse the boot, and under Restart=always that is a restart loop. So the file layer drops a
+// trailing comment (whitespace, then '#') the way the reader already drops a comment line. A process.env value
+// keeps it: an environment variable has no comments, and a '#' there is part of a wrong value.
+export function dropTrailingComment(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : value.replace(/\s+#.*$/s, '')
+}
+
 function bootEnv(key: BootKey): { value: string; source: string } | undefined {
-  return resolveBootValue(process.env[key], cfg(key))
+  return resolveBootValue(process.env[key], dropTrailingComment(cfg(key)))
 }
 
 /**

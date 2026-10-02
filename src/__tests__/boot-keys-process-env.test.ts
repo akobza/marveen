@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { resolveBootValue, parseWebPort } from '../config.js'
+import { resolveBootValue, parseWebPort, dropTrailingComment } from '../config.js'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 // Card b2cd0f43. readEnvFile() reads the .env FILE and nothing else, so
 // `WEB_PORT=39876 node dist/index.js` came up SILENTLY on 3420 -- the variable was not
@@ -120,11 +122,58 @@ describe('az allowlist SZUK marad -- ez fontosabb, mint maga a javitas', () => {
     const dotReads = configTs.match(/process\.env\.[A-Z_]+/g) ?? []
     expect(bracketReads.length).toBe(1)
     expect(dotReads).toEqual(['process.env.CLAUDECLAW_ENV_DIR'])
-    expect(configTs).toMatch(/return resolveBootValue\(process\.env\[key\], cfg\(key\)\)/)
+    expect(configTs).toMatch(/return resolveBootValue\(process\.env\[key\], dropTrailingComment\(cfg\(key\)\)\)/)
   })
 
   it('KONTROLL: a kereso tenyleg talal, ha van mit -- a nulla nem a modszer hibaja', () => {
     // Ha ez a minta sem lenne meg, akkor a fenti nulla-allitasok semmit nem bizonyitananak.
     expect(configTs).toMatch(/PROCESS_ENV_BOOT_KEYS/)
+  })
+})
+
+describe('a .env sorvegi megjegyzese nem okoz ujrainditas-hurkot (WEB_PORT=3420 # komment)', () => {
+  it('a fajl-reteg levagja a szokozzel elvalasztott megjegyzest; szokoz nelkul nem (mint a shell)', () => {
+    expect(dropTrailingComment('3420 # komment')).toBe('3420')
+    expect(dropTrailingComment('3420\t#x')).toBe('3420')
+    expect(dropTrailingComment('3420#x')).toBe('3420#x')
+    expect(dropTrailingComment(undefined)).toBeUndefined()
+  })
+
+  async function configAEnvvel(sor: string, procEnv?: string) {
+    const dir = mkdtempSync(join(tmpdir(), 'boot-keys-env-'))
+    const eredetiDir = process.env.CLAUDECLAW_ENV_DIR
+    const eredetiPort = process.env.WEB_PORT
+    try {
+      writeFileSync(join(dir, '.env'), `${sor}\n`)
+      vi.resetModules()
+      process.env.CLAUDECLAW_ENV_DIR = dir
+      if (procEnv === undefined) delete process.env.WEB_PORT
+      else process.env.WEB_PORT = procEnv
+      return await import('../config.js')
+    } finally {
+      if (eredetiDir === undefined) delete process.env.CLAUDECLAW_ENV_DIR
+      else process.env.CLAUDECLAW_ENV_DIR = eredetiDir
+      if (eredetiPort === undefined) delete process.env.WEB_PORT
+      else process.env.WEB_PORT = eredetiPort
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  it('⛔ a .env "WEB_PORT=3420 # komment" sora ervenyes 3420, jelzes nelkul, a fajl-retegbol', async () => {
+    const cfg = await configAEnvvel('WEB_PORT=3420 # komment')
+    expect(cfg.WEB_PORT).toBe(3420)
+    expect(cfg.WEB_PORT_INVALID).toBeUndefined()
+    expect(cfg.BOOT_KEY_SOURCES.WEB_PORT).toBe('config-overrides.json/.env')
+  })
+
+  it('⛔ KONTROLL: a megjegyzes mogotti ERVENYTELEN ertek tovabbra is megtagadas (a vagas nem nyel el hibat)', async () => {
+    const cfg = await configAEnvvel('WEB_PORT=abc # komment')
+    expect(cfg.WEB_PORT_INVALID?.raw).toBe('abc')
+  })
+
+  it('⛔ KONTROLL: a process.env erteke NEM kap vagast: ott a # egy hibas ertek resze', async () => {
+    const cfg = await configAEnvvel('WEB_PORT=3420', '3420 # x')
+    expect(cfg.WEB_PORT_INVALID?.source).toBe('process.env')
+    expect(cfg.WEB_PORT_INVALID?.raw).toBe('3420 # x')
   })
 })
