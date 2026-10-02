@@ -14,6 +14,10 @@
 // importalja es egyik kapun sem megy at. A tobbi jelzes MELYSEGI VEDELEM -- azert
 // all ott, hogy a vedelem ne egy elerhetosegi ERVEN mulljon, ami egy uj belepesi
 // ponttal csendben megszunne.
+//
+// Card b2cd0f43 (5), decision (c): that one reachable place, the enroll CLI, now refuses at the dashboard's level
+// (assertWebPortUsable, before any write) instead of warning on stderr. It moved to the KAPUZOTT (gated) bucket below,
+// and none of the copied places is reachable with an invalid port any more.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -64,7 +68,6 @@ describe('a jelzes EGY forrasbol jon', () => {
     for (const f of [
       'src/web/voice-directive.ts',
       'src/web/channel-monitor.ts',
-      'scripts/remote-access-enroll.ts',
     ]) {
       expect(readFileSync(join(ROOT, f), 'utf-8'), f).toMatch(/WEB_PORT_COPY_WARNING/)
     }
@@ -106,7 +109,11 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
     'src/web/heartbeat-agent-scaffold.ts',
     'src/web/voice-directive.ts',
     'src/web/channel-monitor.ts',
-    'scripts/remote-access-enroll.ts',
+  ])
+  // Places that write WEB_PORT into a copied artefact but STOP on an invalid port before writing anything, with the
+  // dashboard's own gate. They carry no marker: there is no copied text on that path.
+  const KAPUZOTT = new Map([
+    ['scripts/remote-access-enroll.ts', 'onallo CLI: ervenytelen portnal --web-port nelkul megall, MIELOTT irna (b2cd0f43 (5))'],
   ])
   const BELSO = new Map([
     ['src/index.ts', 'port-zar, log -- a folyamaton belul marad'],
@@ -150,7 +157,7 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
   })
 
   it('⛔ NINCS BESOROLATLAN MARADEK -- ha ez pirosodik, uj iras-hely kerult be', () => {
-    const maradek = helyek.filter((p) => !MASOLT.has(p) && !BELSO.has(p))
+    const maradek = helyek.filter((p) => !MASOLT.has(p) && !BELSO.has(p) && !KAPUZOTT.has(p))
     expect(maradek, `besorolatlan iras-hely(ek): ${maradek.join(', ')}`).toEqual([])
   })
 
@@ -166,6 +173,19 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
       return !/WEB_PORT_COPY_WARNING|withWebPortWarning/.test(torzs)
     })
     expect(hianyzik, `a jelzest nem HASZNALO masolt hely: ${hianyzik.join(', ')}`).toEqual([])
+  })
+
+  it('a KAPUZOTT rekesz minden tagja HIVJA a kaput (nem csak importalja)', () => {
+    // The same use-not-mention rule as for MASOLT: import lines out, then the call itself. The behaviour (exit 1, no
+    // authorized_keys line, no bundle) is measured on the real CLI process in enroll-refuses-invalid-web-port.test.ts.
+    const hianyzik = [...KAPUZOTT.keys()].filter((p) => {
+      const torzs = readFileSync(join(ROOT, p), 'utf-8')
+        .split('\n')
+        .filter((l) => !/^\s*import\b/.test(l))
+        .join('\n')
+      return !/\bassertWebPortUsable\(\)/.test(torzs)
+    })
+    expect(hianyzik, `a kaput nem HIVO kapuzott hely: ${hianyzik.join(', ')}`).toEqual([])
   })
 
   it('⛔ VISELKEDESI par egy MASODIK helyen is: a heartbeat CLAUDE.md', async () => {

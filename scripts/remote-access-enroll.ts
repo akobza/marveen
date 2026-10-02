@@ -15,7 +15,8 @@
 // WEB_PORT env / .env value, falling back to REMOTE_PORT. A mismatch between the
 // permitopen and the actual dashboard port silently locks the device out
 // (INSTUX1): the tunnel opens a dead port and the app reports "dashboard not
-// running" forever.
+// running" forever. An INVALID WEB_PORT (one config.ts rejected) stops the CLI
+// before anything is written, unless --web-port is given (card b2cd0f43).
 //
 // The bundle includes the dashboard bearer token (store/.dashboard-token) by
 // default so the connecting app can authenticate against the dashboard. Such a
@@ -44,7 +45,7 @@ import {
 } from '../src/remote-enroll-core.js'
 import { enrollAuthorizedKey } from '../src/remote-enroll-fs.js'
 import { resolveSshDir } from '../src/ssh-dir.js'
-import { WEB_PORT as ENV_WEB_PORT, WEB_PORT_COPY_WARNING } from '../src/config.js'
+import { WEB_PORT as ENV_WEB_PORT, assertWebPortUsable } from '../src/config.js'
 
 interface Args {
   keyLine?: string
@@ -173,6 +174,20 @@ function readDashboardToken(): string | null {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2))
+  // Card b2cd0f43 (5), decision (c): this CLI writes WEB_PORT into two copied
+  // artefacts (the authorized_keys line and the bundle) without passing the
+  // dashboard's boot gates, because it imports config directly. On an invalid
+  // WEB_PORT config.ts falls back to 3420, and both artefacts would carry that
+  // port looking like a configured value. So the CLI refuses at the dashboard's
+  // level, with the dashboard's own gate, BEFORE anything is written. An
+  // explicit --web-port does not use WEB_PORT at all and keeps the old behaviour.
+  if (args.webPortFromEnv) {
+    try {
+      assertWebPortUsable()
+    } catch (err) {
+      fail(`${err instanceof Error ? err.message : String(err)} Or pass --web-port <port> explicitly.`)
+    }
+  }
   if (args.keyLine === undefined) {
     fail('missing public key line. Usage: npm run remote-enroll -- "<public key line>"')
   }
@@ -256,17 +271,6 @@ async function main(): Promise<void> {
         'hand it over on a private channel, never by email or shared chat. ' +
         'Use --no-dashboard-token to emit a token-free bundle.\n',
     )
-  }
-
-  // Card b2cd0f43, 4th condition. This CLI is the ONE place that writes WEB_PORT
-  // into a copied artefact WITHOUT passing a boot gate first: the dashboard's own
-  // gates stop that process before any of its template paths run, but this script
-  // imports config directly and never calls them. So on the fallback path the
-  // bundle would carry 3420 looking exactly like a configured value. Same sentence
-  // as everywhere else, from the same constant -- on stderr, so it cannot corrupt
-  // the bundle on stdout that a consumer pipes.
-  if (WEB_PORT_COPY_WARNING && args.webPortFromEnv) {
-    process.stderr.write(`WARNING: ${WEB_PORT_COPY_WARNING}\n`)
   }
 
   const encoded = encodeBundle(buildBundle(bundleInput))
