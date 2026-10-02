@@ -130,6 +130,8 @@ const CHECKOUT_ONLY: Record<string, string> = {
     'conversation-continuity ledger: same design as ledger-capture.py (docs/conversation-continuity.md, project settings only)',
   'ledger-replay.py':
     'conversation-continuity ledger: same design as ledger-capture.py; the docs state it is "wired in the repo\'s project settings only (the main agent)"',
+  'owner-question-lookup.py':
+    'the owner-question lookup (fc282e39) searches conversation_log, which only the main-only ledger trio fills; seeded to a sub-agent it would search an empty ledger and report "no earlier message" for every question, a misleading zero -- and the card scopes the first round to the main agent\'s owner chats, the agents\' own channels being a separate second round',
   'telegram-reply-guard.py':
     'the Stop-hook half of the Telegram reply enforcement (#856) decides from ledger_lib.open_question_with_age, i.e. the conversation_log the main-only ledger trio writes; seeded alone it would read an empty ledger and allow every stop, a silent no-op -- seeding it means seeding the ledger trio with it, a separate design decision',
 }
