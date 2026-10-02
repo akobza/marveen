@@ -166,6 +166,18 @@ describe('a .env sorvegi megjegyzese nem okoz ujrainditas-hurkot (WEB_PORT=3420 
     expect(cfg.BOOT_KEY_SOURCES.WEB_PORT).toBe('config-overrides.json/.env')
   })
 
+  it('⛔ a .env tabbal elvalasztott megjegyzese is vagodik: "WEB_PORT=3420<TAB># komment" -> 3420', async () => {
+    const cfg = await configAEnvvel('WEB_PORT=3420\t# komment')
+    expect(cfg.WEB_PORT).toBe(3420)
+    expect(cfg.WEB_PORT_INVALID).toBeUndefined()
+  })
+
+  it('⛔ a NEM VAGOTT alak: "WEB_PORT=3420#x" (szokoz nelkul) nem megjegyzes, hanem hibas ertek, mint a shellben', async () => {
+    const cfg = await configAEnvvel('WEB_PORT=3420#x')
+    expect(cfg.WEB_PORT_INVALID?.raw).toBe('3420#x')
+    expect(cfg.WEB_PORT_INVALID?.source).toBe('config-overrides.json/.env')
+  })
+
   it('⛔ KONTROLL: a megjegyzes mogotti ERVENYTELEN ertek tovabbra is megtagadas (a vagas nem nyel el hibat)', async () => {
     const cfg = await configAEnvvel('WEB_PORT=abc # komment')
     expect(cfg.WEB_PORT_INVALID?.raw).toBe('abc')
