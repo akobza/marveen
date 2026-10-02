@@ -11,7 +11,8 @@
 // itt mind a ketto, es ezert van kontroll mindkettohoz.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -69,12 +70,55 @@ describe('(i) a modul-szint VISSZAESIK, nem dob -- es a jelzes all', () => {
   })
 })
 
+// startWebServer is called for real below. If its gate ever regressed, it would go on to create the agents
+// directory, write the dashboard token, create the HTTP server and listen -- and on EADDRINUSE reclaim the port
+// from whatever holds it, on a machine where that is the live dashboard. So node:http, the token writer and the
+// agents directory are stubbed for these calls: a listen that is ever reached throws, nothing binds, nothing is
+// written into the checkout. The port is not the live one either.
+async function startWebServerStubbed(webPort: string) {
+  vi.resetModules()
+  process.env.WEB_PORT = webPort
+  const listen = vi.fn(() => { throw new Error('test: a real listen was attempted') })
+  const createServer = vi.fn(() => ({ listen, on: vi.fn(), once: vi.fn(), close: vi.fn() }))
+  vi.doMock('node:http', async (importOriginal) => {
+    const real = await importOriginal<typeof import('node:http')>()
+    return { ...real, createServer, default: { ...real, createServer } }
+  })
+  vi.doMock('../web/dashboard-auth.js', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../web/dashboard-auth.js')>()
+    return { ...real, loadOrCreateDashboardToken: () => 'test-token' }
+  })
+  const agentsDir = mkdtempSync(join(tmpdir(), 'web-port-gate-'))
+  vi.doMock('../web/agent-config.js', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../web/agent-config.js')>()
+    return { ...real, AGENTS_BASE_DIR: agentsDir }
+  })
+  try {
+    const { startWebServer } = await import('../web.js')
+    let thrown: unknown
+    try { startWebServer(39877) } catch (e) { thrown = e }
+    return { thrown, createServer, listen }
+  } finally {
+    vi.doUnmock('node:http')
+    vi.doUnmock('../web/dashboard-auth.js')
+    vi.doUnmock('../web/agent-config.js')
+    rmSync(agentsDir, { recursive: true, force: true })
+  }
+}
+
 describe('(ii) UGYANAKKOR a megtagadas megtortenik -- e nelkul az (i) csendes elfogadas lenne', () => {
   it('⛔ a startWebServer DOB, ha a jelzes all', async () => {
-    vi.resetModules()
-    process.env.WEB_PORT = 'nope'
-    const { startWebServer } = await import('../web.js')
-    expect(() => startWebServer(3420)).toThrow(/WEB_PORT is unusable/)
+    const { thrown, createServer, listen } = await startWebServerStubbed('nope')
+    expect(String(thrown)).toMatch(/WEB_PORT is unusable/)
+    expect(createServer).not.toHaveBeenCalled()
+    expect(listen).not.toHaveBeenCalled()
+  })
+
+  it('⛔ KONTROLL a csonkra: ervenyes ertek mellett a kapu atenged, es a csonkolt listen-ig jut', async () => {
+    // Without this, the test above would also pass if the stub were not in effect at all.
+    const { thrown, listen } = await startWebServerStubbed('39876')
+    expect(String(thrown)).toMatch(/a real listen was attempted/)
+    expect(listen).toHaveBeenCalledTimes(1)
   })
 
   it('⛔ KONTROLL: ervenyes ertek mellett a startWebServer NEM a kapun bukik el', async () => {
