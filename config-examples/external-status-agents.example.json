@@ -1,0 +1,10 @@
+{
+  "agents": [
+    {
+      "id": "partner-bot",
+      "label": "Partner bot",
+      "statusFile": "/var/lib/partner-bot-status/status.json",
+      "staleAfterSeconds": 120
+    }
+  ]
+}

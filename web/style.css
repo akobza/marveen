@@ -7484,6 +7484,16 @@ body {
 .federated-agent-card .agent-desc {
   color: var(--text-muted);
 }
+.external-status-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary, #888);
+  background: rgba(128, 128, 128, 0.12);
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
 .federated-badge {
   font-size: 10px;
   font-weight: 600;

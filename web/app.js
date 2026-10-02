@@ -2998,7 +2998,7 @@ async function loadAgents() {
     // The federation status fetch is deliberately failure-proof (.catch ->
     // null): it must NEVER take down the Agents page -- including on an
     // older backend where the route 404s.
-    const [agentsRes, marveenRes, fedStatus, ctxGuard] = await Promise.all([
+    const [agentsRes, marveenRes, fedStatus, ctxGuard, extStatus] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/marveen'),
       fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
@@ -3006,8 +3006,11 @@ async function loadAgents() {
       // transient error here must not take down the whole Agents page over a
       // badge.
       fetch('/api/context-guard').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      // 28c4a739: the read-only external agents; failure-proof like the two above (an older backend 404s).
+      fetch('/api/external-agents').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     agents = await agentsRes.json()
+    externalStatusAgents = extStatus && Array.isArray(extStatus.agents) ? extStatus.agents : []
     if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
     contextGuardPct = {}
     if (ctxGuard && Array.isArray(ctxGuard.agents)) {
@@ -3636,6 +3639,7 @@ function renderAgents() {
     agentsGrid.insertBefore(card, addBtn)
   }
   renderFederatedAgentCards(agentsGrid, addBtn)
+  renderExternalStatusCards(agentsGrid, addBtn)
   // Re-apply the live busy tint right after a re-render (renderAgents rebuilds
   // the cards from scratch, dropping the class), so it never blinks off while
   // the page is open.
@@ -3679,7 +3683,7 @@ async function refreshAgentTerminalBusy() {
   _liveAgentIds = new Set(entries.filter((e) => e && e.running).map((e) => e.name))
   const mainId = mainAgentId()
   if (agentsGrid) {
-    agentsGrid.querySelectorAll('.agent-card:not(.add-card):not(.federated-agent-card)').forEach((card) => {
+    agentsGrid.querySelectorAll('.agent-card:not(.add-card):not(.federated-agent-card):not(.external-status-card)').forEach((card) => {
       const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
       const entry = id ? byName.get(id) : null
       const working = !!entry && entry.state === 'working'
@@ -3714,6 +3718,11 @@ async function refreshAgentTerminalBusy() {
 // create-wizard, where qualified ids would be selectable-and-invalid.
 // "remote" already means SSH agents in this codebase -- these are FEDERATED.
 let federatedPeerStatus = []
+
+// Card 28c4a739: non-fleet agents the install lists in store/external-status-agents.json, shown with their STATUS
+// ONLY (/api/external-agents). Kept apart from `agents` like the federated ones: they are not message targets and
+// the dashboard has no control over them.
+let externalStatusAgents = []
 
 // System/plumbing agent names never shown as message targets.
 const FEDERATED_HIDDEN_AGENTS = new Set(['heartbeat', 'telegram-coordinator', 'channel-coordinator'])
@@ -3760,6 +3769,46 @@ function renderFederatedAgentCards(agentsGrid, addBtn) {
       e.stopPropagation()
       openFederatedThread(fa.qualified)
     })
+    agentsGrid.insertBefore(card, addBtn)
+  }
+}
+
+// Relative time of an ISO timestamp from the status file, or '-' when it is missing or not a date.
+function externalRelative(iso) {
+  const ms = typeof iso === 'string' ? Date.parse(iso) : NaN
+  return Number.isFinite(ms) ? formatRelative(ms) : '-'
+}
+
+// SECURITY: every status-derived string is placed as escaped TEXT; nothing from the status file lands in an
+// attribute or a class name (the state and dot classes come from fixed sets). No action button: status only.
+function renderExternalStatusCards(agentsGrid, addBtn) {
+  for (const ea of externalStatusAgents) {
+    if (!ea || typeof ea.id !== 'string') continue
+    const label = typeof ea.label === 'string' && ea.label ? ea.label : ea.id
+    const state = !ea.readable ? 'unreadable' : ea.state === 'running' ? 'running' : ea.state === 'stopped' ? 'stopped' : 'unknown'
+    const dot = state === 'running' && !ea.stale ? 'connected' : 'disconnected'
+    const lines = []
+    if (ea.readable) {
+      lines.push(escapeHtml(t('external.since', { time: externalRelative(ea.activeSince) })))
+      lines.push(escapeHtml(t('external.last_activity', { time: externalRelative(ea.lastActivity) })))
+      if (ea.stale) lines.push(escapeHtml(t('external.stale', { time: externalRelative(ea.updatedAt) })))
+      if (Array.isArray(ea.errors) && ea.errors.length) lines.push(escapeHtml(t('external.errors', { list: ea.errors.join('; ') })))
+    } else {
+      lines.push(escapeHtml(t('external.unreadable')))
+    }
+    const card = document.createElement('div')
+    card.className = 'agent-card external-status-card'
+    card.innerHTML = `
+      <div class="agent-card-top">
+        <div class="agent-avatar gradient-3">${escapeHtml(label.charAt(0).toUpperCase())}</div>
+        <div class="agent-card-info">
+          <div class="agent-name">${escapeHtml(label)} <span class="external-status-badge">${escapeHtml(t('external.badge'))}</span></div>
+          <div class="agent-desc">${lines.join('<br>')}</div>
+        </div>
+      </div>
+      <div class="agent-card-footer">
+        <span class="tg-status"><span class="tg-dot ${dot}"></span> ${escapeHtml(t('external.state.' + state))}</span>
+      </div>`
     agentsGrid.insertBefore(card, addBtn)
   }
 }
