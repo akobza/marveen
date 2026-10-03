@@ -78,6 +78,10 @@ const EXPECTED: Record<string, string[]> = {
     'email-approval-gate.py @ .*draft_email.*',
     'channel-image-resize.sh @ Read', 'egress-gate.mjs @ WebFetch', 'memory-frontmatter-gate.py @ Write|Edit|MultiEdit',
     'memory-frontmatter-bash-gate.py @ Bash',
+    // Card 0ad8d161: no signal to the user service manager, init or every
+    // process, and none to a PID taken from a parent lookup. The sub-agents get
+    // it from the scaffold (injectKillGate); this is the main agent's copy.
+    'kill-gate.py @ Bash',
   ],
   Stop: ['marveen-commands.py', 'telegram-reply-guard.py', 'telegram_progress_clear.py', 'slack_progress_clear.py'],
   StopFailure: ['ledger-turn-failure.py'],
