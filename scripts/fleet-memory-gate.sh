@@ -23,9 +23,20 @@
 #   usedPct >= HARD           -> hard pause: block ALL new spawns; alert once
 #   running non-core >= CAP   -> block non-core regardless of band
 #
+# CAP: MARVEEN_AGENT_CAP when set; otherwise the configured fleet, the larger of
+# the dashboard's own reconcile target (agents-desired.json in the state dir) and
+# the number of agent directories (agents/*, the dashboard-hidden ones included:
+# hiding is a visibility decision, listAllAgentNames); with neither, 12. Neither
+# may block on its own: a new agent has its directory before it is in the
+# desired set. A fixed default made every fleet growth a manual raise, and until
+# the raise the cap blocked starts the dashboard itself wanted. The status line
+# names the source.
+# The cap alert is per agent: the first block after an allow alerts at once, the
+# same agent at most once per MARVEEN_CAP_ALERT_WINDOW (3600 s) after that.
+#
 # Kill-switch: MARVEEN_MEM_GATE_DISABLE=1 -> immediate exit 0 (pure pass-through).
 #
-# Read-only except its own state files (safe-mode flag + alert-dedupe stamp);
+# Read-only except its own state files (safe-mode flag + alert-dedupe stamps);
 # Telegram send is best-effort; --dry-run makes it fully side-effect free.
 
 set -uo pipefail
@@ -69,7 +80,6 @@ MAIN_AGENT_ID="$(_env_val MAIN_AGENT_ID)"; MAIN_AGENT_ID="${MAIN_AGENT_ID:-marve
 
 WARN_PCT="${MARVEEN_MEM_WARN_PCT:-80}"
 HARD_PCT="${MARVEEN_MEM_HARD_PCT:-90}"
-AGENT_CAP="${MARVEEN_AGENT_CAP:-12}"
 # Core = never-throttled agents. Defaults to THIS install's main agent so the
 # primary bot always survives the safe-mode band; override with MARVEEN_CORE_AGENTS.
 CORE_AGENTS="${MARVEEN_CORE_AGENTS:-$MAIN_AGENT_ID}"
@@ -78,6 +88,32 @@ STATE_DIR="${MARVEEN_STORE:-$INSTALL_DIR/store}"
 SAFE_FLAG="$STATE_DIR/.fleet-safe-mode"
 ALERT_STAMP="$STATE_DIR/.fleet-memgate-alert"   # "band:epoch" of last alert
 OBSERVE_FLAG="$STATE_DIR/.fleet-memgate-observe"  # if present -> observe-only
+CAP_ALERT_DIR="$STATE_DIR/.fleet-memgate-cap.d"     # one "cap:epoch" stamp per agent
+CAP_ALERT_WINDOW="${MARVEEN_CAP_ALERT_WINDOW:-3600}"
+
+# The configured fleet size and where it came from ("<n> <source>"); see CAP above.
+fleet_size() {
+  local n=0 c=0 d
+  if [[ -f "$STATE_DIR/agents-desired.json" ]] && command -v python3 >/dev/null 2>&1; then
+    # Read the way the dashboard reads it (getDesiredAgents): a JSON list, its
+    # distinct strings; anything else counts as empty.
+    n="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  print(len(set(x for x in d if isinstance(x,str))) if isinstance(d,list) else 0)
+except Exception: print(0)' "$STATE_DIR/agents-desired.json" 2>/dev/null)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  fi
+  for d in "$INSTALL_DIR"/agents/*/; do [[ -d "$d" ]] && c=$((c+1)); done
+  if (( n > c )); then echo "$n desired"
+  elif (( c > 0 )); then echo "$c configured"
+  else echo "12 default"; fi
+}
+if [[ "${MARVEEN_AGENT_CAP:-}" =~ ^[0-9]+$ ]]; then
+  AGENT_CAP="$MARVEEN_AGENT_CAP"; CAP_SRC="env"
+else
+  read -r AGENT_CAP CAP_SRC <<< "$(fleet_size)"
+fi
 
 # OBSERVE-ONLY mode (Istvan standing directive 2026-07-09, re-confirmed 2026-07-15):
 # monitor + alert stay ON, but the gate NEVER blocks a start and NEVER writes the
@@ -151,19 +187,21 @@ is_core() {
   return 1
 }
 
-# Best-effort deduped Telegram alert (band-cooldown).
+# Best-effort deduped Telegram alert (band-cooldown). An optional stamp file and
+# cooldown give a key of its own (the per-agent cap alert); the default is the
+# shared band stamp with ALERT_COOLDOWN.
 send_alert() {
-  local band="$1" msg="$2"
+  local band="$1" msg="$2" stamp="${3:-$ALERT_STAMP}" cooldown="${4:-$ALERT_COOLDOWN}"
   (( DRY_RUN )) && { log "DRY-RUN alert [$band]: $msg"; return 0; }
   # No resolvable owner chat id -> never send (would otherwise go nowhere or, with
   # a hardcoded default, to a stranger). Log and move on.
   [[ -z "$CHAT_ID" ]] && { log "no owner chat id resolved; skipping Telegram alert [$band]"; return 0; }
   local now prev_band prev_ep
   now="$(date +%s)"
-  if [[ -f "$ALERT_STAMP" ]]; then
-    prev_band="$(cut -d: -f1 "$ALERT_STAMP" 2>/dev/null)"
-    prev_ep="$(cut -d: -f2 "$ALERT_STAMP" 2>/dev/null | tr -dc '0-9')"
-    if [[ "$prev_band" == "$band" && -n "${prev_ep:-}" ]] && (( now - prev_ep < ALERT_COOLDOWN )); then
+  if [[ -f "$stamp" ]]; then
+    prev_band="$(cut -d: -f1 "$stamp" 2>/dev/null)"
+    prev_ep="$(cut -d: -f2 "$stamp" 2>/dev/null | tr -dc '0-9')"
+    if [[ "$prev_band" == "$band" && -n "${prev_ep:-}" ]] && (( now - prev_ep < cooldown )); then
       log "alert [$band] within cooldown; skipping"; return 0
     fi
   fi
@@ -177,7 +215,8 @@ send_alert() {
     local send_err
     if send_err="$(send_telegram_message "$token" "$CHAT_ID" "$msg" 2>&1)"; then
       log "Telegram sent [$band]"
-      echo "${band}:${now}" >"$ALERT_STAMP" 2>/dev/null || true
+      mkdir -p "$(dirname "$stamp")" 2>/dev/null || true
+      echo "${band}:${now}" >"$stamp" 2>/dev/null || true
     else
       log "Telegram send FAILED -- cooldown stamp NOT written, will retry next run: ${send_err}"
     fi
@@ -210,7 +249,7 @@ else
   clear_safe_mode
 fi
 
-status_line="used=${used_pct}% avail=${avail_mb}MB running_agents=${running} cap=${AGENT_CAP} band=${band}"
+status_line="used=${used_pct}% avail=${avail_mb}MB running_agents=${running} cap=${AGENT_CAP}(${CAP_SRC}) band=${band}"
 
 # Observe-only: alerts have already fired above; from here the gate only reports and
 # always ALLOWS -- no block exit (10), no cap-block. Istvan owns the throttle call.
@@ -243,10 +282,14 @@ case "$MODE" in
     if [[ "$band" == "hard" || "$band" == "warn" ]]; then
       echo "block non-core (${band}): $agent | $status_line"; exit 10
     fi
+    cap_stamp="$CAP_ALERT_DIR/${agent//[^A-Za-z0-9._-]/_}"
     if (( running >= AGENT_CAP )); then
-      send_alert cap "Marveen memória-kapu: agent-cap elérve (${running}/${AGENT_CAP}). Új nem-core agent-indítás visszafogva, amíg csökken a szám."
+      send_alert cap "Marveen memória-kapu: agent-cap elérve (${running}/${AGENT_CAP}), ${agent} indítása visszafogva, amíg csökken a szám." \
+        "$cap_stamp" "$CAP_ALERT_WINDOW"
       echo "block non-core (cap ${running}/${AGENT_CAP}): $agent | $status_line"; exit 10
     fi
+    # An allowed start ends this agent's blocked state: its next block alerts at once.
+    (( DRY_RUN )) || rm -f "$cap_stamp" 2>/dev/null || true
     echo "allow: $agent | $status_line"; exit 0
     ;;
 esac
