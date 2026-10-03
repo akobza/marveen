@@ -18,6 +18,7 @@ import {
   listScheduledTasks, writeScheduledTask, markDefaultTaskRemoved,
 } from '../scheduled-tasks-io.js'
 import { runScheduledTaskNow } from '../schedule-runner.js'
+import { checkSchedulePostFields, SCHEDULE_POST_FIELDS } from '../schedule-post-fields.js'
 import type { RouteContext } from './types.js'
 
 // Resolve a URL-supplied schedule name to an on-disk dir, blocking path
@@ -142,9 +143,17 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       }
       throw err
     }
-    const data = JSON.parse(body.toString()) as {
-      name: string; description: string; prompt: string; schedule: string; agent?: string; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string
+    const raw: unknown = JSON.parse(body.toString())
+    // Every field writeScheduledTask knows is taken over, type-checked; an
+    // unknown or wrong-typed field is a 400 naming it, never a silent drop
+    // (5bdc1e4a -- see schedule-post-fields.ts).
+    const fieldCheck = checkSchedulePostFields(raw)
+    if (!fieldCheck.ok) {
+      json(res, { error: fieldCheck.message, rejected: fieldCheck.rejected, writable: SCHEDULE_POST_FIELDS }, 400)
+      return true
     }
+    const data = raw as { name?: string } & Parameters<typeof writeScheduledTask>[1]
+    const { name: _name, ...fields } = data
     const name = sanitizeScheduleName(data.name || '')
     if (!name) { json(res, { error: 'Name is required' }, 400); return true }
     if (!data.prompt?.trim()) { json(res, { error: 'Prompt is required' }, 400); return true }
@@ -161,11 +170,14 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     if (existsSync(dir)) { json(res, { error: 'Schedule already exists' }, 409); return true }
 
     writeScheduledTask(name, {
+      // the optional fields as sent (enabled, telegramChatId, preCheck, ...);
+      // the lines below keep the POST's own defaults and normalization
+      ...fields,
       description: data.description || '',
       prompt: data.prompt.trim(),
       schedule: data.schedule.trim(),
       agent: data.agent || MAIN_AGENT_ID,
-      enabled: true,
+      enabled: data.enabled ?? true,
       type: data.type || 'task',
       skipIfBusy: data.skipIfBusy === true,
       forceSend: data.forceSend === true,
