@@ -308,10 +308,11 @@ const HAS_PROC = existsSync('/proc/self')
 /**
  * The owner uid of a process: the owner of /proc/<pid> where /proc exists, else
  * `ps -o uid= -p <pid>`. null when it cannot be read (the process is gone, or
- * neither source answers); such a pid is never signalled. Exported for testability.
+ * neither source answers); such a pid is never signalled. `useProc` is a test
+ * seam (the ps path on a host that has /proc). Exported for testability.
  */
-export function processOwnerUid(pid: number): number | null {
-  if (HAS_PROC) {
+export function processOwnerUid(pid: number, useProc: boolean = HAS_PROC): number | null {
+  if (useProc) {
     try { return statSync(`/proc/${pid}`).uid } catch { return null }
   }
   try {

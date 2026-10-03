@@ -9,7 +9,8 @@
 // Two layers:
 //   1. pure: splitByOwner, sendSignal and terminatePids with stubbed owners and
 //      signals (EPERM on each step, ESRCH, a SIGTERM that ends the process, a
-//      survivor that gets SIGKILL);
+//      survivor that gets SIGKILL); the owner lookup through /proc and through
+//      the `ps -o uid=` fallback;
 //   2. real processes against a fake tmux (as in the cc4d0ddd and 217d8669
 //      tests): an own-uid poller is still reaped (positive control); the same
 //      kind of poller, reported as another uid's through the owner seam, is
@@ -51,6 +52,11 @@ describe('35ea0375 pure: the owner split and the signal outcome', () => {
   it('reads the real owner of this process, and null for a pid that cannot exist', () => {
     expect(processOwnerUid(process.pid)).toBe(process.getuid?.())
     expect(processOwnerUid(2 ** 22 + 12345)).toBeNull()
+  })
+
+  it('the ps fallback (a host without /proc, e.g. macOS) reads the same owner, and null for a missing pid', () => {
+    expect(processOwnerUid(process.pid, false)).toBe(process.getuid?.())
+    expect(processOwnerUid(2 ** 22 + 12345, false)).toBeNull()
   })
 
   it('classifies one signal: ok, ESRCH, EPERM, other', () => {
