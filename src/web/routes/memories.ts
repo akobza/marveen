@@ -3,9 +3,13 @@ import {
   hybridSearch, backfillEmbeddings,
   searchMemories, getMemoriesForChat, getDb, touchMemoriesAccessed,
   getMemoryById, deleteMemoryById, getMemoryVersions,
-  type Memory, type MemoryRow,
+  saveAgentMemoryCheckingSimilar,
+  type Memory, type MemoryRow, type SimilarMemory,
 } from '../../db.js'
-import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL, MEMORY_IMPORT_CATEGORIZE_MODEL, APP_TZ } from '../../config.js'
+import {
+  MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL, MEMORY_IMPORT_CATEGORIZE_MODEL, APP_TZ,
+  MEMORY_SIMILAR_THRESHOLD, MEMORY_SIMILAR_WAIT_MS,
+} from '../../config.js'
 import { createHash } from 'crypto'
 import { logger } from '../../logger.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
@@ -210,6 +214,22 @@ function ownerMismatchPayload(id: number, m: { caller: string; owner: string }) 
   }
 }
 
+// The text that rides the save response when similar memories exist. It asks
+// the question instead of answering it: whether the new memory supersedes an
+// older one is the saving agent's call, and a stale row that nobody corrects
+// keeps answering searches on its own.
+export function formatSimilarMemoryWarning(similar: SimilarMemory[]): string {
+  const list = similar
+    .map((s) => `#${s.id} (${s.agentId}, ${s.category}, ${s.similarity.toFixed(2)})`)
+    .join(', ')
+  return (
+    `similar memories already exist: ${list}. Saved anyway. ` +
+    'Does the new memory supersede any of them, or do they stand together? ' +
+    'If it supersedes one, correct or retire the older row as well, so a later ' +
+    'search cannot surface the stale claim on its own.'
+  )
+}
+
 export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method, url } = ctx
 
@@ -230,13 +250,27 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
       json(res, { error: `Invalid category "${category}". Allowed: ${[...MEMORY_CATEGORIES].join(', ')}` }, 400)
       return true
     }
-    const result = saveAgentMemory(
-      data.agent_id || MAIN_AGENT_ID,
+    const agentId = data.agent_id || MAIN_AGENT_ID
+    const result = await saveAgentMemoryCheckingSimilar(
+      agentId,
       data.content.trim(),
       category,
       data.keywords || undefined,
-      true
+      true,
+      { threshold: MEMORY_SIMILAR_THRESHOLD, waitMs: MEMORY_SIMILAR_WAIT_MS },
     )
+    // Similar-memory signal (SIMILARMEMORY1003): the save has happened either
+    // way. similar_check always says whether the comparison ran, so "nothing
+    // close" is never confused with "not checked" (embedding backend down or
+    // too slow for the wait).
+    const reply: Record<string, unknown> = { ok: true, id: result.id, similar_check: result.check }
+    if (result.similar.length > 0) {
+      reply.similar_memories = result.similar.map((s) => ({
+        id: s.id, agent_id: s.agentId, category: s.category, similarity: Math.round(s.similarity * 1000) / 1000,
+      }))
+      reply.similar_warning = formatSimilarMemoryWarning(result.similar)
+      logger.info({ agent: agentId, memoryId: result.id, similar: result.similar.map((s) => s.id) }, 'memory saved next to similar memories')
+    }
     // Warn-only homoglyph check (GATEHOMOGLIFSWEEP816): the save above already
     // happened -- legitimate Cyrillic/Greek content (quotes, foreign records)
     // must never be lost, so the finding rides the response instead of a 4xx.
@@ -244,10 +278,9 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
     if (homoglyphs.length > 0) {
       const warning = formatHomoglyphWarning(homoglyphs)
       logger.warn({ agent: data.agent_id, memoryId: result.id }, `memory saved with ${warning}`)
-      json(res, { ok: true, id: result.id, homoglyph_warning: warning })
-      return true
+      reply.homoglyph_warning = warning
     }
-    json(res, { ok: true, id: result.id })
+    json(res, reply)
     return true
   }
 

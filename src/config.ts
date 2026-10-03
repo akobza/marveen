@@ -490,6 +490,34 @@ export const EMBED_MODEL = cfg('EMBED_MODEL') ?? 'nomic-embed-text'
 const rawEmbedDims = parseInt(cfg('EMBED_DIMS') ?? '0', 10)
 export const EMBED_DIMS = Number.isFinite(rawEmbedDims) && rawEmbedDims > 0 ? rawEmbedDims : 0
 
+// Save-time similar-memory signal on POST /api/memories. Two memories can
+// contradict each other and never meet: search is query-driven, so the older
+// claim stays findable on its own. At save time the new memory's embedding
+// (generated anyway) is compared with every stored one, and the response
+// names the rows at or above this cosine similarity, so the saving agent
+// decides whether the new memory supersedes them. Nothing is merged or deleted.
+//
+// The right value depends on the embedding model and the corpus. Measured on
+// one production install (5920 memories, nomic-embed-text, 768 dims,
+// 2026-10-03): two random memories sit at a median cosine of 0.72, the 99.9th
+// percentile at 0.86; a save's best match among the earlier memories is
+// >= 0.90 for 13% of saves (>= 0.92: 6%, >= 0.88: 28%), and sampled pairs
+// above 0.88 were nearly all the same subject (a later status, the same rule
+// saved twice). A copied claim scored 0.93 and a short contradicting pair
+// 0.92, but a long multi-topic memory against a one-sentence correction of it
+// scored 0.78 -- inside the random range, so whole-memory cosine cannot flag
+// that case at any useful threshold.
+const rawSimilarThreshold = parseFloat(cfg('MEMORY_SIMILAR_THRESHOLD') ?? '0.9')
+export const MEMORY_SIMILAR_THRESHOLD =
+  Number.isFinite(rawSimilarThreshold) && rawSimilarThreshold > 0 && rawSimilarThreshold <= 1 ? rawSimilarThreshold : 0.9
+// How long a save waits for the new memory's embedding before it answers
+// without the check (similar_check "timeout"; the vector is still stored when
+// it arrives). A GPU backend answers in milliseconds, a CPU-only one can take
+// 40-60 s for a long memory (see tool-timeouts.ts), and a save must not hang
+// that long. 0 turns the check off: no wait, the save answers at once.
+const rawSimilarWaitMs = parseInt(cfg('MEMORY_SIMILAR_WAIT_MS') ?? '5000', 10)
+export const MEMORY_SIMILAR_WAIT_MS = Number.isFinite(rawSimilarWaitMs) && rawSimilarWaitMs >= 0 ? rawSimilarWaitMs : 5000
+
 // The base URL an OLLAMA-CLASSED agent talks to is not the same thing as the
 // ollama API this install uses elsewhere. agent-process.ts only needs an
 // ANTHROPIC-compatible /v1/messages endpoint; the other four OLLAMA_URL
