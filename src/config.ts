@@ -293,9 +293,211 @@ export function systemdStatusUnits(serviceId: string): string[] {
   return [...new Set([`${serviceId}-dashboard`, serviceId, LEGACY_SERVICE_ID])]
 }
 
-export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
+// --- Boot-critical key: process.env is allowed to win, for this ONE key only ----------
+//
+// readEnvFile() reads the .env FILE and nothing else, so until now
+// `WEB_PORT=39876 node dist/index.js` came up SILENTLY on 3420: the variable was not
+// wrong, it was not consulted. That is worse than a rejected value, because the
+// operator has evidence they set it and the process has evidence it did not.
+//
+// The allowlist is deliberately ONE key and lives in one named place. It is NOT a
+// general process.env overlay: pouring the environment over the config would let an
+// inherited variable silently rewrite this install's identity (MAIN_AGENT_ID,
+// CHANNEL_PROVIDER, tokens), which is a much larger hole than the one being closed.
+// Any further key needs its own decision, not an edit to this array. WEB_HOST had one and
+// is OUT: it is the bind address, so an inherited WEB_HOST=0.0.0.0 (or ::) would open the
+// dashboard to the whole network and put the address into the CSRF allowlist, with nothing
+// validating it. It stays a .env-only key, read exactly as before this card.
+//
+// CLAUDECLAW_ENV_DIR (env.ts:11, and FLEET_PYTHON_VENV below) is untouched: it already reads
+// process.env and is a test seam for the .env path itself, not a config value.
+const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT'] as const
+type BootKey = (typeof PROCESS_ENV_BOOT_KEYS)[number]
+
+// process.env > config-overrides.json > .env  (the caller applies the default).
+// An empty or whitespace-only value counts as UNSET at every layer, so a stray
+// `WEB_PORT=` cannot blank the port -- it falls through to the next source, the same
+// way cfg() already treats an empty override.
+// Pure, so the ORDER can be asserted without booting the process or touching the
+// real .env -- the precedence is the thing this card changes, so it is the thing a
+// test has to be able to see.
+export function resolveBootValue(
+  fromProcess: string | undefined,
+  fromLayered: string | undefined,
+): { value: string; source: string } | undefined {
+  if (fromProcess !== undefined && fromProcess.trim().length > 0) {
+    return { value: fromProcess.trim(), source: 'process.env' }
+  }
+  if (fromLayered !== undefined && fromLayered.trim().length > 0) {
+    return { value: fromLayered.trim(), source: 'config-overrides.json/.env' }
+  }
+  return undefined
+}
+
+// A .env line `WEB_PORT=3420 # komment` reaches the file layer as "3420 # komment": the shared .env grammar
+// (env-parse.ts) drops whole-line comments, not trailing ones. The old parseInt read 3420 from it; the strict
+// parse below would refuse the boot, and under Restart=always that is a restart loop. So the file layer drops a
+// trailing comment (whitespace, then '#') the way the reader already drops a comment line. A process.env value
+// keeps it: an environment variable has no comments, and a '#' there is part of a wrong value.
+export function dropTrailingComment(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : value.replace(/\s+#.*$/s, '')
+}
+
+function bootEnv(key: BootKey): { value: string; source: string } | undefined {
+  return resolveBootValue(process.env[key], dropTrailingComment(cfg(key)))
+}
+
+/**
+ * Parse a port, or STOP.
+ *
+ * `parseInt('39876x', 10)` is 39876 and `parseInt('nope', 10)` is NaN -- and a NaN port
+ * makes listen() bind an arbitrary free port, so the dashboard would come up somewhere
+ * nobody is looking. While the value could only come from a hand-edited .env this was a
+ * once-per-install risk; now that a command line can set it, one keystroke is enough.
+ * Exported for tests: the failure path must be assertable without booting the process.
+ */
+export function parseWebPort(raw: string | undefined, source: string, fallback: number): number {
+  if (raw === undefined) return fallback
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `WEB_PORT is not a number: ${JSON.stringify(raw)} (source: ${source}). ` +
+      'Refusing to start: an unparsable port would bind an arbitrary free port and the ' +
+      'dashboard would come up where nobody is looking.',
+    )
+  }
+  const port = Number(raw)
+  if (port < 1 || port > 65535) {
+    throw new Error(
+      `WEB_PORT is out of range: ${port} (source: ${source}). Valid ports are 1-65535.`,
+    )
+  }
+  return port
+}
+
+/**
+ * Two-level validation, LEVEL ONE: resolve, or FALL BACK -- never throw here.
+ *
+ * The first shape of this fix threw at module load. That is wrong for a measured
+ * reason: WEB_PORT is imported by ten places that are NOT the web server -- agent
+ * scaffolds, enroll bundles, the bridge port routes, the example curl commands written
+ * into agent instructions. A module-level throw does not STOP a typo, it SPREADS it:
+ * every one of those importers dies at import time, and the message lands wherever that
+ * importer happens to write, which is usually nowhere anyone is looking.
+ *
+ * So the module level does what resolveAppTz above already does for SCHEDULER_TZ: fall
+ * back, and export the rejected value as a flag. The difference from SCHEDULER_TZ is
+ * what the consumer then does: a bad timezone warns and keeps scheduling, a bad port
+ * REFUSES -- quietly accepting the fallback port is the exact defect this card exists to
+ * remove. See assertWebPortUsable below.
+ *
+ * The flag carries the raw value, its source, the validator's OWN words and the fallback
+ * actually taken, so the refusal downstream is one signal read in two places, not a log
+ * line someone has to grep for.
+ */
+export function resolveWebPort(
+  raw: { value: string; source: string } | undefined,
+  fallback: number,
+): { port: number; invalid?: { raw: string; source: string; reason: string; fallback: number } } {
+  try {
+    return { port: parseWebPort(raw?.value, raw?.source ?? 'default', fallback) }
+  } catch (e) {
+    return {
+      port: fallback,
+      invalid: {
+        raw: raw?.value ?? '',
+        source: raw?.source ?? 'default',
+        reason: e instanceof Error ? e.message : String(e),
+        fallback,
+      },
+    }
+  }
+}
+
+const webPortRaw = bootEnv('WEB_PORT')
+const webPortResolved = resolveWebPort(webPortRaw, 3420)
+export const WEB_PORT = webPortResolved.port
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
+
+// Which source the boot-critical key actually came from. The startup log prints this:
+// "the variable was ignored" and "the variable was applied" look identical from outside,
+// and that ambiguity is exactly what this card exists to remove.
+export const BOOT_KEY_SOURCES: Record<BootKey, string> = {
+  WEB_PORT: webPortRaw?.source ?? 'default',
+}
+
+// The WEB_PORT value that was REJECTED, if any -- undefined on the healthy path.
+// It sits right next to BOOT_KEY_SOURCES on purpose: both answer the same question
+// ("what actually happened to this key at boot"), and both are READ, not grepped. A log
+// line is not addressed to anyone; a flag can be asserted, and is.
+export const WEB_PORT_INVALID = webPortResolved.invalid
+
+/**
+ * LEVEL TWO: refuse.
+ *
+ * Call this before anything acts on WEB_PORT in a way that a wrong value makes
+ * destructive or invisible. Two such places exist, and the second one is why this
+ * function is not simply inlined into the web server:
+ *
+ *   1. acquireLock() in index.ts -- it SIGTERMs and then SIGKILLs whatever holds
+ *      WEB_PORT. On the fallback that is 3420, i.e. the install's OWN running
+ *      dashboard. Measured: index.ts calls acquirePortLock(WEB_PORT) ~115 lines
+ *      before startWebServer(WEB_PORT), so a gate that only sat in the web server
+ *      would let a typo kill the live dashboard first and refuse to start second --
+ *      strictly worse than the defect it fixes.
+ *   2. startWebServer() in web.ts -- binding the fallback port is the silent
+ *      acceptance itself.
+ *
+ * The message names the raw value, its source, the fallback that was taken and the
+ * validator's own sentence, because the operator reading it is holding the typo, not
+ * the source tree.
+ */
+/**
+ * LEVEL TWO, second half: the warning that travels WITH the value.
+ *
+ * The two gates above stand where the fault ARISES. This one stands where it
+ * SPREADS: WEB_PORT is written into agent templates, enroll bundles and example
+ * curl commands, and those outlive the process that produced them. Someone copies
+ * a command tomorrow; the 3420 in it looks like a configured value, because
+ * nothing in the text says otherwise.
+ *
+ * ONE string, emitted verbatim at every such site -- deliberately a constant and
+ * not a per-site sentence. Ten hand-written variants drift, and the next edit
+ * updates eight of them.
+ *
+ * null on the healthy path, so a site can branch on it without knowing anything
+ * about how the port was resolved.
+ */
+export const WEB_PORT_COPY_WARNING: string | null = WEB_PORT_INVALID
+  ? `WEB_PORT was INVALID at boot (${JSON.stringify(WEB_PORT_INVALID.raw)}, source: ` +
+    `${WEB_PORT_INVALID.source}), so this text carries the ${WEB_PORT_INVALID.fallback} ` +
+    `fallback, NOT your configured port. Fix WEB_PORT and regenerate before using this.`
+  : null
+
+/**
+ * Put the warning in front of `text` when one stands, commented with the marker
+ * the destination understands ('# ' for shell and most config, '// ' for JS-like).
+ * Returns `text` byte-for-byte unchanged on the healthy path -- so a site can call
+ * it unconditionally and the clean output is not altered at all, which is what
+ * makes "the warning is absent on the clean path" a testable claim rather than an
+ * intention.
+ */
+export function withWebPortWarning(text: string, marker = '# '): string {
+  if (!WEB_PORT_COPY_WARNING) return text
+  return `${marker}${WEB_PORT_COPY_WARNING}\n${text}`
+}
+
+export function assertWebPortUsable(): void {
+  if (!WEB_PORT_INVALID) return
+  const { raw, source, reason, fallback } = WEB_PORT_INVALID
+  throw new Error(
+    `WEB_PORT is unusable, refusing to continue. The raw value ${JSON.stringify(raw)} ` +
+    `(source: ${source}) was REJECTED at module load, and config.ts fell back to ` +
+    `${fallback} so the rest of the process could still be imported. ${reason} ` +
+    `Fix WEB_PORT or unset it, then start again: continuing would put the dashboard on ` +
+    `${fallback} -- not where you asked for it, and not where you would go looking.`,
+  )
+}
 
 // Kanban card aging visual thresholds (hours since last update) and colours.
 // Override per-install via .env; defaults match the design spec (24/72/168h).

@@ -78,6 +78,12 @@ export interface AcquirePortLockOptions {
   postKillDrainMs?: number
   /** Poll interval for the post-kill drain. Default 100ms. */
   postKillPollMs?: number
+  /** If set, a port holder that is NOT this install's own dashboard (found by the port, not by the
+   * project-root-scoped binary pattern) is not terminated: the call throws, naming the PIDs and this
+   * reason, before signalling anyone. The dashboard sets it when WEB_PORT came from process.env (card
+   * b2cd0f43): an inherited variable can name another service's port, and the port branch does not
+   * filter by project root. */
+  refuseForeignPortHolders?: string
 }
 
 const DEFAULT_GRACE_MS = 1500
@@ -234,6 +240,16 @@ export async function acquirePortLock(
   const pollMs = opts.postKillPollMs ?? DEFAULT_POST_KILL_POLL_MS
   const byPort = findOwnNodeHolders(port, ctx)
   const byBinary = opts.binaryPattern ? findOwnBinaryMatches(opts.binaryPattern, ctx) : []
+  if (opts.refuseForeignPortHolders) {
+    const own = new Set(byBinary)
+    const foreign = byPort.filter((pid) => !own.has(pid))
+    if (foreign.length) {
+      throw new Error(
+        `Port ${port} is held by pid(s) ${foreign.join(', ')}, which are not this install's dashboard ` +
+        `(${opts.refuseForeignPortHolders}). Refusing to stop them: free the port, or start without that setting.`,
+      )
+    }
+  }
   const victims = Array.from(new Set([...byPort, ...byBinary]))
   if (!victims.length) return
   ctx.log.warn({ port, victims, matchedBy: { byPort, byBinary } }, 'Previous dashboard instance(s) detected, taking over')
