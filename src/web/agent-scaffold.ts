@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync, rmSync, watchFile, unwatchFile } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync, rmSync, watchFile, unwatchFile, lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { readRemovedDefaultTasks } from './scheduled-tasks-io.js'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -2522,7 +2522,7 @@ const SKILLS_TRAP_BLOCK_RE = new RegExp(
   `${SKILLS_TRAP_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SKILLS_TRAP_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
 )
 
-function buildSkillsPathTrapBody(): string {
+function buildSkillsPathTrapBody(memoryNote: string[]): string {
   return [
     '## Skill-útvonal csapda (KÖTELEZŐ elolvasni skill-írás előtt)',
     '',
@@ -2533,19 +2533,57 @@ function buildSkillsPathTrapBody(): string {
     '`.claude/skills/` mappájába megy. A globálisba írás tudatos, flotta-szintű',
     'döntés legyen, ne alapértelmezés.',
     '',
-    // 2026-09-07: a leanarchivist a saját tanulságát a
-    // `.claude-config/projects/-home-istvan-marveen/memory/MEMORY.md`-be akarta
-    // írni. Megmérve: `projects -> ~/.claude/projects`, tehát az a fájl a Lean
-    // Chief memóriája. A skills symlink nem az egyetlen ilyen út; a szabály
-    // általános, ezért itt, ugyanabban a blokkban kap helyet.
-    'Ugyanez a csapda a MEMÓRIÁRA is áll (2026-09-07-én megmérve, leanarchivist):',
-    'a `.claude-config/projects` szintén symlink a `~/.claude/projects`-re, tehát a',
-    '`.claude-config/projects/.../memory/MEMORY.md` NEM a te memóriád, hanem a Lean',
-    'Chiefé -- az ő session-je tölti be, a tiéd soha. A te memóriád a dashboard API,',
-    '`agent_id`-vel címezve (`POST /api/memories`). Általános szabály: a `.claude`',
-    'vagy `.claude-config` alatti útvonal soha nem a sajátod, akkor sem, ha a',
-    'munkakönyvtáradban látszik. Írás előtt nézd meg, hova mutat: `ls -la`.',
+    ...memoryNote,
   ].join('\n')
+}
+
+// MEMCSAPDAMERT1003 (kanban e2c5e112): the memory paragraph used to state one other install's 2026-09-07 measurement as a fact for
+// every install (".claude-config/projects is a symlink to ~/.claude/projects, so its MEMORY.md is the main agent's"). Since the
+// isolated-config provisioner leaves `projects` alone (ISOLATED_CONFIG_SKIP in agent-process.ts), a fresh agent gets a REAL
+// directory there, and the fixed sentence told agents that their own memory belonged to someone else. The paragraph now states
+// what THIS generation measured for THIS agent (lstat, readlink, realpath): a symlink and where it points, a real directory, or
+// no such path. It is rewritten on every respawn with the rest of the block, so a later change of the path shows up there too.
+export function describeProjectsMemory(base: string): string[] {
+  const rel = '`.claude-config/projects`'
+  const api = 'A flotta közös, kereshető memóriája ettől függetlenül a dashboard API (`POST /api/memories`, `agent_id`-vel).'
+  const check = 'Ez a CLAUDE.md legutóbbi generálásakor mért állapot; írás előtt nézd meg újra: `ls -la` és `realpath`.'
+  const p = join(base, '.claude-config', 'projects')
+  let kind: 'symlink' | 'dir' | 'other' | 'missing'
+  try {
+    const st = lstatSync(p)
+    kind = st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : 'other'
+  } catch {
+    kind = 'missing'
+  }
+  if (kind === 'symlink') {
+    let target = '?'
+    try { target = readlinkSync(p) } catch { /* unreadable link: the "?" says so */ }
+    let real: string | null = null
+    try { real = realpathSync(p) } catch { real = null }
+    return [
+      `A MEMÓRIÁRA is áll ez a csapda (mérve): a ${rel} SYMLINK, célja \`${target}\`` +
+        (real ? ` (feloldva \`${real}\`).` : ', és a cél NEM ÉRHETŐ EL.'),
+      'Az alatta álló `memory/MEMORY.md` tehát nem csak a tiéd: minden session-é, amely ugyanezt a célt használja;',
+      'saját, csak rád tartozó tanulságot oda ne írj.',
+      api,
+      check,
+    ]
+  }
+  if (kind === 'dir') {
+    return [
+      `A MEMÓRIÁRA ez a csapda itt NEM áll (mérve): a ${rel} VALÓDI könyvtár, nem symlink, tehát az alatta`,
+      'álló `memory/MEMORY.md` a te session-öd Claude Code-memóriája, és a te session-öd tölti be.',
+      api,
+      check,
+    ]
+  }
+  return [
+    kind === 'other'
+      ? `A MEMÓRIÁRA (mérve): a ${rel} ezen az úton se nem könyvtár, se nem symlink.`
+      : `A MEMÓRIÁRA (mérve): a ${rel} ezen az úton nem létezik.`,
+    api,
+    check,
+  ]
 }
 
 // Same five-rule idempotency contract as ensureFleetRosterSection /
@@ -2557,7 +2595,8 @@ export function ensureSkillsPathTrapSection(name: string): void {
     : join(agentDir(name), 'CLAUDE.md')
   if (!existsSync(claudeMdPath)) return
 
-  const block = `${SKILLS_TRAP_BEGIN}\n${buildSkillsPathTrapBody()}\n${SKILLS_TRAP_END}`
+  const memoryNote = describeProjectsMemory(name === MAIN_AGENT_ID ? PROJECT_ROOT : agentDir(name))
+  const block = `${SKILLS_TRAP_BEGIN}\n${buildSkillsPathTrapBody(memoryNote)}\n${SKILLS_TRAP_END}`
 
   let existing: string
   try {

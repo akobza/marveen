@@ -4,7 +4,7 @@
 // third-party skills landed fleet-wide through it on 2026-08-22. This proves
 // the warning block actually reaches the agent file on respawn, idempotently.
 import { describe, it, expect, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, symlinkSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -97,6 +97,102 @@ describe('ensureSkillsPathTrapSection', () => {
     ensureSkillsPathTrapSection('agent-a')
     const out = readFileSync(join(tmpRoot, 'CLAUDE.md'), 'utf-8')
     expect(out).toContain(MARKER_BEGIN)
+  })
+})
+
+// MEMCSAPDAMERT1003 (kanban e2c5e112): the memory paragraph states what the generation MEASURED for THIS agent's
+// .claude-config/projects (a symlink and its target, a real directory, or no such path), never one install's old fact.
+describe('MEMCSAPDAMERT1003: the memory paragraph is measured per agent', () => {
+  const block = (out: string) => out.slice(out.indexOf(MARKER_BEGIN), out.indexOf(MARKER_END))
+  const skillsPart = (out: string) => block(out).split('A MEMÓRIÁRA')[0]
+  const projects = (agentName: string) => join(tmpRoot, 'agents', agentName, '.claude-config', 'projects')
+  const OLD_FIXED_CLAIM = ['Lean Chief', 'leanarchivist', 'szintén symlink a `~/.claude/projects`-re']
+
+  it('a REAL projects directory: says so, and claims no symlink and no foreign owner', () => {
+    setup('agent-real', '# Real\n')
+    mkdirSync(join(projects('agent-real'), '-x', 'memory'), { recursive: true })
+    ensureSkillsPathTrapSection('agent-real')
+    const b = block(read('agent-real'))
+    expect(b).toContain('VALÓDI könyvtár, nem symlink')
+    expect(b).toContain('a te session-öd Claude Code-memóriája')
+    expect(b).not.toContain('SYMLINK, célja')
+    for (const s of OLD_FIXED_CLAIM) expect(b).not.toContain(s)
+  })
+
+  it('a SYMLINKED projects directory: names the link target and its resolved path, and warns', () => {
+    setup('agent-link', '# Link\n')
+    const shared = join(tmpRoot, 'shared-projects')
+    mkdirSync(shared, { recursive: true })
+    mkdirSync(join(tmpRoot, 'agents', 'agent-link', '.claude-config'), { recursive: true })
+    symlinkSync(shared, projects('agent-link'))
+    ensureSkillsPathTrapSection('agent-link')
+    const b = block(read('agent-link'))
+    expect(b).toContain('SYMLINK, célja `' + shared + '`')
+    expect(b).toContain('(feloldva `' + realpathSync(shared) + '`)')
+    expect(b).toContain('nem csak a tiéd')
+    expect(b).not.toContain('VALÓDI könyvtár')
+    for (const s of OLD_FIXED_CLAIM) expect(b).not.toContain(s)
+  })
+
+  it('a dangling symlink: the target is named and marked unreachable', () => {
+    setup('agent-dangling', '# Dangling\n')
+    mkdirSync(join(tmpRoot, 'agents', 'agent-dangling', '.claude-config'), { recursive: true })
+    symlinkSync(join(tmpRoot, 'no-such-target'), projects('agent-dangling'))
+    ensureSkillsPathTrapSection('agent-dangling')
+    const b = block(read('agent-dangling'))
+    expect(b).toContain('SYMLINK, célja `' + join(tmpRoot, 'no-such-target') + '`, és a cél NEM ÉRHETŐ EL.')
+  })
+
+  it('no such path, and a plain file in its place: each says what it found', () => {
+    setup('agent-none', '# None\n')
+    ensureSkillsPathTrapSection('agent-none')
+    expect(block(read('agent-none'))).toContain('ezen az úton nem létezik')
+    setup('agent-file', '# File\n')
+    mkdirSync(join(tmpRoot, 'agents', 'agent-file', '.claude-config'), { recursive: true })
+    writeFileSync(projects('agent-file'), 'x', 'utf-8')
+    ensureSkillsPathTrapSection('agent-file')
+    expect(block(read('agent-file'))).toContain('se nem könyvtár, se nem symlink')
+  })
+
+  it('the two installs get DIFFERENT memory text and the SAME skills paragraph', () => {
+    setup('agent-real2', '# Real2\n')
+    mkdirSync(projects('agent-real2'), { recursive: true })
+    setup('agent-link2', '# Link2\n')
+    mkdirSync(join(tmpRoot, 'shared-projects2'), { recursive: true })
+    mkdirSync(join(tmpRoot, 'agents', 'agent-link2', '.claude-config'), { recursive: true })
+    symlinkSync(join(tmpRoot, 'shared-projects2'), projects('agent-link2'))
+    ensureSkillsPathTrapSection('agent-real2')
+    ensureSkillsPathTrapSection('agent-link2')
+    const real = read('agent-real2')
+    const link = read('agent-link2')
+    expect(block(real)).not.toBe(block(link))
+    expect(skillsPart(real)).toBe(skillsPart(link))
+    expect(skillsPart(real)).toContain('NEM a saját mappád')
+  })
+
+  it('a respawn re-measures: a real directory replaced by a symlink rewrites the block, once', () => {
+    setup('agent-switch', '# Switch\n')
+    mkdirSync(projects('agent-switch'), { recursive: true })
+    ensureSkillsPathTrapSection('agent-switch')
+    expect(block(read('agent-switch'))).toContain('VALÓDI könyvtár')
+    rmSync(projects('agent-switch'), { recursive: true })
+    mkdirSync(join(tmpRoot, 'shared-projects3'), { recursive: true })
+    symlinkSync(join(tmpRoot, 'shared-projects3'), projects('agent-switch'))
+    ensureSkillsPathTrapSection('agent-switch')
+    const out = read('agent-switch')
+    expect(block(out)).toContain('SYMLINK, célja')
+    expect(block(out)).not.toContain('VALÓDI könyvtár')
+    expect(out.split(MARKER_BEGIN).length - 1).toBe(1)
+  })
+
+  it('the main agent is measured on PROJECT_ROOT, not on an agents/ directory', () => {
+    writeFileSync(join(tmpRoot, 'CLAUDE.md'), '# Main\n', 'utf-8')
+    ensureSkillsPathTrapSection('agent-a')
+    expect(block(readFileSync(join(tmpRoot, 'CLAUDE.md'), 'utf-8'))).toContain('ezen az úton nem létezik')
+    mkdirSync(join(tmpRoot, '.claude-config', 'projects'), { recursive: true })
+    ensureSkillsPathTrapSection('agent-a')
+    expect(block(readFileSync(join(tmpRoot, 'CLAUDE.md'), 'utf-8'))).toContain('VALÓDI könyvtár')
+    rmSync(join(tmpRoot, '.claude-config'), { recursive: true })
   })
 })
 
