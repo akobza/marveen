@@ -187,6 +187,55 @@ def main() -> int:
         check("CONTROL: every source readable -> the principals-only id IS found (exit 1)",
               rc == 1 and "*******004" in out, "rc=%d" % rc)
 
+    # --- card 7b964221: the source discovery is two levels deep and never leaves the tree ---
+    import glob as glob_mod
+    import importlib.util
+    import time
+    spec = importlib.util.spec_from_file_location("person_id_scan", SCAN)
+    pis = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pis)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_root(tmp, allow_main=[FIXTURE_IDS[0]], allow_sub=[FIXTURE_IDS[2]],
+                         principals={FIXTURE_IDS[3]: "staff"})
+        for name in ("a1", "a2", "a3"):   # four agent channels in all, the fleet's layout
+            d = Path(root) / "agents" / name / ".claude" / "channels" / "telegram"
+            d.mkdir(parents=True)
+            (d / "access.json").write_text(json.dumps({"allowFrom": []}), encoding="utf-8")
+        recursive = sorted(glob_mod.glob(os.path.join(root, "**", ".claude", "channels", "*", "access.json"),
+                                         recursive=True))
+        inside, outside = pis.find_sources(root)
+        check("the bounded discovery finds the same 5 sources as the recursive walk",
+              inside == recursive and len(inside) == 5 and outside == [],
+              "%d bounded, %d recursive" % (len(inside), len(recursive)))
+
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as away:
+        root = make_root(tmp, allow_main=[FIXTURE_IDS[0]], principals={FIXTURE_IDS[3]: "staff"})
+        far = Path(away) / ".claude" / "channels" / "telegram"
+        far.mkdir(parents=True)
+        (far / "access.json").write_text(json.dumps({"allowFrom": [FIXTURE_IDS[1]]}), encoding="utf-8")
+        os.symlink(away, os.path.join(root, "agents", "elsewhere"))
+        inside, outside = pis.find_sources(root)
+        check("a source behind a symlink out of the tree is not read",
+              [os.path.relpath(p, root) for p in outside] == ["agents/elsewhere/.claude/channels/telegram/access.json"]
+              and not any("elsewhere" in p for p in inside))
+        rc, out = run(root, DIFF_HIT)   # 9990000002 is known ONLY to the file outside the tree
+        check("... and the list counts as partial: exit 2, the skipped path named, not clean",
+              rc == 2 and "OUTSIDE THE TREE agents/elsewhere" in out and "clean:" not in out, "rc=%d" % rc)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = full_root(tmp)
+        os.symlink(root, os.path.join(root, "loop"))                       # a cycle back to the root
+        os.symlink("/", os.path.join(root, "agents", "sub", "whole-disk"))  # a link to the whole filesystem
+        started = time.time()
+        try:
+            rc, out = run(root, DIFF_HIT)
+        except subprocess.TimeoutExpired:
+            rc, out = -1, "timeout"
+        took = time.time() - started
+        check("a symlink cycle and a link to / do not make the discovery wander (%.1f s)" % took,
+              rc == 1 and took < 10, "rc=%d" % rc)
+
     total = len(RESULTS)
     print("\n=> %d/%d ok" % (sum(RESULTS), total))
     return 0 if all(RESULTS) else 1

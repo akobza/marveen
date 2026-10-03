@@ -8,8 +8,10 @@ pre-commit secret gate does not cover this either (measured: a file holding a re
 Until now the only protection was the agent reading the diff.
 
 The identifier list is built AT RUNTIME from the live configuration, never hardcoded:
-  * every  <root>/**/.claude/channels/<provider>/access.json  ->  allowFrom[]
-  * store/principals.json                                     ->  principals{} keys
+  * <root>/.claude/channels/<provider>/access.json            ->  allowFrom[]
+  * <root>/agents/*/.claude/channels/<provider>/access.json   ->  allowFrom[]
+  * store/principals.json                                      ->  principals{} keys
+Two levels and no deeper, and never through a symlink out of the tree (card 7b964221).
 
 EXIT CODES (three states, deliberately distinct):
   0  clean      - the scanned content holds no known identifier
@@ -45,6 +47,33 @@ def mask(ident):
     return "*" * max(len(s) - 3, 0) + (s[-3:] if len(s) > 3 else "*" * len(s))
 
 
+def find_sources(root):
+    """The identifier sources under root: its own channel configuration and each agent's, two levels and
+    no deeper. Returns (inside, outside).
+
+    Card 7b964221: this used a recursive '**' glob, and '**' follows symlinks. On a live install the walk
+    left the tree through a config directory's symlinks into the home directory's caches and did not finish
+    in 290 s: unusable in a commit hook, and too slow for the push-time scan as well. The fleet's layout is
+    exactly these two levels (the tests below build the same two).
+
+    A candidate whose real path leaves the tree through a symlink is NOT read. It comes back in `outside`,
+    so the caller can refuse a partial list instead of shrinking it silently."""
+    real_root = os.path.realpath(root)
+    candidates = sorted(set(
+        glob.glob(os.path.join(root, ".claude", "channels", "*", "access.json"))
+        + glob.glob(os.path.join(root, "agents", "*", ".claude", "channels", "*", "access.json"))))
+    inside, outside = [], []
+    for path in candidates:
+        real = os.path.realpath(path)
+        (inside if real.startswith(real_root + os.sep) else outside).append(path)
+    return inside, outside
+
+
+def has_sources(root):
+    inside, outside = find_sources(root)
+    return bool(inside or outside)
+
+
 def main_worktree(start):
     """The live configuration (.claude/, store/) is gitignored, so a linked worktree does not
     carry it. Resolve the MAIN worktree from the common git dir, so the scan reads the same
@@ -70,14 +99,12 @@ def resolve_root(explicit):
     if explicit != REPO_DEFAULT:
         return explicit, [explicit]
     tried = [REPO_DEFAULT]
-    if glob.glob(os.path.join(REPO_DEFAULT, "**", ".claude", "channels", "*", "access.json"),
-                 recursive=True):
+    if has_sources(REPO_DEFAULT):
         return REPO_DEFAULT, tried
     main = main_worktree(REPO_DEFAULT)
     if main and main != REPO_DEFAULT:
         tried.append(main)
-        if glob.glob(os.path.join(main, "**", ".claude", "channels", "*", "access.json"),
-                     recursive=True):
+        if has_sources(main):
             return main, tried
     return REPO_DEFAULT, tried
 
@@ -91,8 +118,12 @@ def load_identifiers(root):
     invisible, and the scan would pass while the id sits in the diff.
     """
     report, ids, unreadable = [], set(), []
-    pattern = os.path.join(root, "**", ".claude", "channels", "*", "access.json")
-    sources = sorted(glob.glob(pattern, recursive=True))
+    sources, outside = find_sources(root)
+    for path in outside:
+        # Not read: it is not this tree's configuration. Listed as unreadable, so the list counts as partial.
+        report.append("  OUTSIDE THE TREE %s (a symlink leads out of the root; not read)"
+                      % os.path.relpath(path, root))
+        unreadable.append(os.path.relpath(path, root))
     for path in sources:
         try:
             data = json.load(io.open(path, encoding="utf-8"))
@@ -115,7 +146,7 @@ def load_identifiers(root):
         report.append("  UNREADABLE store/principals.json (%s)" % type(exc).__name__)
         unreadable.append("store/principals.json")
 
-    return ids, report, len(sources), unreadable
+    return ids, report, len(sources) + len(outside), unreadable
 
 
 def build_matcher(ids):
