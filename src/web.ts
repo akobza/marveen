@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, STORE_DIR } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, STORE_DIR, BOOT_KEY_SOURCES, assertWebPortUsable } from './config.js'
 import { watchEgressAllowlistBaseline, queueAllowlistReport } from './web/egress-allowlist-baseline.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
@@ -113,6 +113,14 @@ function ensureDirs() {
 }
 
 export function startWebServer(port = 3420): http.Server {
+  // Level TWO of the WEB_PORT validation (card b2cd0f43). config.ts deliberately did
+  // NOT throw at module load -- see resolveWebPort -- so an invalid value reaches here
+  // as a flag with a fallback port already substituted. Binding that fallback is the
+  // silent acceptance of a wrong port, which is precisely the defect this card exists
+  // to remove, so this is where the boot stops. The message comes from the flag, not
+  // from a second sentence written here: one signal, read in two places.
+  assertWebPortUsable()
+
   // SECURITY: Server binds to 127.0.0.1 (see server.listen below). The allowed
   // browser origins mirror that -- anything else is rejected to prevent CSRF
   // from malicious websites the user may visit while the dashboard is running.
@@ -294,6 +302,14 @@ export function startWebServer(port = 3420): http.Server {
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
+      // A port the ENVIRONMENT chose is not ours to reclaim (card b2cd0f43): the reclaim below stops every
+      // own-UID node process on it, with no project-root check, and an inherited WEB_PORT can be another
+      // service's port. Stop the boot loudly instead.
+      if (BOOT_KEY_SOURCES.WEB_PORT === 'process.env') {
+        logger.error({ port, portSource: BOOT_KEY_SOURCES.WEB_PORT },
+          'Web port foglalt, es a WEB_PORT a process.env-bol jott: a portot nem szabaditom fel, kilepes')
+        process.exit(1)
+      }
       // Try to reclaim the port only if the listener is another node/dashboard
       // process owned by us. Blind `lsof -ti | xargs kill -9` would take down
       // whatever happens to be on the port (e.g. an unrelated dev server),
@@ -350,7 +366,13 @@ export function startWebServer(port = 3420): http.Server {
   })
 
   server.listen(port, WEB_HOST, () => {
-    logger.info({ port }, `Web dashboard: http://localhost:${port}`)
+    // Name the SOURCE of the port and host, not just their values. "The variable was
+    // ignored" and "the variable was applied" produce identical output otherwise, and
+    // that ambiguity is what let WEB_PORT be silently dropped (card b2cd0f43).
+    logger.info(
+      { port, host: WEB_HOST, portSource: BOOT_KEY_SOURCES.WEB_PORT },
+      `Web dashboard: http://localhost:${port}`,
+    )
     // Do NOT log the bearer token: launchd/journal/pipe captures of the
     // structured log would otherwise carry a root-equivalent credential.
     // Printing to stderr keeps it out of the pino stream -- but under launchd

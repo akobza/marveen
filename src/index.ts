@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
 import type { Server as HttpServer } from 'node:http'
-import { PROJECT_ROOT, STORE_DIR, PID_FILENAME, WEB_PORT, MAIN_AGENT_ID, RESPAWN_ENABLED, HEARTBEAT_AGENT_ENABLED } from './config.js'
+import { PROJECT_ROOT, STORE_DIR, PID_FILENAME, WEB_PORT, MAIN_AGENT_ID, RESPAWN_ENABLED, HEARTBEAT_AGENT_ENABLED, assertWebPortUsable, BOOT_KEY_SOURCES } from './config.js'
 import { resolveOwnerChatId } from './owner-chat.js'
 import { initDatabase, backfillEmbeddings } from './db.js'
 import { runDecaySweep, runDailyDigest } from './memory.js'
@@ -356,6 +356,14 @@ function checkFreshStartupRace(procCtx: ProcessLockContext): void {
 }
 
 async function acquireLock(): Promise<void> {
+  // The WEB_PORT gate stands HERE, not only in startWebServer, and the reason is
+  // measured: acquirePortLock() below SIGTERMs and then SIGKILLs whatever holds
+  // WEB_PORT, and on an invalid value config.ts has already substituted the 3420
+  // fallback -- which is this install's own running dashboard. startWebServer is
+  // reached ~115 lines later, so a gate only there would kill the live dashboard
+  // first and refuse to start second. A typo must not be able to do that.
+  assertWebPortUsable()
+
   mkdirSync(STORE_DIR, { recursive: true })
 
   const procCtx = buildProcessLockContext()
@@ -369,7 +377,12 @@ async function acquireLock(): Promise<void> {
   // anything running the dashboard binary (for the zombie case where the
   // port was released but the process survived). The pidfile alone can
   // lie under launchd KeepAlive because each restart overwrites it.
-  await acquirePortLock(WEB_PORT, procCtx, { binaryPattern: DASHBOARD_BINARY_PATTERN })
+  // A port the ENVIRONMENT chose may be another service's (card b2cd0f43): take over only this install's
+  // own dashboard there, and refuse -- loudly, before any signal -- to stop anything else.
+  await acquirePortLock(WEB_PORT, procCtx, {
+    binaryPattern: DASHBOARD_BINARY_PATTERN,
+    ...(BOOT_KEY_SOURCES.WEB_PORT === 'process.env' ? { refuseForeignPortHolders: 'WEB_PORT came from process.env' } : {}),
+  })
 
   // Atomic O_EXCL claim on PID_FILE. Serializes any two fresh startups
   // that race past the port check. `onLiveLegitimate: 'defer'` is a
