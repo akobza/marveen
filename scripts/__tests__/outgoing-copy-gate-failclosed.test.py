@@ -83,6 +83,20 @@ with tempfile.TemporaryDirectory() as _tmp:
     failed.append(_name2) if not _ok2 else None
     print(f"  [{'PASS' if _ok2 else 'FAIL'}] {_name2}: stderr={_err[:120]!r}")
 
+    # KANBANHOMOGLIF927 (card fbca08d6): the kanban text writes go through the same scan, so they fail closed the
+    # same way, and say it is the kanban gate.
+    _payload_kb = json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": "curl -s -X POST http://localhost:3420/api/kanban/00000000/comments "
+                                  "-d '{\"author\":\"igor\",\"content\":\"tiszta szoveg\"}'"},
+    })
+    _proc_kb = subprocess.run([sys.executable, _gate], input=_payload_kb.encode(), capture_output=True)
+    _err_kb = _proc_kb.stderr.decode("utf-8", "replace")
+    _name3 = "a missing mixed_script.py BLOCKS a kanban comment too, as the kanban gate"
+    _ok3 = _proc_kb.returncode == 2 and "NEM TOLTHETO BE" in _err_kb and "(kanban)" in _err_kb
+    failed.append(_name3) if not _ok3 else None
+    print(f"  [{'PASS' if _ok3 else 'FAIL'}] {_name3}: exit={_proc_kb.returncode} stderr={_err_kb[:120]!r}")
+
 print()
 if failed:
     print(f"{len(failed)} FAILED: {failed}", file=sys.stderr)

@@ -1256,13 +1256,49 @@ EMAIL_TOOL_RE = re.compile(
 #                                   attacker, so fail-open-loud is the right side.
 # All three shapes are covered, or the concept is not closed: quoted heredoc
 # (`--data-binary @- <<'JSON'`), `@file`, and inline `-d '...'`.
+#
+# KANBANHOMOGLIF927 (fbca08d6; decision of 2026-09-26): the
+# three kanban WRITES get the same homoglyph-only check, on the fields the
+# decision names. A card title, description or comment is where the fleet
+# leaves card ids, agent names and paths for the next reader, and the server
+# only LOGS a lookalike (AFTER INSERT triggers on the comment and the card
+# title; nothing at all on the description, neither on insert nor on update),
+# while a comment cannot be edited afterwards. So this is the last point where
+# the character can still be stopped:
+#   POST /api/kanban                -> title, description
+#   PUT  /api/kanban/<id>           -> title, description
+#   POST /api/kanban/<id>/comments  -> content
+# Other kanban calls (move, archive, reads) carry no free text: not scanned.
+# Same failure direction as the message branch: found -> BLOCK, uninterpretable
+# body -> PASS, loudly, logged as NEM MERHETO (a third state, never as "ok").
+# Both branches now also LOG a block (the code points, not the words: the log
+# is a trace of the event, the word itself stays in the author's stderr).
 _IA_TARGET = re.compile(r"^(https?://)?[^/\s]*/api/messages/?(\?\S*)?$", re.I)
+_KB_CREATE = re.compile(r"^(https?://)?[^/\s]*/api/kanban/?(\?\S*)?$", re.I)
+_KB_UPDATE = re.compile(r"^(https?://)?[^/\s]*/api/kanban/([^/\s?]+)/?(\?\S*)?$", re.I)
+_KB_COMMENT = re.compile(r"^(https?://)?[^/\s]*/api/kanban/([^/\s?]+)/comments/?(\?\S*)?$", re.I)
 _IA_DATA_FLAGS = ("-d", "--data", "--data-binary", "--data-raw", "--data-ascii", "--json")
 _IA_SUBST = re.compile(r"\$\(|`|\$\{?\w")
 
+# None = EVERY string field (a lookalike in `to` misroutes as silently as one in
+# `content` misleads); a tuple = only the fields the kanban decision names.
+_HW_FIELDS = {
+    "message": None,
+    "kanban-create": ("title", "description"),
+    "kanban-update": ("title", "description"),
+    "kanban-comment": ("content",),
+}
+_HW_LABEL = {
+    "message": "inter-agent",
+    "kanban-create": "kanban, uj lap",
+    "kanban-update": "kanban, lap-modositas",
+    "kanban-comment": "kanban-komment",
+}
 
-def _ia_segment(cmd: str):
-    """Tokens of the curl segment that POSTs to /api/messages, or None."""
+
+def _hw_segment(cmd: str):
+    """(kind, tokens, target) of the first curl segment that writes to an
+    inter-agent or a kanban text endpoint, or None."""
     try:
         segments = _segments_tokens(cmd)
     except ValueError:
@@ -1270,8 +1306,17 @@ def _ia_segment(cmd: str):
     for toks in segments:
         while toks and _ENV_ASSIGN.match(toks[0]):
             toks = toks[1:]
-        if toks and _CURLISH.match(_basename(toks[0])) and any(_IA_TARGET.match(t) for t in toks[1:]):
-            return toks
+        if not toks or not _CURLISH.match(_basename(toks[0])):
+            continue
+        for t in toks[1:]:
+            if _IA_TARGET.match(t):
+                return "message", toks, t
+            if _KB_COMMENT.match(t):
+                return "kanban-comment", toks, t
+            if _KB_UPDATE.match(t):
+                return "kanban-update", toks, t
+            if _KB_CREATE.match(t):
+                return "kanban-create", toks, t
     return None
 
 
@@ -1349,8 +1394,9 @@ def _curl_payload_raw(cmd: str, toks, all_flags: bool = False):
     return raw, None
 
 
-def _ia_payload(cmd: str, toks):
-    """(text, unreadable_reason) of the message body, from the three shapes."""
+def _hw_payload(cmd: str, toks, fields):
+    """([(field, text), ...], unreadable_reason) of the body, from the three
+    shapes. fields None = every string field under one name ("*")."""
     raw, unreadable = _curl_payload_raw(cmd, toks)
     if unreadable:
         return None, unreadable
@@ -1358,54 +1404,121 @@ def _ia_payload(cmd: str, toks):
         # No data flag at all: a GET of the queue (the most frequent call on this
         # path) or a bare POST. Nothing is being SENT, so nothing to scan and
         # nothing to warn about -- a warning here would fire on every queue read.
-        return "", None
+        return [], None
     try:
         obj = json.loads(raw)
     except ValueError:
         return None, "a torzs nem ervenyes JSON"
     if not isinstance(obj, dict):
         return None, "a torzs JSON, de nem objektum"
-    # EVERY string field: a lookalike in `to` misroutes as silently as one in
-    # `content` misleads.
-    strings = [str(v) for v in obj.values() if isinstance(v, str)]
-    return "\n".join(strings), None
+    if fields is None:
+        return [("*", "\n".join(str(v) for v in obj.values() if isinstance(v, str)))], None
+    return [(f, obj[f]) for f in fields if isinstance(obj.get(f), str)], None
 
 
-def inter_agent_homoglyph_gate(cmd: str) -> None:
-    """Exit 2 on a homoglyph, exit 0 otherwise (loudly when unreadable).
+# The dashboard is asked ONLY on a loopback address: the question carries the
+# local dashboard token, and a command that names another host must never make
+# this hook send that token there.
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _kb_stored_note(target: str, card_id: str, words) -> str:
+    """KANBANHOMOGLIF927 (e): the PUT carries the WHOLE title/description, so a
+    lookalike already STORED on the card blocks an innocent edit. Say which case
+    this is. Best effort: when the card cannot be read, say that too."""
+    from urllib.parse import urlsplit
+    from urllib.request import ProxyHandler, Request, build_opener
+    how = ("a PUT a teljes cimet es leirast kuldi, ezert egy mar tarolt homoglifa az ujonnan irt, "
+           "tiszta szoveget is megallitja. Javitas: a teljes szot ird ujra latin betukkel a kuldott "
+           "szovegben; ezzel a tarolt szoveg is rendbe jon.")
+    try:
+        parts = urlsplit(target if "://" in target else "http://" + target)
+        if (parts.hostname or "") not in _LOOPBACK_HOSTS:
+            reason = "a cel nem helyi cim, oda a hook nem kerdez"
+        else:
+            token_path = os.path.join(os.path.dirname(_LOCAL_RULES), ".dashboard-token")
+            with open(token_path, encoding="utf-8") as fh:
+                token = fh.read().strip()
+            req = Request(f"{parts.scheme}://{parts.netloc}/api/kanban",
+                          headers={"Authorization": f"Bearer {token}"})
+            # Directly, never through a proxy named in the environment: the
+            # question carries the local token, and a proxy would receive it.
+            with build_opener(ProxyHandler({})).open(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            cards = data if isinstance(data, list) else data.get("cards", [])
+            card = next((c for c in cards if isinstance(c, dict) and c.get("id") == card_id), None)
+            if card is None:
+                reason = "a lap nincs a nyitott lapok kozott"
+            else:
+                stored = f"{card.get('title') or ''}\n{card.get('description') or ''}"
+                old = [w for w in words if w in stored]
+                if old:
+                    return (f"A MAR TAROLT szovegben is all: {', '.join(repr(w) for w in old)}; " + how)
+                return "A talalat NEM a lap tarolt szovegeben all, hanem a most kuldott reszben."
+    except Exception as exc:  # noqa: BLE001 -- a best-effort hint must never change the verdict
+        reason = f"a lap nem olvashato ({type(exc).__name__})"
+    return f"Nem tudtam megnezni, hogy a talalat a MAR TAROLT szovegben all-e ({reason}). Ha ott all: " + how
+
+
+def homoglyph_write_gate(cmd: str) -> None:
+    """Exit 2 on a homoglyph in an inter-agent message or a kanban text write,
+    exit 0 otherwise (loudly, and logged as NEM MERHETO, when unreadable).
     Only called for a command that is NOT an email send."""
-    toks = _ia_segment(cmd)
-    if toks is None:
+    hit = _hw_segment(cmd)
+    if hit is None:
         sys.exit(0)
-    text, unreadable = _ia_payload(cmd, toks)
+    kind, toks, target = hit
+    label = _HW_LABEL[kind]
+    fields, unreadable = _hw_payload(cmd, toks, _HW_FIELDS[kind])
     if unreadable:
-        msg = ("outgoing-copy-gate (inter-agent, homoglifa): a torzs NEM vizsgalhato -- "
-               f"{unreadable}. Az uzenet ATMENT, homoglifa-ellenorzes NELKUL. "
+        what = "Az uzenet" if kind == "message" else "Az iras"
+        msg = (f"outgoing-copy-gate ({label}, homoglifa): NEM MERHETO -- a torzs NEM vizsgalhato -- "
+               f"{unreadable}. {what} ATMENT, homoglifa-ellenorzes NELKUL. "
                "Vizsgalhato alak: idezett heredoc (--data-binary @- <<'JSON') vagy @/abszolut/ut.json.")
-        _gate_log(msg)
+        _gate_log(f"{msg} Ut: {target}")
         print(json.dumps({"systemMessage": msg}))
         sys.exit(0)
+    head = "inter-agent" if kind == "message" else "kanban"
     try:
-        mixed = mixed_script_words(text)
+        found = [(field, h) for field, text in fields for h in mixed_script_words(text)]
     except MixedScriptUnavailable as exc:
+        # develop's #1541: the rule could not even be loaded, so this is not a verdict on the text. Fail-closed, and
+        # logged like every other block of this gate (KANBANHOMOGLIF927 (b)).
+        _gate_log(f"outgoing-copy-gate ({label}, homoglifa): BLOKK -- a szabaly nem toltheto be ({exc}). Ut: {target}")
         sys.stderr.write(
-            "KIMENO-SZOVEG KAPU (inter-agent): TILTVA -- a vegyes-irasrendszer szabaly "
+            f"KIMENO-SZOVEG KAPU ({head}): TILTVA -- a vegyes-irasrendszer szabaly "
             f"NEM TOLTHETO BE (scripts/lib/mixed_script.py: {exc}).\n"
             "Ez nem a szovegrol szol: a szabaly meg sem futott. Szandekosan fail-closed, "
             "mert egy le nem futott ellenorzes nem 'rendben'.\n"
         )
         sys.exit(2)
-    if mixed:
-        shown = "; ".join(f"{w!r} -- benne {name}" for w, _c, name in mixed[:5])
-        more = f" (+{len(mixed) - 5} tovabbi)" if len(mixed) > 5 else ""
-        sys.stderr.write(
-            "KIMENO-SZOVEG KAPU (inter-agent): TILTVA -- VEGYES IRASRENDSZERU SZO (homoglifa), "
-            f"{len(mixed)} db: {shown}{more}.\n"
-            "Egy kartya-azonositoban, agens-nevben vagy utvonalban ez neman felreiranyit. "
-            "Javitsd a szoveget es kuldd ujra. (Itt CSAK a homoglifa fut, ekezet- es copy-szabaly nem.)\n"
-        )
-        sys.exit(2)
-    sys.exit(0)
+    if not found:
+        sys.exit(0)
+    chars = sorted({name for _f, (_w, _c, name) in found})
+    where = sorted({field for field, _h in found if field != "*"})
+    _gate_log(f"outgoing-copy-gate ({label}, homoglifa): BLOKK -- {len(found)} szo"
+              + (f", mezo: {', '.join(where)}" if where else "")
+              + f", jel: {'; '.join(chars[:5])}. Ut: {target}")
+    shown = "; ".join(
+        f"{w!r}" + (f" ({field})" if field != "*" else "") + f" -- benne {name}"
+        for field, (w, _c, name) in found[:5])
+    more = f" (+{len(found) - 5} tovabbi)" if len(found) > 5 else ""
+    if kind == "message":
+        why = "Egy kartya-azonositoban, agens-nevben vagy utvonalban ez neman felreiranyit. "
+    else:
+        why = ("Egy kartya-azonositoban, agens-nevben vagy utvonalban ez neman felreiranyit, "
+               "es a lapon a kovetkezo olvaso mar ezt latja (a komment utolag nem is javithato). ")
+    note = ""
+    if kind == "kanban-update":
+        m = _KB_UPDATE.match(target)
+        note = _kb_stored_note(target, m.group(2), [w for _f, (w, _c, _n) in found]) + "\n"
+    sys.stderr.write(
+        f"KIMENO-SZOVEG KAPU ({head}): TILTVA -- VEGYES IRASRENDSZERU SZO (homoglifa), "
+        f"{len(found)} db: {shown}{more}.\n"
+        f"{why}Javitsd a szoveget es kuldd ujra. (Itt CSAK a homoglifa fut, ekezet- es copy-szabaly nem.)\n"
+        f"{note}"
+    )
+    sys.exit(2)
 
 
 def main():
@@ -1481,7 +1594,7 @@ def main():
         cmd = str(tool_input.get("command") or "")
         if not is_send_invocation(cmd):
             http_channel_gate(cmd)  # exits if it is a human-facing HTTP send; else returns
-            inter_agent_homoglyph_gate(cmd)  # exits; a no-op pass for anything else
+            homoglyph_write_gate(cmd)  # exits; a no-op pass for anything else
         text, unreadable = collect_bash_body(cmd)
     else:
         sys.exit(0)
