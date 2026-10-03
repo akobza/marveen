@@ -73,12 +73,20 @@ kartya nem mozdult. A mozgatas SZANDEKOSAN a komment-modhoz van kotve -- egyik m
 nyom nelkul. A FELELOS kulon indoka (Marveen, sajat hasznalatbol): a felelos-mezo a tablankon nem
 cimke, hanem azt mondja meg, KINEL all a dontes -- a mozgatasa allapot-valtoztatas, nem adminisztracio.
 
+2026-10-03 (egy masik telepites merese utan):
+  - FLOTTAENV1003: a flotta-nevsor felulbiralhato (KARTYA_FLEET=a,b,c vagy @api, KARTYA_KOORDINATOR,
+    KARTYA_GAZDA); az alapertelmezes valtozatlan. Reszletek a FLEET utan.
+  - TELJESREKORD1003: minden iras utan a kartya TELJES sora vissza: a kert oszlopok a kert erteken,
+    a tobbi a futas elotti erteken (mozgatasnal az updated_at szabad). Elteres = HIBA, nem csend.
+  - STDINHATARIDO1003: a --comment-file / --desc-file / --msg-file erteke lehet '-' (STDIN, egy
+    futasban egyszer), es a hatarido mindket agon irhato: --due-date <unix mp | ISO 8601 zonaval | none>.
+
 Ket fuggetlen hibaosztalyt zar ugyanez az egy ut: (1) a nyers sqlite3-quoting otodik
 elofordulasa utan a quoting az eszkoz dolga (parameterkotes); (2) a fejlec-idot a
 RENDSZERORA adja (ugyanaz az ertek, mint a created_at), gepelt orat a kapu megtagad --
 2026-09-05-en 17 kommentbol 11-ben tert el a gepelt ora a valodi created_at-tol.
 """
-import argparse, json, os, re, sqlite3, sys, time, unicodedata, urllib.request
+import argparse, datetime, json, os, re, sqlite3, sys, time, unicodedata, urllib.request
 
 # GYOKER-FELOLDAS: env ELOSZOR, __file__ CSAK tartaleknak, beegetett /Users/... SEHOL.
 # (Boni ket meresebol, msg 20272.) A sorrend nem izles kerdese:
@@ -192,6 +200,84 @@ def _komment_insert(db, card_id, author, content, now, automated):
                           ' VALUES (?,?,?,?,?)', (card_id, author, content, now, 1 if automated else 0))
     return db.execute('INSERT INTO kanban_comments (card_id,author,content,created_at) VALUES (?,?,?,?)',
                       (card_id, author, content, now))
+
+
+# TELJESREKORD1003: a visszaolvasas a kartya TELJES soran fut, nem csak az irt mezon. Merve 2026-10-03
+# (egy masik telepitesen): a mozgato ag korabban 5 mezot olvasott vissza (status, priority, title, assignee,
+# description), tehat egy iras, ami mellesleg a parent_id-t, a project-et vagy a due_date-et
+# irja at, zold kimenettel ment volna at -- pont azokon a mezokon, amelyek a ritka kartyakon allnak.
+def _kartya_sor(db, card_id):
+    cur = db.execute('SELECT * FROM kanban_cards WHERE id=?', (card_id,))
+    row = cur.fetchone()
+    return None if row is None else {d[0]: v for d, v in zip(cur.description, row)}
+
+
+def _eltero_oszlopok(elotte, utana, szabad=()):
+    return sorted(k for k in set(elotte) | set(utana) if k not in szabad and elotte.get(k) != utana.get(k))
+
+
+def _rov(v):
+    v = str(v)
+    return v if len(v) <= 60 else v[:57] + '...'
+
+
+def _teljes_sor_kapu(db, card_id, elotte, valtozik, mit):
+    """A futas VEGEN a kartya minden oszlopa vagy a kert ertek (valtozik), vagy a futas elotti.
+    Az updated_at csak mezomozgatasnal szabad (az UPDATE es a statusz-trigger is allitja)."""
+    vegen = _kartya_sor(db, card_id)
+    vart = dict(elotte, **valtozik)
+    elt = _eltero_oszlopok(vart, vegen or {}, szabad={'updated_at'} if valtozik else ())
+    if elt:
+        sys.exit(f'HIBA: {mit} beirodott, DE a kartya mas oszlopa is mas, mint vart: '
+                 + ', '.join(f'{k}: {_rov(vart.get(k))} -> {_rov((vegen or {}).get(k))}' for k in elt)
+                 + '\nEzt nem ez a futas kerte (parhuzamos iro vagy trigger?). Nezd meg a kartyat.')
+    print(f'TELJES SOR OK: a kartya {len(vegen)} oszlopabol csak a kert valtozott'
+          + (f' ({", ".join(valtozik)}; updated_at szabad)' if valtozik else ' (semmi)') + '.')
+
+
+# STDINHATARIDO1003: a szoveg fajlbol VAGY a STDIN-rol ('-'). A STDIN egyszer olvashato, ezert
+# egy futasban legfeljebb egy '-' all (main kapuja); a dekodolas a locale-tol fuggetlenul UTF-8.
+_STDIN = None
+
+
+def _szoveg(utvonal):
+    global _STDIN
+    if utvonal != '-':
+        with open(utvonal, encoding='utf-8') as f:
+            return f.read()
+    if _STDIN is None:
+        try:
+            _STDIN = sys.stdin.buffer.read().decode('utf-8')
+        except UnicodeDecodeError as e:
+            sys.exit(f'MEGTAGADVA: a STDIN nem UTF-8 ({e}). Semmi nem irodott.')
+    return _STDIN
+
+
+def _hatarido(ertek):
+    """--due-date: unix masodperc (egesz), ISO 8601 KIMONDOTT idozonaval ('Z' vagy +hh:mm), vagy
+    'none' (torles). A kanban_cards.due_date egesz masodperc UTC-ben; idozona nelkuli idopontot
+    nem talalgatunk, es egy ezredmasodperces (13 jegyu) ertek a tartomany-kapun akad fenn."""
+    v = ertek.strip()
+    if v.lower() == 'none':
+        return None
+    if re.fullmatch(r'\d+', v):
+        t = int(v)
+    else:
+        try:
+            dt = datetime.datetime.fromisoformat(v[:-1] + '+00:00' if v.endswith(('Z', 'z')) else v)
+        except ValueError:
+            sys.exit(f'MEGTAGADVA: a --due-date ("{v}") se nem egesz unix masodperc, se nem ISO 8601.')
+        if dt.tzinfo is None:
+            sys.exit(f'MEGTAGADVA: a --due-date ("{v}") idozona nelkuli. Mondd ki: "Z" vagy +hh:mm.')
+        t = int(dt.timestamp())
+    if not 946684800 <= t <= 4102444800:
+        sys.exit(f'MEGTAGADVA: a --due-date ({t}) a 2000-2100 tartomanyon kivul esik '
+                 f'(ezredmasodperc? a mezo masodpercet var).')
+    return t
+
+
+def _van_hatarido_oszlop(db):
+    return any(r[1] == 'due_date' for r in db.execute('PRAGMA table_info(kanban_cards)'))
 # Ismert FELELOS-nevek. NEM zart halmaz: a tablan 2026-09-06-an 40 kulonbozo felelos allt, es a
 # tobbsegi nem-flotta ertek kulso GitHub-felhasznalonev (PR-kartyak szerzoi). Ezert a nem-ismert
 # nev nem automatikusan hiba -- lasd _felelos_feloldas.
@@ -282,6 +368,74 @@ PRIORITASOK = ('low','normal','high','urgent')
 # Ervenyes FELADO-nevek. Elgepelt nev csendben rossz attribuciot irna a sorba, ezert kapu.
 KULDOK = FLEET | {COORDINATOR}
 API = os.environ.get('KARTYA_API', 'http://localhost:3420/api/messages')
+
+# FLOTTAENV1003: a fenti FLEET / COORDINATOR / GAZDA EGY telepites nevsora. Egy masik telepitesen merve
+# (2026-10-03: 30 agens, egyik sincs a halmazban) az ertesites-ag MINDEN ottani agens kartyajan megtagadott,
+# es a felado-kapu minden ottani nevet elutasitott: az eszkoz fo kepessege ott nem volt hasznalhato.
+# A nevsor ezert felulbiralhato, az ALAPERTELMEZES VALTOZATLAN:
+#   KARTYA_FLEET=a,b,c     kimondott lista
+#   KARTYA_FLEET=@api      az elo agens-lista (GET KARTYA_AGENTS_API, ugyanazzal a tokennel, mint az
+#                          ertesites): egy kezzel vezetett lista minden uj agensnel csendben elavulna
+#   KARTYA_KOORDINATOR=x   a KARTYA_FLEET melle KOTELEZO: a beepitett koordinator-nev egy masik
+#                          telepitese, es csendben egy nem letezo cimzettet tenne a flottaba
+#   KARTYA_GAZDA=y         a gazda (nem agens); flotta-tag nem lehet
+# Hibas, ures vagy elerhetetlen lista MEGTAGADAS, nem visszaeses a beepitettre: a csendes visszaeses
+# pont az a nevsor lenne, amelyik a masik telepitesen mindent megtagadott.
+AGENTS_API = os.environ.get('KARTYA_AGENTS_API', 'http://localhost:3420/api/agents')
+NEV_RX = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}')
+
+
+def _nevlista(nyers, forras):
+    nevek, rossz = set(), []
+    for x in nyers:
+        n = str(x).strip().lower()
+        if n:
+            (nevek.add(n) if NEV_RX.fullmatch(n) else rossz.append(str(x)[:40]))
+    if rossz:
+        sys.exit(f'MEGTAGADVA: ervenytelen nev ({forras}): {rossz[:5]}\n'
+                 f'Ervenyes alak: ASCII kisbetu, szam, ".", "_", "-". Semmi nem irodott.')
+    if not nevek:
+        sys.exit(f'MEGTAGADVA: ures nev-lista ({forras}). Semmi nem irodott.')
+    return nevek
+
+
+def _flotta_beallitas():
+    """A nevsor felulbiralasa (FLOTTAENV1003), az argumentumok utan, MINDEN iras elott."""
+    global FLEET, COORDINATOR, GAZDA, KULDOK, ISMERT_FELELOSOK
+    flotta, koord, gazda = (os.environ.get(k) for k in ('KARTYA_FLEET', 'KARTYA_KOORDINATOR', 'KARTYA_GAZDA'))
+    if flotta is None and koord is None and gazda is None:
+        return
+    if flotta is not None and koord is None:
+        sys.exit(f'MEGTAGADVA: KARTYA_FLEET mellett a KARTYA_KOORDINATOR is kell. A beepitett koordinator\n'
+                 f'("{COORDINATOR}") egy masik telepites neve lehet, es az onhurok-ertesites egy nem letezo\n'
+                 f'cimzetthez menne. Semmi nem irodott.')
+    forras = 'beepitett'
+    uj = set(FLEET)
+    if flotta is not None and flotta.strip() == '@api':
+        forras = '@api ' + AGENTS_API
+        tok = _token_kapu(dry_run=False, elozmeny='MEGTAGADVA: KARTYA_FLEET=@api, de', farok='Semmi nem irodott.')
+        try:
+            req = urllib.request.Request(AGENTS_API, headers={'Authorization': 'Bearer ' + tok})
+            nevek = [x['name'] for x in json.load(urllib.request.urlopen(req, timeout=20))]
+        except Exception as e:
+            sys.exit(f'MEGTAGADVA: KARTYA_FLEET=@api, de az agens-lista nem olvashato ({AGENTS_API}): {e}\n'
+                     f'A beepitett nevsorra nem esem vissza. Semmi nem irodott.')
+        uj = _nevlista(nevek, forras)
+    elif flotta is not None:
+        forras = 'KARTYA_FLEET'
+        uj = _nevlista(flotta.split(','), forras)
+    if koord is not None:
+        COORDINATOR = _nevlista([koord], 'KARTYA_KOORDINATOR').pop()
+    if gazda is not None:
+        GAZDA = _nevlista([gazda], 'KARTYA_GAZDA').pop()
+    FLEET = uj | {COORDINATOR}
+    if GAZDA in FLEET:
+        sys.exit(f'MEGTAGADVA: a gazda ("{GAZDA}") a flotta-listaban is szerepel. A gazdanak nincs\n'
+                 f'agens-sessionje, az ertesites neki nem kezbesitheto, ezert flotta-tag nem lehet.\n'
+                 f'Semmi nem irodott.')
+    KULDOK = FLEET | {COORDINATOR}
+    ISMERT_FELELOSOK = FLEET | {COORDINATOR, GAZDA}
+    print(f'FLOTTA FELULBIRALVA ({forras}): {len(FLEET)} nev, koordinator {COORDINATOR}, gazda {GAZDA}')
 HU = set('áéíóöőúüűÁÉÍÓÖŐÚÜŰ')
 # HOMOGLYPHMICRO924: a MICRO SIGN (U+00B5) betu-kategoriaju, de mertekegyseg-elotag
 # ("40 us"), latin betut nem alcaz -- a kimeno-szoveg kapu SCRIPT_NEUTRAL-janak parja.
@@ -481,10 +635,10 @@ def komment_mod(a):
         sys.exit('MEGTAGADVA: komment-modban a szerzo KIMONDOTT: add meg az --author-t\n'
                  '(pl. --author Boni). Korabban ez csendben "Marveen"-re esett vissza, tehat\n'
                  'a kartyan MAS neve allt, mint aki irta -- es a kimenet kozben OK-t mondott.')
-    text = open(a.comment_file, encoding='utf-8').read().strip()
+    text = _szoveg(a.comment_file).strip()
     # Az ERTESITES szovege NEM esik az ekezet-kapu ala, ugyanugy, mint a letrehozo agon:
     # az nem a kanban-felulet, hanem inter-agent uzenet.
-    msg = open(a.msg_file, encoding='utf-8').read() if a.msg_file else ''
+    msg = _szoveg(a.msg_file) if a.msg_file else ''
     _ekezet_kapu(text, a.ekezet_nelkul_szandekos)
     if not text:
         sys.exit('MEGTAGADVA: ures komment-fajl.')
@@ -547,7 +701,7 @@ def komment_mod(a):
     # szovege. A horgony-kapu sem: az azt meri, hogy a CIM hordozza-e a kartya azonositojat.
     uj_leiras = None
     if a.desc_file is not None:
-        uj_leiras = open(a.desc_file, encoding='utf-8').read()
+        uj_leiras = _szoveg(a.desc_file)
         if not uj_leiras.strip():
             sys.exit('MEGTAGADVA: ures --desc-file a mozgato agon. Ez a leiras KIURITESE lenne, es\n'
                      'egy ures leiras ugyanugy nez ki, mint egy elfelejtett. Ha tenyleg torolni\n'
@@ -560,12 +714,20 @@ def komment_mod(a):
         sys.exit(f'MEGTAGADVA: ervenytelen statusz ("{a.status}"). Ervenyes: {", ".join(STATUSZOK)}.')
     if a.priority is not None and a.priority not in PRIORITASOK:
         sys.exit(f'MEGTAGADVA: ervenytelen prioritas ("{a.priority}"). Ervenyes: {", ".join(PRIORITASOK)}.')
+    # A HATARIDO IS MOZGATHATO (STDINHATARIDO1003): a mezo a tablan van, de eddig egyik agon sem volt
+    # irhato. Ugyanugy mozog, mint a tobbi mezo (elotte-pillanatkep, nyom a teljes regi ertekkel);
+    # a 'none' a torles, ezert a "kertek-e" kulon jelzo, nem az, hogy az ertek None.
+    hatarido_kert = a.due_date is not None
+    uj_hatarido = _hatarido(a.due_date) if hatarido_kert else None
 
     db = sqlite3.connect(_db_kapu()); db.execute('PRAGMA busy_timeout=8000')
     card = db.execute('SELECT id,status,assignee,priority,title,description FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
     if not card:
         sys.exit(f'MEGTAGADVA: a(z) {a.id} kartya NEM LETEZIK -- komment-only mod csak meglevo kartyara ir.\n'
                  f'Uj kartyahoz a letrehozo mod valo (--assignee/--title).')
+    if hatarido_kert and not _van_hatarido_oszlop(db):
+        sys.exit(f'MEGTAGADVA: --due-date, de ezen a DB-n ({DB}) a kanban_cards-ban nincs due_date oszlop.\n'
+                 f'Semmi nem irodott.')
     # A JEL NEM ESHET LE CSENDBEN: egy #1531 elotti DB-n nincs automated oszlop, es ha a komment
     # megis beirodna, a stuck-meres munka-nyomnak latna -- pont az, amit a kapcsolo megelozne.
     # A kapu az IRAS ELOTT all, a dry-run agon is.
@@ -574,8 +736,8 @@ def komment_mod(a):
                  'automated oszlop (a #1531 elotti fa: a dashboard az uj koddal meg nem indult el).\n'
                  'A komment NEM irodott be. Huzd fel a fat es inditsd ujra a dashboardot, utana futtasd ujra.')
     # ELOTTE-PILLANATKEP: enelkul a visszaolvasas nem meres, csak egy ertek felolvasasa.
-    elotte = {'status': card[1], 'priority': card[3], 'title': card[4], 'assignee': card[2],
-               'description': card[5]}
+    # A TELJES sor (TELJESREKORD1003): a vegen minden oszlopot ehhez vetunk ossze, nem csak az irtakat.
+    elotte = _kartya_sor(db, a.id)
     # A FELELOS FELOLDASA a kartya ismereteben: a kanonikus alakot hasonlitjuk az elotte-erteknek,
     # kulonben egy "Samu" -> "samu" no-op valodi mozgatasnak latszana.
     uj_felelos = None
@@ -679,6 +841,8 @@ def komment_mod(a):
     mozgatas = {k: v for k, v in (('status', a.status), ('priority', a.priority), ('title', a.title),
                                   ('assignee', uj_felelos), ('description', uj_leiras))
                 if v is not None}
+    if hatarido_kert:
+        mozgatas['due_date'] = uj_hatarido
     valtozik = {k: v for k, v in mozgatas.items() if v != elotte[k]}
     valtozatlan = {k: v for k, v in mozgatas.items() if v == elotte[k]}
 
@@ -763,6 +927,7 @@ def komment_mod(a):
     if not valtozik:
         if mozgatas:
             print('MEZOMOZGATAS: nincs teendo (minden kimondott ertek mar ez volt).')
+        _teljes_sor_kapu(db, a.id, elotte, {}, 'a komment')
         return
     _elozmeny_figyelmeztetes(db, a, now)
 
@@ -774,9 +939,7 @@ def komment_mod(a):
         sys.exit(f'HIBA: a mezomozgatas {cur.rowcount} sort erintett (1 helyett) -- a komment MAR BEIRT.')
     # FUGGETLEN visszaolvasas: uj SELECT, nem a cursor allitasa. A 0-talalatos UPDATE
     # es a sikeres UPDATE kulonben megkulonboztethetetlen lenne.
-    utana = db.execute('SELECT status,priority,title,assignee,description FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
-    kapott = {'status': utana[0], 'priority': utana[1], 'title': utana[2], 'assignee': utana[3],
-              'description': utana[4]}
+    kapott = _kartya_sor(db, a.id)
     for k, v in valtozik.items():
         if kapott[k] != v:
             sys.exit(f'HIBA: a(z) {k} visszaolvasva "{kapott[k]}", nem a kert "{v}". Az iras NEM ert celba.')
@@ -825,6 +988,8 @@ def komment_mod(a):
                 + f'), kerte: {a.author}. Fuggetlenul visszaolvasva.\n' + reszletes
                 + '\n' + zarosor, now, automated=True)
     db.commit()
+    # A NYOM UTAN, hogy egy nem kert oszlop-valtozasnal is ott alljon a kartyan, MIT mozgattunk.
+    _teljes_sor_kapu(db, a.id, elotte, valtozik, 'a komment es a mezomozgatas')
 
 # A mezomozgatas-nyom GEPI ZAROSORA. Ket helyen hasznaljuk: iraskor a nyom vegere kerul,
 # olvasaskor EBBOL jon a mozgato neve. A sor-eleji ^ es a sor-vegi $ egyutt kell: enelkul a
@@ -920,8 +1085,19 @@ def main():
     p.add_argument('--automated', action='store_true',
                    help='komment-mod: a komment GEPI/TOMEGES (sopres, migracio, audit), NEM munka-nyom; '
                         'a sor automated=1-et kap, es a /api/kanban/stuck nem veszi elkezdett munkanak')
+    p.add_argument('--due-date', dest='due_date', default=None,
+                   help='hatarido: unix masodperc, ISO 8601 idozonaval (pl. 2026-10-29T12:00:00Z) vagy "none" '
+                        '(torles); mindket agon (STDINHATARIDO1003)')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
+    # STDINHATARIDO1003: a '-' a STDIN, de csak egy helyen (egyszer olvashato), es nem terminalrol.
+    kotojel = [n for n, v in (('--comment-file', a.comment_file), ('--desc-file', a.desc_file),
+                              ('--msg-file', a.msg_file)) if v == '-']
+    if len(kotojel) > 1:
+        sys.exit(f'MEGTAGADVA: a STDIN ("-") egy futasban egyszer olvashato, itt tobbszor all: {", ".join(kotojel)}.')
+    if kotojel and sys.stdin.isatty():
+        sys.exit(f'MEGTAGADVA: {kotojel[0]} -, de a STDIN terminal, nincs honnan olvasni. Iranyitsd ra a szoveget.')
+    _flotta_beallitas()
     if a.automated and not a.comment_file:
         sys.exit('MEGTAGADVA: --automated csak komment-modban (--comment-file) ertelmes: a jel egy\n'
                  'KOMMENT-sorra kerul, a letrehozo ag sajat nyom-sorai mar maguktol automated=1-ek.')
@@ -983,8 +1159,9 @@ def main():
     if frm not in KULDOK:
         sys.exit(f'MEGTAGADVA: ismeretlen felado ("{frm}"). Ervenyes: {", ".join(sorted(KULDOK))}.\n'
                  f'Ha az --author nem agens-nev (pl. "Marveen (Boni lelete)"), add meg kimondva: --from <agens>.')
-    desc = open(a.desc_file, encoding='utf-8').read() if a.desc_file else ''
-    msg = open(a.msg_file, encoding='utf-8').read() if a.msg_file else ''
+    desc = _szoveg(a.desc_file) if a.desc_file else ''
+    msg = _szoveg(a.msg_file) if a.msg_file else ''
+    hatarido = _hatarido(a.due_date) if a.due_date is not None else None
     # EKEZET-KAPU A LEIRASON, A LETREHOZO AGON IS (EKEZETKAPU919, 2026-09-21). A ket ag kulon
     # kodut, es a kapu eddig EGYIKEN SEM allt: a leiras volt az utolso gazdanak szant mezo, ami
     # ekezet nelkul bement. Merve a kartyan: egy teljes leiras ment be igy, es a gazda ugyanugy
@@ -1048,7 +1225,11 @@ def main():
         # meg egy hianyzo DB-fajlt sem hozhat letre.
         dbro = sqlite3.connect(f'file:{_db_kapu()}?mode=ro', uri=True)
         letezik = dbro.execute('SELECT 1 FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
+        van_hatarido = _van_hatarido_oszlop(dbro)
         dbro.close()
+        if hatarido is not None and not van_hatarido:
+            sys.exit(f'MEGTAGADVA: --due-date, de ezen a DB-n ({DB}) a kanban_cards-ban nincs due_date oszlop.\n'
+                     f'Semmi nem irodott.')
         if letezik:
             # SZO SZERINT ugyanaz a mondat, mint az eles agon (a paritas-teszt 3. ellenorzese
             # pont ezt meri): ha a ket ag MAS okot mond ugyanarra, az olvasoja nem tudja
@@ -1061,7 +1242,8 @@ def main():
             _token_kapu(dry_run=True)
         print(f'DRY-RUN OK (DB: {DB}): minden ellenorzes atment (a letezes- es a token-kaput is'
               f' beleertve).\n  id={a.id} gazda={who} statusz={a.status} '
-              f'prio={a.priority}\n  cim {len(a.title)} kar | leiras {len(desc)} kar | uzenet {len(msg)} kar')
+              f'prio={a.priority}' + (f' hatarido={hatarido}' if hatarido is not None else '')
+              + f'\n  cim {len(a.title)} kar | leiras {len(desc)} kar | uzenet {len(msg)} kar')
         return
 
     # 4. kartya + VISSZAOLVASAS
@@ -1069,12 +1251,25 @@ def main():
     db = sqlite3.connect(_db_kapu()); db.execute('PRAGMA busy_timeout=8000')
     if db.execute('SELECT 1 FROM kanban_cards WHERE id=?', (a.id,)).fetchone():
         sys.exit(f'MEGTAGADVA: a(z) {a.id} kartya MAR LETEZIK.')
-    db.execute('''INSERT INTO kanban_cards (id,title,description,status,assignee,priority,sort_order,created_at,updated_at)
-                  VALUES (?,?,?,?,?,?,0,?,?)''', (a.id, a.title, desc, a.status, who, a.priority, now, now))
+    if hatarido is not None and not _van_hatarido_oszlop(db):
+        sys.exit(f'MEGTAGADVA: --due-date, de ezen a DB-n ({DB}) a kanban_cards-ban nincs due_date oszlop.\n'
+                 f'Semmi nem irodott.')
+    irt = {'id': a.id, 'title': a.title, 'description': desc, 'status': a.status, 'assignee': who,
+           'priority': a.priority, 'sort_order': 0, 'created_at': now, 'updated_at': now}
+    if hatarido is not None:
+        irt['due_date'] = hatarido
+    db.execute(f'INSERT INTO kanban_cards ({",".join(irt)}) VALUES ({",".join("?" * len(irt))})', tuple(irt.values()))
     db.commit()
-    back = db.execute('SELECT id,status,assignee,length(title) FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
+    # TELJESREKORD1003: a TELJES sor vissza, minden irt oszlop ertekre osszevetve; a tobbi kiirva.
+    back = _kartya_sor(db, a.id)
     if not back: sys.exit('HIBA: a kartya nem olvashato vissza -- az iras nem tortent meg.')
-    print(f'KARTYA OK (visszaolvasva innen: {DB}): {back}')
+    rossz = [k for k, v in irt.items() if back.get(k) != v]
+    if rossz:
+        sys.exit('HIBA: a kartya visszaolvasva mas, mint amit irtunk: '
+                 + ', '.join(f'{k}: {_rov(irt[k])} -> {_rov(back.get(k))}' for k in rossz))
+    tobbi = ', '.join(f'{k}={_rov(v)}' for k, v in back.items() if k not in irt)
+    print(f'KARTYA OK (teljes sor visszaolvasva innen: {DB}): az irt {len(irt)} oszlop egyezik'
+          + (f'; a tobbi: {tobbi}' if tobbi else ''))
 
     # 5. uzenet + VISSZAOLVASAS
     if not msg:
