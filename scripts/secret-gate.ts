@@ -10,6 +10,11 @@
  * The CI run is the actual gate. That is stated here and in the PR template so
  * nobody mistakes the convenience for the control.
  *
+ * The pre-commit run (--staged) also checks the staged additions for KNOWN
+ * PERSON IDENTIFIERS, through scripts/person-id-scan.py (card 7b964221, see
+ * src/security/person-id-check.ts). That list lives only in this machine's
+ * configuration, so --range and --all say out loud that the check did not run.
+ *
  * Everything this runner cannot scan is REPORTED and FAILS. Size limits, binary
  * files, read errors: each is named. A silent skip would read as "clean".
  *
@@ -41,10 +46,16 @@
  * there is nothing to follow at all.
  */
 import { execFileSync } from 'node:child_process';
+import { basename, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runGate, type ScanInput, type GateResult } from '../src/security/secret-gate.js';
+import { checkPersonIds, type PersonIdOutcome } from '../src/security/person-id-check.js';
 
 /** Beyond this the file is not scanned -- and therefore not cleared. */
 const MAX_BYTES = 5 * 1024 * 1024;
+
+/** The existing identifier scanner, next to this runner: the check keeps no list of its own. */
+const PERSON_ID_SCANNER = fileURLToPath(new URL('./person-id-scan.py', import.meta.url));
 
 /** Git file modes we can meet in a tree or the index. */
 const MODE_SYMLINK = '120000';
@@ -216,7 +227,33 @@ function readAll(entries: Entry[]): ScanInput[] {
   });
 }
 
-function report(result: GateResult, mode: string, entries: Entry[]): void {
+/**
+ * What is about to be committed, as a unified diff of the index against HEAD: the identifier
+ * scanner reads its added lines. Fixed prefixes and no external diff or textconv, so a user's
+ * diff configuration cannot change the paths or the text the scanner sees.
+ */
+function stagedDiff(): string {
+  return git(['diff', '--cached', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-U0', '--diff-filter=ACMR']);
+}
+
+/**
+ * The tree that holds the identifier configuration. `.claude/` and `store/` are gitignored, so a
+ * linked worktree does not carry them: the configuration of the repository being committed is
+ * in its MAIN worktree (the same rule as the scanner's own main_worktree()). The environment
+ * override is for tests, which point it at a synthetic tree.
+ */
+function personIdRoot(): string | undefined {
+  const override = process.env.SECRET_GATE_PERSON_ID_ROOT;
+  if (override) return override;
+  try {
+    const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
+    return basename(common) === '.git' ? dirname(common) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function report(result: GateResult, mode: string, entries: Entry[], personIds: PersonIdOutcome): void {
   const line = (s = '') => process.stdout.write(`${s}\n`);
   line();
   line(`secret-gate (EVIDGUARD818) -- mode ${mode}, ${result.scannedCount} file(s) in scope, read from git objects`);
@@ -240,9 +277,19 @@ function report(result: GateResult, mode: string, entries: Entry[]): void {
     for (const a of result.allowlisted) line(`  - ${a.file}  <- ${a.reason}`);
   }
 
-  if (result.ok) {
+  const idsFound = personIds.status === 'found';
+  const notRun = personIds.status === 'not-run' ? `The person-identifier check did NOT run: ${personIds.reason.replace(/\.$/, '')}.` : '';
+
+  if (result.ok && !idsFound) {
     line();
-    line(`PASS: no denied path, no secret shape, no channel material in ${result.scannedCount} file(s).`);
+    if (personIds.status === 'clean') {
+      line(`PASS: no denied path, no secret shape, no channel material, no known person identifier in ${result.scannedCount} file(s).`);
+    } else {
+      // The PASS line claims only what was measured.
+      line(`PASS: no denied path, no secret shape, no channel material in ${result.scannedCount} file(s).`);
+      line(notRun);
+      line('This PASS says nothing about person identifiers.');
+    }
     return;
   }
 
@@ -259,13 +306,26 @@ function report(result: GateResult, mode: string, entries: Entry[]): void {
     line(`NOT SCANNED, therefore NOT CLEARED (${unscannable.length}):`);
     for (const f of unscannable) line(`  ${f.file}  ${f.reason}`);
   }
-  line();
-  line('The matched text is deliberately not printed: echoing a secret into CI logs');
-  line('would leak it a second time. Look at the file and line above.');
-  line();
-  line('If a hit is an intentional fixture, add the PATH to ALLOWLISTED_PATHS in');
-  line('src/security/secret-gate.ts. Do NOT loosen the pattern: a pattern exception');
-  line('opens the same hole in every file in the repository.');
+  if (personIds.status === 'found') {
+    line();
+    line(`BLOCKED, known person identifier (${personIds.findings.length}), masked to the last 3 characters:`);
+    for (const f of personIds.findings) line(`  ${f.file}:${f.line}  [person-id]  ${f.masked}`);
+    line('The list is this machine\'s configuration, read by scripts/person-id-scan.py. A real');
+    line('person identifier must not be committed: replace it with a synthetic value.');
+    line('No path allowlist covers this check.');
+  } else if (notRun) {
+    line();
+    line(notRun);
+  }
+  if (!result.ok) {
+    line();
+    line('The matched text is deliberately not printed: echoing a secret into CI logs');
+    line('would leak it a second time. Look at the file and line above.');
+    line();
+    line('If a hit is an intentional fixture, add the PATH to ALLOWLISTED_PATHS in');
+    line('src/security/secret-gate.ts. Do NOT loosen the pattern: a pattern exception');
+    line('opens the same hole in every file in the repository.');
+  }
   if (entries.length !== result.scannedCount) {
     line();
     line(`NOTE: ${entries.length} file(s) were listed but ${result.scannedCount} reached the scanner.`);
@@ -292,8 +352,14 @@ function main(): void {
   }
 
   const result = runGate(readAll(entries));
-  report(result, mode, entries);
-  process.exit(result.ok ? 0 : 1);
+  const personIds = checkPersonIds({
+    mode,
+    diff: mode === '--staged' ? stagedDiff() : '',
+    scanner: PERSON_ID_SCANNER,
+    root: mode === '--staged' ? personIdRoot() : undefined,
+  });
+  report(result, mode, entries, personIds);
+  process.exit(result.ok && personIds.status !== 'found' ? 0 : 1);
 }
 
 main();
