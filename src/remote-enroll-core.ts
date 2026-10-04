@@ -90,6 +90,47 @@ export function dashboardTokenDecision(
   return { include: true, token }
 }
 
+export interface WebPortChoice {
+  line: string
+  warning?: string
+}
+
+/**
+ * Which dashboard port an enrollment run writes into the key line, and from where (card bc3f8fb0 (b)).
+ *
+ * The CLI takes WEB_PORT from config.ts, so it resolves in the dashboard's own order (process.env >
+ * config-overrides.json > .env > default). But it runs in the operator's shell: a stale `export WEB_PORT=...` wins
+ * there, while a dashboard started as a service does not inherit that shell and listens on the install's value, so
+ * the key line would open a dead port (the INSTUX1 lockout, by another road). The line names the port and its
+ * source; the warning names both values when a shell export disagrees with the install's files (`install`: what
+ * config-overrides.json / .env give without process.env, or the default when neither sets it). A warning, not a
+ * stop: --web-port is the explicit way out, and a deliberate export is a legitimate use.
+ */
+export function describeWebPortChoice(c: {
+  webPort: number
+  explicit: boolean
+  source: string
+  shellValue: string | undefined
+  install: { value: string; source: string }
+}): WebPortChoice {
+  const source = c.explicit ? '--web-port' : c.source === 'process.env' ? 'shell (exported WEB_PORT)' : c.source
+  const line = `dashboard port: ${c.webPort} (source: ${source})`
+  const shell = c.shellValue?.trim()
+  // compared as ports where both are digits: an export of 039876 is the same port as a .env 39876
+  const samePort = (a: string, b: string) => (/^\d+$/.test(a) && /^\d+$/.test(b) ? Number(a) === Number(b) : a === b)
+  if (c.explicit || !shell || samePort(shell, c.install.value)) return { line }
+  const installSays = c.install.source === 'default'
+    ? `this install's files set no WEB_PORT, so the default ${c.install.value} applies`
+    : `this install's ${c.install.source} says ${c.install.value}`
+  return {
+    line,
+    warning:
+      `the shell exports WEB_PORT=${shell}, but ${installSays}; this run uses ${shell} (process.env wins, in the ` +
+      `dashboard's own order). A dashboard started as a service does not inherit your shell: if it listens on ` +
+      `${c.install.value}, unset the export or pass --web-port ${c.install.value}.`,
+  }
+}
+
 /**
  * Validate a user-supplied target address. `isIP` covers IPv4 and IPv6
  * literals; anything else must look like a hostname.
