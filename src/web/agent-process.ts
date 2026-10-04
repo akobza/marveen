@@ -80,9 +80,9 @@ export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, exists:
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInherited } from './mcp-inheritance.js'
 import { readEnvFile } from '../env.js'
-import { loadProfileTemplate } from './profiles.js'
+import { loadProfileTemplate, profileWantsThinChiefHandoff } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureProjectRootInClaudeMd, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureProjectRootInClaudeMd, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureThinChiefHandoffSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { recordInjectedPrompt } from './injected-prompt-registry.js'
 import { getSecret } from './vault.js'
@@ -2017,6 +2017,16 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     ensureAutonomySection(name)
     ensureSkillsPathTrapSection(name)
     ensureSystemDirectiveAuthSection(name)
+    ensureAgentIdHeaderSection(name)
+    // OPT-IN, DEFAULT OFF (PR #1357 review). The THIN CHIEF handoff is this
+    // fleet's reporting standard -- how a specialist hands a result to its
+    // coordinator -- not a property of the software. Injecting it into every
+    // downstream install's agent CLAUDE.md would be shipping our process as if
+    // it were a feature. No shipped profile sets the flag, so a fresh install
+    // gets nothing; the fleet that wrote it opts in on its own profiles.
+    // Turning the flag off does not remove a section an agent already carries:
+    // ensureThinChiefHandoffSection only appends, and nothing here deletes.
+    if (profileWantsThinChiefHandoff(profile)) ensureThinChiefHandoffSection(name)
     ensureMemorySearchLabelSection(name)
     ensureFleetAuthSection(name)
     ensureEvidenceSection(name)
