@@ -9,7 +9,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // reads/writes at a sandbox instead of the real repo root (env.test.ts used
 // to unlink+rewrite the LIVE .env -- 2026-07-27 incident). Read at import
 // time; production never sets it.
-const PROJECT_ROOT = process.env.CLAUDECLAW_ENV_DIR ?? join(__dirname, '..')
+// bc3f8fb0: exported, so config.ts reads config-overrides.json from <seam>/store under the same switch: one variable
+// sandboxes BOTH file layers of a boot key (.env and the override), and a test never reads this install's own files.
+export const ENV_SANDBOX_DIR: string | undefined = process.env.CLAUDECLAW_ENV_DIR
+const PROJECT_ROOT = ENV_SANDBOX_DIR ?? join(__dirname, '..')
 
 export function readEnvFile(keys?: string[]): Record<string, string> {
   const envPath = join(PROJECT_ROOT, '.env')

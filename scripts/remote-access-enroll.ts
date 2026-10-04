@@ -11,12 +11,15 @@
 //   npm run remote-enroll -- --no-dashboard-token "<public key line>"
 //
 // --port is the SSH port; --web-port is the dashboard port the enrolled key may
-// tunnel to (permitopen) AND the port encoded in the bundle. It defaults to the
-// WEB_PORT env / .env value, falling back to REMOTE_PORT. A mismatch between the
+// tunnel to (permitopen) AND the port encoded in the bundle. It defaults to
+// WEB_PORT in the dashboard's own order (process.env > config-overrides.json >
+// .env > the 3420 default, resolved by config.ts). A mismatch between the
 // permitopen and the actual dashboard port silently locks the device out
 // (INSTUX1): the tunnel opens a dead port and the app reports "dashboard not
 // running" forever. An INVALID WEB_PORT (one config.ts rejected) stops the CLI
-// before anything is written, unless --web-port is given (card b2cd0f43).
+// before anything is written, unless --web-port is given (card b2cd0f43). Every run
+// prints the port and its source, and warns when a shell export of WEB_PORT disagrees
+// with the install's value (config-overrides.json / .env, or the default) (card bc3f8fb0).
 //
 // The bundle includes the dashboard bearer token (store/.dashboard-token) by
 // default so the connecting app can authenticate against the dashboard. Such a
@@ -36,6 +39,7 @@ import {
   buildBundle,
   checkEnrollHost,
   dashboardTokenDecision,
+  describeWebPortChoice,
   encodeBundle,
   resolveHostKey,
   HOST_KEY_PUB_CANDIDATES,
@@ -45,7 +49,7 @@ import {
 } from '../src/remote-enroll-core.js'
 import { enrollAuthorizedKey } from '../src/remote-enroll-fs.js'
 import { resolveSshDir } from '../src/ssh-dir.js'
-import { WEB_PORT as ENV_WEB_PORT, assertWebPortUsable } from '../src/config.js'
+import { WEB_PORT as ENV_WEB_PORT, BOOT_KEY_SOURCES, WEB_PORT_INSTALL, assertWebPortUsable } from '../src/config.js'
 
 interface Args {
   keyLine?: string
@@ -57,11 +61,13 @@ interface Args {
   includeDashboardToken: boolean
 }
 
-/** Dashboard port default: the install's actual WEB_PORT, read from the same
- * .env the service loads (config resolves config-overrides.json > .env), so a
- * manual `remote-enroll` with no --web-port still targets the real port instead
- * of the 3420 default. Explicit --web-port overrides. Falls back to REMOTE_PORT
- * only when .env carries no WEB_PORT (config already applies that default). */
+/** Dashboard port default: WEB_PORT as config.ts resolves it for the dashboard
+ * (process.env > config-overrides.json > .env > the 3420 default), so a manual
+ * `remote-enroll` with no --web-port targets the port the dashboard resolves in
+ * the same environment. Explicit --web-port overrides. main() prints the port and
+ * its source, and warns when a shell export disagrees with the install's files
+ * (card bc3f8fb0). REMOTE_PORT is only a last guard: config.ts never hands over
+ * a port outside 1-65535. */
 export function defaultWebPort(): number {
   const n = ENV_WEB_PORT
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : REMOTE_PORT
@@ -199,6 +205,14 @@ async function main(): Promise<void> {
     if (err instanceof RemoteEnrollError) fail(err.message)
     throw err
   }
+
+  // bc3f8fb0 (b): say which port goes into the key line and from where, before anything is written
+  const portChoice = describeWebPortChoice({
+    webPort: args.webPort, explicit: !args.webPortFromEnv, source: BOOT_KEY_SOURCES.WEB_PORT,
+    shellValue: process.env.WEB_PORT, install: WEB_PORT_INSTALL,
+  })
+  process.stderr.write(`${portChoice.line}\n`)
+  if (portChoice.warning) process.stderr.write(`warning: ${portChoice.warning}\n`)
 
   const restrictedLine = buildRestrictedLine(parsed, args.webPort)
   // ENROLL813: this CLI used to hardcode homedir()/.ssh and did not know the

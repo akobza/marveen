@@ -183,7 +183,7 @@ describe('⛔ VISELKEDESI par a kapu HARMADIK helyere: a kill-ag EL SEM ERHETO',
     const jelek: string[] = []
     await expect((async () => {
       cfg.assertWebPortUsable()                                   // index.ts: acquireLock() elso sora
-      await acquirePortLock(cfg.WEB_PORT, rogzitoCtx(jelek), {})  // index.ts:468
+      await acquirePortLock(cfg.WEB_PORT, rogzitoCtx(jelek), {})  // index.ts: acquirePortLock(WEB_PORT, ...), before startWebServer
     })()).rejects.toThrow(/WEB_PORT is unusable/)
     expect(jelek).toEqual([])
   })
@@ -232,7 +232,7 @@ describe('⛔ VISELKEDESI par a kapu HARMADIK helyere: a kill-ag EL SEM ERHETO',
 describe('⛔ a kapu a PUSZTITO hasznalat ELOTT all, nem csak a webkiszolgaloban', () => {
   // Merve: az index.ts az acquirePortLock(WEB_PORT)-tal SIGTERM-et majd SIGKILL-t kuld
   // arra, ami a portot tartja -- a fallbacken az a sajat, FUTO dashboard. A
-  // startWebServer ~115 sorral kesobb jon. Egy csak ott allo kapu eloszor megolne az elo
+  // startWebServer csak joval kesobb jon, a main()-ben. Egy csak ott allo kapu eloszor megolne az elo
   // dashboardot, es utana tagadna meg az indulast: rosszabb, mint a hiba, amit javit.
   const index = readFileSync(join(SRC, 'index.ts'), 'utf-8')
 

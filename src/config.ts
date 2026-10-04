@@ -3,7 +3,7 @@ import { hostname, homedir } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readEnvFile } from './env.js'
+import { readEnvFile, ENV_SANDBOX_DIR } from './env.js'
 import { resolveFleetVenvDir } from './fleet-venv.js'
 import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
 import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
@@ -28,7 +28,9 @@ const env = readEnvFile()
 // the saved override would never be read by the boot-time consumers.
 function readConfigOverrides(): Record<string, unknown> {
   try {
-    const p = join(STORE_DIR, 'config-overrides.json')
+    // bc3f8fb0: under the CLAUDECLAW_ENV_DIR test seam the override file is the sandbox's too (env.ts ENV_SANDBOX_DIR);
+    // production never sets it and reads STORE_DIR.
+    const p = join(ENV_SANDBOX_DIR !== undefined ? join(ENV_SANDBOX_DIR, 'store') : STORE_DIR, 'config-overrides.json')
     return existsSync(p) ? (JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>) : {}
   } catch {
     return {}
@@ -309,27 +311,32 @@ export function systemdStatusUnits(serviceId: string): string[] {
 // dashboard to the whole network and put the address into the CSRF allowlist, with nothing
 // validating it. It stays a .env-only key, read exactly as before this card.
 //
-// CLAUDECLAW_ENV_DIR (env.ts:11, and FLEET_PYTHON_VENV below) is untouched: it already reads
-// process.env and is a test seam for the .env path itself, not a config value.
+// CLAUDECLAW_ENV_DIR (env.ts, the PROJECT_ROOT line, exported there as ENV_SANDBOX_DIR; and FLEET_PYTHON_VENV below)
+// is untouched as a source of values: it is a test seam for the .env path itself (and, since bc3f8fb0, for the
+// config-overrides.json path next to it), not a config value.
 const PROCESS_ENV_BOOT_KEYS = ['WEB_PORT'] as const
 type BootKey = (typeof PROCESS_ENV_BOOT_KEYS)[number]
 
+export type BootLayerSource = 'process.env' | 'config-overrides.json' | '.env'
+
 // process.env > config-overrides.json > .env  (the caller applies the default).
-// An empty or whitespace-only value counts as UNSET at every layer, so a stray
-// `WEB_PORT=` cannot blank the port -- it falls through to the next source, the same
-// way cfg() already treats an empty override.
-// Pure, so the ORDER can be asserted without booting the process or touching the
-// real .env -- the precedence is the thing this card changes, so it is the thing a
-// test has to be able to see.
-export function resolveBootValue(
+// An empty or whitespace-only value counts as UNSET at EVERY layer, the override included, so a stray
+// `WEB_PORT=` or a `"WEB_PORT": "   "` override cannot blank the port: it falls through to the next source.
+// bc3f8fb0 (a): the three layers are resolved here one by one. Before, the override and .env arrived pre-merged
+// through cfg(), which lets a whitespace-only override shadow .env (it only skips an EMPTY one), so the port fell
+// to the 3420 default (measured: .env 39876 + override '   ' -> 3420). Each layer also names its own source:
+// the startup log and remote-access-enroll print it, and "the override" and ".env" call for different fixes.
+// Pure, so the ORDER can be asserted without booting the process or touching the real files.
+export function resolveBootLayers(
   fromProcess: string | undefined,
-  fromLayered: string | undefined,
-): { value: string; source: string } | undefined {
-  if (fromProcess !== undefined && fromProcess.trim().length > 0) {
-    return { value: fromProcess.trim(), source: 'process.env' }
-  }
-  if (fromLayered !== undefined && fromLayered.trim().length > 0) {
-    return { value: fromLayered.trim(), source: 'config-overrides.json/.env' }
+  fromOverride: string | undefined,
+  fromEnvFile: string | undefined,
+): { value: string; source: BootLayerSource } | undefined {
+  const layers: Array<[string | undefined, BootLayerSource]> = [
+    [fromProcess, 'process.env'], [fromOverride, 'config-overrides.json'], [fromEnvFile, '.env'],
+  ]
+  for (const [value, source] of layers) {
+    if (value !== undefined && value.trim().length > 0) return { value: value.trim(), source }
   }
   return undefined
 }
@@ -343,17 +350,38 @@ export function dropTrailingComment(value: string | undefined): string | undefin
   return value === undefined ? undefined : value.replace(/\s+#.*$/s, '')
 }
 
-function bootEnv(key: BootKey): { value: string; source: string } | undefined {
-  return resolveBootValue(process.env[key], dropTrailingComment(cfg(key)))
+// The three raw layers of a boot key: process.env as it is, the two file layers with a trailing comment dropped.
+function bootLayers(key: BootKey): { fromProcess?: string; fromOverride?: string; fromEnvFile?: string } {
+  const ov = overrides[key]
+  return {
+    fromProcess: process.env[key],
+    fromOverride: ov === undefined || ov === null ? undefined : dropTrailingComment(String(ov)),
+    fromEnvFile: dropTrailingComment(env[key]),
+  }
+}
+
+function bootEnv(key: BootKey): { value: string; source: BootLayerSource } | undefined {
+  const l = bootLayers(key)
+  return resolveBootLayers(l.fromProcess, l.fromOverride, l.fromEnvFile)
+}
+
+// What this install's FILES say, without process.env (config-overrides.json > .env): the value a dashboard started as a
+// service uses when it does not inherit an operator's shell. remote-access-enroll compares a shell export against it.
+function bootInstallValue(key: BootKey): { value: string; source: BootLayerSource } | undefined {
+  const l = bootLayers(key)
+  return resolveBootLayers(undefined, l.fromOverride, l.fromEnvFile)
 }
 
 /**
  * Parse a port, or STOP.
  *
- * `parseInt('39876x', 10)` is 39876 and `parseInt('nope', 10)` is NaN -- and a NaN port
- * makes listen() bind an arbitrary free port, so the dashboard would come up somewhere
- * nobody is looking. While the value could only come from a hand-edited .env this was a
- * once-per-install risk; now that a command line can set it, one keystroke is enough.
+ * `parseInt('39876x', 10)` is 39876, so a stray character silently gives a port nobody set, and the
+ * dashboard comes up somewhere nobody is looking. `parseInt('nope', 10)` is NaN, and listen() rejects that only
+ * at the END of the boot (Node 22: ERR_SOCKET_BAD_PORT, after the lock and the agents already ran); 0 would make
+ * listen() bind an arbitrary free port, and above 65535 listen() rejects it the same way (bc3f8fb0 (d): measured on
+ * Node 22.23.2; the earlier text said a NaN port binds an arbitrary free port, which Node 22 does not do).
+ * While the value could only come from a hand-edited .env this was a once-per-install risk; now that a command line
+ * can set it, one keystroke is enough.
  * Exported for tests: the failure path must be assertable without booting the process.
  */
 export function parseWebPort(raw: string | undefined, source: string, fallback: number): number {
@@ -361,14 +389,15 @@ export function parseWebPort(raw: string | undefined, source: string, fallback: 
   if (!/^\d+$/.test(raw)) {
     throw new Error(
       `WEB_PORT is not a number: ${JSON.stringify(raw)} (source: ${source}). ` +
-      'Refusing to start: an unparsable port would bind an arbitrary free port and the ' +
-      'dashboard would come up where nobody is looking.',
+      'Refusing to start: a lenient read would take a different port without a word ' +
+      '(parseInt("39876x") is 39876), and a NaN port fails only at listen(), at the end of the boot.',
     )
   }
   const port = Number(raw)
   if (port < 1 || port > 65535) {
     throw new Error(
-      `WEB_PORT is out of range: ${port} (source: ${source}). Valid ports are 1-65535.`,
+      `WEB_PORT is out of range: ${port} (source: ${source}). Valid ports are 1-65535: ` +
+      '0 would bind an arbitrary free port, and listen() rejects anything above 65535.',
     )
   }
   return port
@@ -426,6 +455,12 @@ export const BOOT_KEY_SOURCES: Record<BootKey, string> = {
   WEB_PORT: webPortRaw?.source ?? 'default',
 }
 
+// bc3f8fb0 (b): the WEB_PORT this install's FILES give (config-overrides.json > .env, no process.env), and the
+// resolveWebPort default above when neither sets it. A dashboard started as a service does not inherit an operator's
+// shell, so this is the port it listens on; scripts/remote-access-enroll.ts warns when a shell export disagrees with it.
+export const WEB_PORT_INSTALL: { value: string; source: string } =
+  bootInstallValue('WEB_PORT') ?? { value: '3420', source: 'default' }
+
 // The WEB_PORT value that was REJECTED, if any -- undefined on the healthy path.
 // It sits right next to BOOT_KEY_SOURCES on purpose: both answer the same question
 // ("what actually happened to this key at boot"), and both are READ, not grepped. A log
@@ -441,7 +476,7 @@ export const WEB_PORT_INVALID = webPortResolved.invalid
  *
  *   1. acquireLock() in index.ts -- it SIGTERMs and then SIGKILLs whatever holds
  *      WEB_PORT. On the fallback that is 3420, i.e. the install's OWN running
- *      dashboard. Measured: index.ts calls acquirePortLock(WEB_PORT) ~115 lines
+ *      dashboard. Measured: index.ts calls acquirePortLock(WEB_PORT) well
  *      before startWebServer(WEB_PORT), so a gate that only sat in the web server
  *      would let a typo kill the live dashboard first and refuse to start second --
  *      strictly worse than the defect it fixes.

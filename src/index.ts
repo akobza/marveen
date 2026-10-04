@@ -359,8 +359,8 @@ async function acquireLock(): Promise<void> {
   // The WEB_PORT gate stands HERE, not only in startWebServer, and the reason is
   // measured: acquirePortLock() below SIGTERMs and then SIGKILLs whatever holds
   // WEB_PORT, and on an invalid value config.ts has already substituted the 3420
-  // fallback -- which is this install's own running dashboard. startWebServer is
-  // reached ~115 lines later, so a gate only there would kill the live dashboard
+  // fallback -- which is this install's own running dashboard. startWebServer runs
+  // only much later in main(), so a gate only there would kill the live dashboard
   // first and refuse to start second. A typo must not be able to do that.
   assertWebPortUsable()
 
