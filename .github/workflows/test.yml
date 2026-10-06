@@ -63,6 +63,10 @@ jobs:
       # over-report GROWS with every consolidation round, which is why this
       # runs here and not by hand. Hermetic: throwaway fixture dir.
       - run: python3 scripts/__tests__/memory-link-audit.test.py
+      # Owner-request pairing: its scenario tests ran only by hand, so a green PR said
+      # nothing about them (tester's note on the PR). Hermetic: a throwaway sqlite DB with made-up
+      # chat ids and texts; it never reads store/claudeclaw.db or store/principals.json.
+      - run: python3 scripts/tulajdonosi-keres-par/test_tulajdonosi_keres_par.py
       # MORNTIMERPARK914: the #1313 contract tests shipped without CI wiring,
       # so "CI green" said nothing about them -- the exact rot the comment
       # above warns about. All three are hermetic (stubs on PATH / CLAUDE_BIN,
