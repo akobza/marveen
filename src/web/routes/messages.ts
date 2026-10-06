@@ -141,14 +141,48 @@ function noteHeartbeatRefusal(problems: string[], nowMs: number = Date.now()): v
   }
 }
 
+/**
+ * Where a POST /api/messages came from, for its log line (card 4ab5252a). The shared bearer token lets any
+ * local process or tailnet peer send with any EXISTING agent's `from` -- only an unknown name is refused --
+ * and on 2026-09-20 such a message arrived with no address or port on any log line, so its origin could not
+ * be told. This is the socket's address and port, plus what a proxy in front says about the client when it
+ * says it: X-Forwarded-For, and the identity header `tailscale serve` adds for tailnet users. Observation
+ * only: nothing here changes an answer. Never the token, never the body.
+ */
+export function requestOrigin(req: RouteContext['req']): Record<string, string | number> {
+  const o: Record<string, string | number> = {
+    remote: req.socket?.remoteAddress ?? 'unknown',
+    remotePort: req.socket?.remotePort ?? 0,
+  }
+  // Defensive on purpose: an observation that throws would turn an answer into a 500.
+  const header = (name: string): string | null => {
+    const v = req.headers?.[name]
+    return v == null || v === '' ? null : Array.isArray(v) ? v.join(', ') : String(v)
+  }
+  const xff = header('x-forwarded-for')
+  if (xff) o.xff = xff
+  const tailnetUser = header('tailscale-user-login')
+  if (tailnetUser) o.tailnetUser = tailnetUser
+  return o
+}
+
 export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method, url } = ctx
 
   if (path === '/api/messages' && method === 'POST') {
+    const origin = requestOrigin(req)
     const body = await readBody(req)
-    const { from, to, content, origin_note } = JSON.parse(body.toString()) as
-      { from: string; to: string; content: string; origin_note?: string }
+    let parsed: { from: string; to: string; content: string; origin_note?: string }
+    try {
+      parsed = JSON.parse(body.toString()) as typeof parsed
+    } catch (err) {
+      // Logged, then thrown on unchanged: the shared handler in web.ts answers it (500), as before.
+      logger.warn({ ...origin }, 'Rejected /api/messages POST: the body is not JSON')
+      throw err
+    }
+    const { from, to, content, origin_note } = parsed
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
+      logger.warn({ ...origin, from: from?.trim(), to: to?.trim() }, 'Rejected /api/messages POST: from, to and content are required')
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
     }
@@ -200,7 +234,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // router -> channel-inbound with an attacker-controlled body. Matching the
     // router's normalization here closes that asymmetry.
     if (sanitizeAgentIdent(from) === COORDINATOR_AGENT_ID) {
-      logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST forging channel-coordinator id')
+      logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST forging channel-coordinator id')
       json(res, { error: 'from is reserved for the in-process channel coordinator' }, 403)
       return true
     }
@@ -227,7 +261,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // The other SYSTEM_SENDER_IDS entries are untouched -- they name external
     // notifiers, and none of them is the fleet's authentication base.
     if (sanitizeAgentIdent(from) === SYSTEM_DIRECTIVE_SENDER) {
-      logger.warn({ from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none' }, 'Rejected /api/messages POST forging the system directive sender')
+      logger.warn({ ...origin, from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none' }, 'Rejected /api/messages POST forging the system directive sender')
       json(res, { error: `from '${SYSTEM_DIRECTIVE_SENDER}' is reserved for in-process system directives and can never be POSTed` }, 403)
       return true
     }
@@ -245,7 +279,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // where the auth context is long gone and only from_agent survives.
     if (sanitizeAgentIdent(from) === VOICE_CHANNEL_AGENT_ID && ctx.auth?.kind !== 'device') {
       logger.warn(
-        { from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none' },
+        { ...origin, from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none' },
         'Rejected /api/messages POST as voice channel without a device key',
       )
       json(res, { error: `from '${VOICE_CHANNEL_AGENT_ID}' requires an enrolled device key, not the shared dashboard token` }, 403)
@@ -257,7 +291,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // any dashboard-token holder (i.e. every local sub-agent) impersonate a
     // federation peer toward another local agent.
     if (from.includes('/')) {
-      logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST with qualified from (federation impersonation guard)')
+      logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST with qualified from (federation impersonation guard)')
       json(res, { error: 'from must be a local agent id without "/" -- federated senders are only accepted via /api/federation/inbox' }, 403)
       return true
     }
@@ -291,7 +325,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     const isVoiceChannelSender = sanitizeAgentIdent(from) === VOICE_CHANNEL_AGENT_ID
     const isSystemSender = SYSTEM_SENDERS.has(sanitizeAgentIdent(from))
     if (!isOwnerSender && !isSystemSender && !isVoiceChannelSender && !isKnownAgent(sanitizeAgentIdent(from))) {
-      logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST from unregistered agent')
+      logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST from unregistered agent')
       json(res, { error: `unknown agent '${from.trim()}' -- from must be a registered fleet agent id` }, 403)
       return true
     }
@@ -302,11 +336,13 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     if (storedTo.includes('/')) {
       const target = parseQualifiedId(storedTo)
       if (!target) {
+        logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST: invalid federated recipient')
         json(res, { error: 'Invalid federated address in to (expected "<system>/<agent>")' }, 400)
         return true
       }
       const cfg = getFederationConfig()
       if (!cfg.enabled) {
+        logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST: invalid federated recipient')
         json(res, { error: 'Federation is disabled on this system' }, 400)
         return true
       }
@@ -317,10 +353,12 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       // PEER's namespace -- leave its case alone.
       const targetSystem = target.system.toLowerCase()
       if (targetSystem === cfg.systemId) {
+        logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST: invalid federated recipient')
         json(res, { error: `'${target.system}' is this system -- address the agent locally as '${target.agent}'` }, 400)
         return true
       }
       if (!cfg.peers.some((p) => p.id === targetSystem)) {
+        logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST: invalid federated recipient')
         json(res, { error: `Unknown federation peer '${target.system}'` }, 400)
         return true
       }
@@ -333,6 +371,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       // with the correct form. Safe: sanitizeAgentIdent strips ':', so no
       // legitimate local agent id can contain one, and the channel
       // coordinator inserts directly into the DB, bypassing this endpoint.
+      logger.warn({ ...origin, from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST: invalid recipient form')
       json(res, { error: 'Invalid recipient: use "<system>/<agent>" (slash) for a federated address, not the "federation:x:y" source form' }, 400)
       return true
     }
@@ -390,7 +429,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     const queue = isQualifiedId(storedTo) ? undefined : getRecipientQueueState(storedTo)
     const queueField = queue ? { queue } : {}
     logger.info(
-      { id: msg.id, from: msg.from_agent, to: msg.to_agent, originNote: msg.origin_note, queueDepth: queue?.queueDepth },
+      { ...origin, id: msg.id, from: msg.from_agent, to: msg.to_agent, originNote: msg.origin_note, queueDepth: queue?.queueDepth },
       'Agent message created',
     )
     // A LOCAL recipient that is not running never receives this: the router
@@ -411,7 +450,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     if (!storedTo.includes('/')
         && sanitizeAgentIdent(storedTo) !== sanitizeAgentIdent(MAIN_AGENT_ID)
         && !isAgentRunning(sanitizeAgentIdent(storedTo))) {
-      logger.warn({ id: msg.id, to: msg.to_agent }, 'Agent message queued for a STOPPED agent -- likely to be abandoned')
+      logger.warn({ ...origin, id: msg.id, to: msg.to_agent }, 'Agent message queued for a STOPPED agent -- likely to be abandoned')
       json(res, {
         ...msg,
         ...queueField,
