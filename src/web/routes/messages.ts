@@ -1,6 +1,6 @@
 import {
-  createAgentMessage, getPendingMessages, listAgentMessages, getRecipientQueueState,
-  getAgentConversation, getAgentConversationThreads,
+  createAgentMessage, getPendingMessages, listAgentMessagesPage, getRecipientQueueState,
+  getAgentConversationPage, getAgentConversationThreads,
   getKanbanSeqByIdPrefix,
   markMessageDone, markMessageFailed, getAgentMessage,
   closeOtelSpan,
@@ -493,23 +493,38 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     }
     const agent = url.searchParams.get('agent') || ''
     const status = url.searchParams.get('status') || ''
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200)
+    const limit = parseInt(url.searchParams.get('limit') || '50', 10)
     const beforeRaw = url.searchParams.get('before')
-    const before = beforeRaw !== null ? parseInt(beforeRaw, 10) : undefined
+    const beforeParsed = beforeRaw !== null ? parseInt(beforeRaw, 10) : undefined
+    const before = Number.isFinite(beforeParsed as number) ? beforeParsed : undefined
 
+    // 39a46ab7: the list used to be cut to 200 rows in silence (limit=500 answered 200 rows, and
+    // nothing said so), and the global branch could not page at all. The body stays a bare JSON
+    // array (the fleet's scripts read that shape); the cut is stated in three headers instead:
+    // X-Messages-Limit (the limit actually applied), X-Messages-Has-More (measured: one row more
+    // than the limit was asked), and X-Messages-Next-Before (the cursor for the next older page,
+    // only when there is one). The pending lists are not capped: "none" and "false".
     let messages: AgentMessage[]
+    let appliedLimit: number | null = null
+    let hasMore = false
+    let nextBefore: number | null = null
     if (status === 'pending' && agent) {
       messages = getPendingMessages(agent)
     } else if (status === 'pending') {
       messages = getPendingMessages()
-    } else if (agent) {
-      // SQL-filtered to THIS agent's last N (+ before-cursor pagination), not
-      // global-last-N-then-JS-filter which starved rarely-active threads.
-      messages = getAgentConversation(agent, limit, Number.isFinite(before as number) ? before : undefined)
     } else {
-      messages = listAgentMessages(limit)
+      // agent: SQL-filtered to THIS agent's last N (+ before-cursor pagination), not
+      // global-last-N-then-JS-filter which starved rarely-active threads.
+      const page = agent ? getAgentConversationPage(agent, limit, before) : listAgentMessagesPage(limit, before)
+      messages = page.messages
+      appliedLimit = page.appliedLimit
+      hasMore = page.hasMore
+      nextBefore = page.nextBefore
     }
 
+    res.setHeader('X-Messages-Limit', appliedLimit === null ? 'none' : String(appliedLimit))
+    res.setHeader('X-Messages-Has-More', hasMore ? 'true' : 'false')
+    if (nextBefore !== null) res.setHeader('X-Messages-Next-Before', String(nextBefore))
     jsonMaybeGzip(req, res, attachFreshness(messages))
     return true
   }
