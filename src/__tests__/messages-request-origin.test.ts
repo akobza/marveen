@@ -79,6 +79,7 @@ const CASES: Array<[string, Record<string, unknown>, number]> = [
   ['400 federation disabled', { from: MAIN_AGENT_ID, to: 'peer/agent', content: BODY_TEXT }, 400],
   ['400 the federation:x:y source form', { from: MAIN_AGENT_ID, to: 'federation:x:y', content: BODY_TEXT }, 400],
   ['200 created', { from: MAIN_AGENT_ID, to: MAIN_AGENT_ID, content: BODY_TEXT }, 200],
+  ['200 an answer to the voice channel, stored in its mailbox', { from: MAIN_AGENT_ID, to: VOICE_CHANNEL_AGENT_ID, content: BODY_TEXT }, 200],
 ]
 
 describe('every branch keeps its status (the card forbids a behaviour change)', () => {
@@ -109,6 +110,9 @@ describe('every answer stays what develop gives (measured, not claimed)', () => 
       const r = await post(body)
       if (name in REFUSAL_BODY) {
         expect(r.body).toBe(REFUSAL_BODY[name])
+      } else if (body.to === VOICE_CHANNEL_AGENT_ID) {
+        // develop's voice mailbox (VOICEREPLY1005): stored as done, never pending, and marked as a mailbox row
+        expect(JSON.parse(r.body)).toMatchObject({ from_agent: MAIN_AGENT_ID, to_agent: VOICE_CHANNEL_AGENT_ID, content: BODY_TEXT, status: 'done', mailbox: true })
       } else {
         expect(JSON.parse(r.body)).toMatchObject({ from_agent: MAIN_AGENT_ID, to_agent: MAIN_AGENT_ID, content: BODY_TEXT, status: 'pending' })
       }

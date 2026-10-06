@@ -415,7 +415,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote)
     if (isVoiceMailbox) {
       markMessageDone(msg.id, VOICE_MAILBOX_RESULT)
-      logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Voice-channel answer stored in the mailbox (no session delivery)')
+      logger.info({ ...origin, id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Voice-channel answer stored in the mailbox (no session delivery)')
       json(res, { ...(getAgentMessage(msg.id) ?? msg), mailbox: true })
       return true
     }
