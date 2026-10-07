@@ -13,7 +13,7 @@
 // and the other silent preconditions through GET /api/claude-plans/readiness.
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { CHANNEL_CHAT_ID, MAIN_AGENT_ID, PROJECT_ROOT, WEB_PORT } from '../config.js'
+import { CHANNEL_CHAT_ID, MAIN_AGENT_ID, PROJECT_ROOT, WEB_PORT, withWebPortWarning } from '../config.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { readClaudePlans } from './claude-plans.js'
 import { readClaudePlansState } from './claude-plans-state.js'
@@ -100,7 +100,9 @@ export function ensureRotationHeartbeatTask(opts: { respectRemoval?: boolean } =
   if (opts.respectRemoval && readRemovedDefaultTasks().has(ROTATION_HEARTBEAT_TASK)) return 'removed-by-operator'
   writeScheduledTask(ROTATION_HEARTBEAT_TASK, {
     description: 'Claude-plan rotáció: 10 percenként ellenőrzi a fő agent aktív planjének keretét, és ha kell, jelez és vált (scripts/claude-plan-rotate-check.ts)',
-    prompt: buildRotationHeartbeatPrompt({ projectRoot: PROJECT_ROOT, webPort: WEB_PORT, chatId: CHANNEL_CHAT_ID }),
+    // Card b2cd0f43: the main agent runs the curl in this prompt when a rotation is due, and the prompt is stored,
+    // so it outlives this process. On the fallback path its port is NOT the operator's value. Same sentence, one source.
+    prompt: withWebPortWarning(buildRotationHeartbeatPrompt({ projectRoot: PROJECT_ROOT, webPort: WEB_PORT, chatId: CHANNEL_CHAT_ID })),
     schedule: ROTATION_HEARTBEAT_SCHEDULE,
     agent: MAIN_AGENT_ID,
     enabled: true,

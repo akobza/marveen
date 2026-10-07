@@ -18,6 +18,11 @@
 // Card b2cd0f43 (5), decision (c): that one reachable place, the enroll CLI, now refuses at the dashboard's level
 // (assertWebPortUsable, before any write) instead of warning on stderr. It moved to the KAPUZOTT (gated) bucket below,
 // and none of the copied places is reachable with an invalid port any more.
+//
+// A copied place that landed after this count: the Claude-plan rotation heartbeat prompt
+// (src/web/claude-rotation-heartbeat.ts, a stored task prompt with a curl to the dashboard port). It is written only
+// by the dashboard process, after both gates, like the other dashboard-only places; it carries the warning for the
+// same reason they do, so the protection does not rest on that reachability argument.
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -109,6 +114,7 @@ describe('⛔ LEFEDETTSEG: minden iras-hely BESOROLVA, besorolatlan maradek NELK
     'src/web/heartbeat-agent-scaffold.ts',
     'src/web/voice-directive.ts',
     'src/web/channel-monitor.ts',
+    'src/web/claude-rotation-heartbeat.ts',
   ])
   // Places that write WEB_PORT into a copied artefact but STOP on an invalid port before writing anything, with the
   // dashboard's own gate. They carry no marker: there is no copied text on that path.
