@@ -70,6 +70,8 @@ const EXPECTED: Record<string, string[]> = {
     'outgoing-copy-gate.py @ .*[Gg]mail.*__.*',
     'outgoing-copy-gate.py @ .*draft_email.*',
     'outgoing-copy-gate.py @ mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message',
+    // fc282e39: a question to an owner gets the owner's earlier messages as context (non-blocking)
+    'owner-question-lookup.py @ mcp__plugin_telegram_telegram__reply',
     'outgoing-copy-gate.py @ mcp__plugin_discord_discord__reply|mcp__plugin_discord_discord__edit_message',
     'email-approval-gate.py @ Bash',
     'email-approval-gate.py @ .*send_email.*',
