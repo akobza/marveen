@@ -24,6 +24,10 @@ Exit code:
     0  message delivered (placeholder cleared best-effort)
     2  delivery FAILED (Bot API not ok / unreachable) -> caller should escalate
        (per the skill: fall through to email). Nothing was cleared.
+    3  NOT SENT on purpose: the chat is in its quiet hours (card 20e178fc, the same
+       decision as the telegram-quiet-gate.py PreToolUse gate). Do NOT escalate to
+       email: the item goes into the batched message after the window. Nothing was
+       sent and nothing was cleared.
 
 Resolution mirrors the plugin/hooks: state dir from --state-dir else
 TELEGRAM_STATE_DIR else ~/.claude/channels/telegram; token from <state_dir>/.env
@@ -34,6 +38,8 @@ so tests can point it at a local stub.
 import sys
 import os
 import json
+import time
+import importlib.util
 import urllib.request
 
 MAX_LEN = 4000  # Telegram hard limit is 4096; match the Stop hook's trim.
@@ -58,6 +64,36 @@ def state_dir(cli_dir=None):
 
 def session_id(cli_sid=None):
     return cli_sid or os.environ.get("CLAUDE_CODE_SESSION_ID") or "default"
+
+
+def _sibling(name):
+    """A module next to this file, loaded by path (never through sys.path)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("_fallback_" + name, os.path.join(here, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def quiet_hold(chat_id, now=None):
+    """(hold, why) from telegram_quiet_hours.send_decision on the INSTALL's quiet-hours
+    config (card 20e178fc), the same decision as telegram-quiet-gate.py. Fail-closed:
+    if the decision itself cannot be made, nothing is sent."""
+    root = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    state, seen = os.path.join(root, ".claude", "channels", "telegram"), os.path.join(root, "store", "quiet-hours.seen")
+    try:
+        quiet = _sibling("telegram_quiet_hours")
+        hold, why, defect = quiet.send_decision(state, chat_id, time.time() if now is None else now, seen)
+        quiet.remember_configured(state, seen, "telegram_fallback_send")
+    except Exception as e:
+        return True, "the quiet-hours decision failed (%s: %s)" % (type(e).__name__, e)
+    if defect:
+        sys.stderr.write("telegram_fallback_send: QUIET-HOURS DEFECT: %s\n" % defect)
+        try:
+            _sibling("hook_errlog").report("telegram_fallback_send", defect)
+        except Exception:
+            pass  # the stderr line above already carries it
+    return hold, why
 
 
 def log(sd, msg):
@@ -141,6 +177,16 @@ def main():
     chat_id, text = pos[0], pos[1]
     sd = state_dir(cli_dir)
     sid = session_id(cli_sid)
+
+    # Card 20e178fc: the quiet-hours decision of the PreToolUse gate, so the manual
+    # fallback is no way around it. The config is the install's own, whatever
+    # state dir the token comes from (see telegram-quiet-gate.py).
+    hold, why = quiet_hold(chat_id)
+    if hold:
+        sys.stderr.write("telegram_fallback_send: NOT SENT, quiet hours (%s). Do not escalate "
+                         "to email; the item goes into the batched message after the window.\n" % why)
+        log(sd, f"[fallback-send] held by quiet hours chat={chat_id} sid={sid}: {why}")
+        sys.exit(3)
 
     tok = token(sd)
     if not tok:
