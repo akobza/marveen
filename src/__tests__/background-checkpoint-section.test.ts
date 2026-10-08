@@ -66,7 +66,7 @@ describe('background-checkpoint section: what it says (BGCHECKPOINT1008)', () =>
 
   it('the file lives under the working directory, not the scratchpad, and the brief names it', () => {
     expect(body).toMatch(/munkakönyvtárad alatt/)
-    expect(body).toMatch(/scratchpad/)
+    expect(body).toMatch(/scratchpad session-hez kötött \/tmp-mappa: új session[\s\S]{0,60}gép-újraindulás után nincs meg/)
     expect(body).toMatch(/briefjébe[\s\S]{0,40}fájl útjával/)
   })
 

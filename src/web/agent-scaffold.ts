@@ -2436,8 +2436,9 @@ export function buildBackgroundCheckpointBody(): string {
     'futó parancsot leállítja: a fő beszélgetés folytatódik, a háttér-munka nem, és ami nincs fájlban, elvész.',
     '',
     '- Ha egy háttér-alügynök vagy háttér-futás várhatóan 15 percnél tovább dolgozik, kb. 10 percenként mentse a',
-    '  részeredményt fájlba, a munkakönyvtárad alatt (a scratchpad egy újraindult sessionben már nem ugyanaz). A',
-    '  háttér-alügynök briefjébe ezt írd bele, a fájl útjával együtt.',
+    '  részeredményt fájlba, a munkakönyvtárad alatt (a scratchpad session-hez kötött /tmp-mappa: új session, például a',
+    '  context-guard friss indítása, vagy gép-újraindulás után nincs meg). A háttér-alügynök briefjébe ezt írd bele, a',
+    '  fájl útjával együtt.',
     '- Újraindulás vagy kulcsfal után ELŐBB a mentett részt olvasd be, és onnan folytasd, ne elölről.',
     '- A lapra (vagy a HANDOFF.md-be) egy sor: hol a mentett rész (út), és mi a következő lépés.',
   ].join('\n')
