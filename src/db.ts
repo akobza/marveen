@@ -5677,6 +5677,26 @@ export function markReminderFailed(id: string, error: string): boolean {
     .run(error.slice(0, 500), id).changes > 0
 }
 
+/** 6a6fe7d2: the conversation_log agent id of a sent reminder is `<agent>:emlekezteto`, never the agent's own id. Every
+ *  ledger reader keys on agent_id with no chat filter, and the open-question rule takes the newest outbound after the
+ *  newest inbound as the answer: a reminder under the agent's own id would close the owner's open question, even one
+ *  asked in another chat. */
+export const REMINDER_LEDGER_AGENT_SUFFIX = ':emlekezteto'
+
+/**
+ * 6a6fe7d2: a reminder the dashboard sent on the Bot API, in conversation_log, in the ledger's outbound form
+ * (scripts/hooks/ledger_lib.py log_outbound: INSERT OR IGNORE, ts as an ISO second with Z) under its own agent id. The
+ * Telegram message id makes a repeat of the same send a no-op (UNIQUE(agent_id, chat_id, direction, message_id)). Only
+ * the columns both schema places define (this file and ledger_lib.py). Returns whether a row was written.
+ */
+export function logReminderOutbound(agentId: string, chatId: string, messageId: number | null, text: string, nowSec: number): boolean {
+  const ts = new Date(nowSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  return db.prepare(
+    `INSERT OR IGNORE INTO conversation_log (agent_id, chat_id, direction, message_id, text, ts, created_at)
+       VALUES (?, ?, 'out', ?, ?, ?, ?)`,
+  ).run(`${agentId}${REMINDER_LEDGER_AGENT_SUFFIX}`, String(chatId), messageId == null ? null : String(messageId), text, ts, nowSec).changes > 0
+}
+
 /** The daily check's rows: still to go in [fromSec, toSec) by send moment, and the ones that did not go: due before
  *  `missedBeforeSec` and not sent (failed, cancelled, or still waiting past their moment). */
 export function reminderDigestRows(fromSec: number, toSec: number, missedFromSec: number, missedBeforeSec: number): { today: Reminder[]; missed: Reminder[] } {

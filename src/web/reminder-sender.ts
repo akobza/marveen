@@ -17,11 +17,12 @@ import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 import { channelStateDir, readChannelToken } from '../channel-provider.js'
 import {
   claimReminder, claimReminderDigest, createAgentMessage, deferReminder, dueReminders, failStaleReminderClaims,
-  markReminderFailed, markReminderSent, reminderDigestRows, type Reminder,
+  logReminderOutbound, markReminderFailed, markReminderSent, reminderDigestRows, type Reminder,
 } from '../db.js'
 import { logger } from '../logger.js'
 import { allowedAt, EMPTY_WINDOWS, localParts, nextAllowedMs, parseReminderWindows, zonedToUtcMs, type ReminderWindowsConfig } from '../reminder-window.js'
 import { agentDir } from './agent-config.js'
+import { maskSecrets } from './agent-transcript.js'
 import { parseTelegramToken, sendTelegramMessage } from './telegram.js'
 
 export const REMINDER_WINDOWS_FILE = 'reminder-windows.json'
@@ -83,6 +84,20 @@ function errorText(err: unknown): string {
   return m.replace(/bot[0-9]+:[A-Za-z0-9_-]+/g, 'bot<token>').slice(0, 300)
 }
 
+/**
+ * 6a6fe7d2: the sent reminder in conversation_log, so the ledger-based gates see it (it went out on the Bot API, past
+ * the hooks that log a session's own replies). Under `<agent>:emlekezteto` (REMINDER_LEDGER_AGENT_SUFFIX): it is not an
+ * answer, so the agent's open question stays open. The text is logged with secrets masked (60316906: no key in the
+ * ledger); a failed write is only logged and never turns a sent reminder into a failed one.
+ */
+function logSentReminder(r: Reminder, messageId: number | null, sentSec: number): void {
+  try {
+    logReminderOutbound(r.agent_id, r.recipient_chat_id, messageId, maskSecrets(r.text), sentSec)
+  } catch (err) {
+    logger.warn({ id: r.id, agent_id: r.agent_id, err: errorText(err) }, 'reminder-sender: the conversation_log row was not written')
+  }
+}
+
 let lastConfigAlertMs = 0
 /** Tests: forget the broken-config alert's last time. */
 export function _resetReminderSenderForTest(): void {
@@ -126,8 +141,10 @@ export async function reminderTick(deps: ReminderSenderDeps): Promise<ReminderTi
     if (!claimReminder(r.id, nowSec)) continue
     try {
       const messageId = await deps.send(r.agent_id, r.recipient_chat_id, r.text)
-      markReminderSent(r.id, Math.floor(deps.nowMs() / 1000), messageId)
+      const sentSec = Math.floor(deps.nowMs() / 1000)
+      markReminderSent(r.id, sentSec, messageId)
       out.sent++
+      logSentReminder(r, messageId, sentSec)
       logger.info({ id: r.id, agent_id: r.agent_id, messageId }, 'reminder-sender: sent')
       deps.copyToAgent(r.agent_id, `[EMLÉKEZTETŐ KIMENT] ${short(r)}: ${bpTime(nowSec)}-kor a ${r.recipient_chat_id} chatbe `
         + `(Telegram message_id ${messageId ?? 'nincs'}; kérte: ${r.requester}). A szöveg:\n${r.text}`)
