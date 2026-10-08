@@ -881,6 +881,7 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   }
   if (agentGetsTelegramCopyGate(name)) injectTelegramCopyGate(existing)
   if (agentGetsChildClaudeGuard(name)) injectChildClaudeGuard(existing)
+  if (agentGetsTelegramQuietGate(name)) injectTelegramQuietGate(existing)
   if (agentGetsDestructiveGate(name, profile)) injectDestructiveGate(existing)
   if (agentGetsCredentialGate(name, profile)) injectCredentialGate(existing)
   injectEgressGate(existing)
@@ -1634,6 +1635,66 @@ export function ensureTelegramCopyGate(name: string): boolean {
   })
   if (wiredHere && hookCommandWired(JSON.stringify(ptu), command)) return false
   injectTelegramCopyGate(settings)
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
+// Card 20e178fc: the quiet-hours SEND gate on the Telegram tools that write into a
+// chat (reply, react, edit_message; download_attachment only reads). Every
+// sub-agent, for the reason the copy gate above gives: a gate that exists only in
+// the main agent's settings is a habit, not a gate. The main agent carries the
+// same entry in its committed .claude/settings.json file. The gate reads the INSTALL's
+// quiet-hours.json (it resolves the root from its own file location), so a
+// sub-agent's bot is held for a protected person's chat as well, while its own
+// principal's chat, which no window names, is untouched.
+export const TELEGRAM_QUIET_GATE_MATCHER =
+  'mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__react|mcp__plugin_telegram_telegram__edit_message'
+
+export function agentGetsTelegramQuietGate(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+export function injectTelegramQuietGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = pythonHookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'telegram-quiet-gate.py'))
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: TELEGRAM_QUIET_GATE_MATCHER,
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  // Drop every prior quiet-gate entry, whatever its matcher, then re-add the
+  // canonical one: unlike the copy gate, this script has no use on any other tool,
+  // so an entry under a stale matcher is only a gate that never fires.
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('telegram-quiet-gate.py')),
+    entry,
+  ]
+}
+
+// Idempotent migration for the running fleet, the twin of ensureTelegramCopyGate:
+// the scaffold rewrites a sub-agent's settings only on spawn. Returns true if written.
+export function ensureTelegramQuietGate(name: string): boolean {
+  if (!agentGetsTelegramQuietGate(name)) return false
+  const settingsPath = agentSettingsPath(name)
+  if (!existsSync(settingsPath)) return false
+  let settings: Record<string, unknown> = {}
+  try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  const command = pythonHookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'telegram-quiet-gate.py'))
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []
+  const wiredHere = ptu.some((e) => {
+    const j = JSON.stringify(e)
+    return j.includes('telegram-quiet-gate.py')
+      && (e as { matcher?: unknown })?.matcher === TELEGRAM_QUIET_GATE_MATCHER
+  })
+  if (wiredHere && hookCommandWired(JSON.stringify(ptu), command)) return false
+  injectTelegramQuietGate(settings)
   atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
   return true
 }
