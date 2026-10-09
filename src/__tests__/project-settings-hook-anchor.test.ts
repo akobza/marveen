@@ -78,6 +78,8 @@ const EXPECTED: Record<string, string[]> = {
     'email-approval-gate.py @ .*draft_email.*',
     'channel-image-resize.sh @ Read', 'egress-gate.mjs @ WebFetch', 'memory-frontmatter-gate.py @ Write|Edit|MultiEdit',
     'memory-frontmatter-bash-gate.py @ Bash',
+    // 44ac3366: a raw POST /api/schedules with a dated cron is denied; a one-shot wake-up goes through egyszeri.py.
+    'schedule-dated-post-gate.py @ Bash',
   ],
   Stop: ['marveen-commands.py', 'telegram-reply-guard.py', 'telegram_progress_clear.py', 'slack_progress_clear.py'],
   StopFailure: ['ledger-turn-failure.py'],
