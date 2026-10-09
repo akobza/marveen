@@ -58,6 +58,25 @@ _guard_sender() {
   printf '%s' "${MAIN_AGENT_ID:-marveen}"
 }
 
+# The isolation-lost notice of trigger 2 below, MEASURED (card 40ac420c). The TS respawn guard builds this notice
+# from what it can measure about MAIN_AGENT_ISOLATED_CONFIG -- the effective value, the layer it came from, the
+# state of store/config-overrides.json -- since card 8a4056ad (#1714). This shell guard used to send a fixed guess
+# instead (the setting "probably lost", the overrides file "deleted with no .env key", a 401 risk, "set it back to
+# 1"), which on 2026-09-21 was false on every point: the overrides file existed and .env held a deliberate 0. The
+# words now come from the TS guard itself, through scripts/main-agent-isolation-lost-notice.mjs (one source of
+# truth). Prints two lines: "setting<TAB><the measured facts>" for the WARN line and "notice<TAB><a JSON string>" for
+# the POST body. Without a contract line from the helper both fall back to "not measured": the notice is then the
+# TS guard's own text for an unreadable source, which claims no cause and advises no change.
+_isolation_lost_notice() {
+  local raw setting notice
+  raw="$("${_node_bin:-node}" "$INSTALL_DIR/scripts/main-agent-isolation-lost-notice.mjs" 3>&1 2>>"$INSTALL_DIR/store/channels-failures.log" 1>&2 || true)"
+  setting="$(printf '%s\n' "$raw" | grep -m1 '^setting	' | cut -f2- || true)"
+  notice="$(printf '%s\n' "$raw" | grep -m1 '^notice	"' | cut -f2- || true)"
+  [ -n "$setting" ] || setting='MAIN_AGENT_ISOLATED_CONFIG: not measured (the notice helper gave no contract line)'
+  [ -n "$notice" ] || notice='"[GUARD] A fo agens most a KOZOS ~/.claude alol indult ujra, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG forrasa nem olvashato, ezert a guard nem allit okot es nem javasol teendot."'
+  printf 'setting	%s\nnotice	%s\n' "$setting" "$notice"
+}
+
 # Read MAIN_AGENT_ID and CHANNEL_PROVIDER from .env WITHOUT exporting
 # every variable into the shell environment. `set -a && source .env`
 # would also export TELEGRAM_BOT_TOKEN, which then leaks into the tmux
@@ -1066,17 +1085,21 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
   fi
   # Trigger 2 (below): an install that HAS run isolated before. Its
   # .channels-config dir is still on disk, yet this boot resolved to the shared
-  # root -- so the isolation setting was LOST, e.g. store/config-overrides.json
-  # deleted with no .env key backing it. Needing that dir is what makes this
-  # trigger blind on a fresh install, hence trigger 1.
+  # root. The dir alone does not say why: the setting may be missing, set to a
+  # deliberate 0, or 1 with a failed resolution. So the WARN line and the notice
+  # say what was MEASURED (_isolation_lost_notice, card 40ac420c). Needing that
+  # dir is what makes this trigger blind on a fresh install, hence trigger 1.
   if [ -z "$CFG_ENV" ] && [ -d "$INSTALL_DIR/.channels-config" ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- MAIN_AGENT_ISOLATED_CONFIG resolution came back empty (overrides/.env key lost?). Auth rides the rotating shared session and can 401." >> "$INSTALL_DIR/store/channels-failures.log"
+    _lost="$(_isolation_lost_notice)"
+    _lost_setting="$(printf '%s\n' "$_lost" | grep -m1 '^setting	' | cut -f2-)"
+    _lost_notice="$(printf '%s\n' "$_lost" | grep -m1 '^notice	' | cut -f2-)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- $_lost_setting" >> "$INSTALL_DIR/store/channels-failures.log"
     if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
       _guard_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
       curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
-        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd channels session restart.\"}" \
+        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":$_lost_notice}" \
         -o /dev/null -w '%{http_code}' 2>>"$INSTALL_DIR/store/channels-failures.log" > "$INSTALL_DIR/store/.channels-guard-http.$$" || true
       # Honest delivery (NOTIFYVAKSWEEP826 zaro kor): a fenti WARN csak a helyi
       # logban el -- ha a koordinatornak szolo POST elbukik, az is a logba
@@ -1089,6 +1112,7 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       esac
       unset _guard_port _guard_http
     fi
+    unset _lost _lost_setting _lost_notice
   fi
   # Custom provider env for the main agent (e.g. LiteLLM/OpenCode endpoint).
   # The helper reads the main agent's customProvider from agent-config.json,
