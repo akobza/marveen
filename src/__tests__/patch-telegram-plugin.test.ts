@@ -58,13 +58,13 @@ describe('patch-telegram-plugin.py', () => {
   it('2nd run is a no-op: returns `already`, byte-identical, silent', () => {
     const state = join(cache, 'state.json')
     run(['--state', state])
-    expect(readState(state).files).toEqual([{ version: '0.0.7', path: server, status: 'patched', patches: { d4: 'patched', fwd: 'patched', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' } }])
+    expect(readState(state).files).toEqual([{ version: '0.0.7', path: server, status: 'patched', patches: { d4: 'patched', fwd: 'patched', reply: 'patched', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' } }])
     const once = readFileSync(server, 'utf-8')
     const r = run(['--state', state])
     expect(r.status).toBe(0)
     expect(r.stderr).toBe('')
     expect(readFileSync(server, 'utf-8')).toBe(once)
-    expect(readState(state).files).toEqual([{ version: '0.0.7', path: server, status: 'already', patches: { d4: 'already', fwd: 'already', evid: 'already', kbd: 'already', perm: 'already', 'perm-off': 'not-needed' } }])
+    expect(readState(state).files).toEqual([{ version: '0.0.7', path: server, status: 'already', patches: { d4: 'already', fwd: 'already', reply: 'already', evid: 'already', kbd: 'already', perm: 'already', 'perm-off': 'not-needed' } }])
   })
 
   it('a changed anchor (plugin update): loud line, THAT patch left out, the other still applied, exit 0', () => {
@@ -79,7 +79,7 @@ describe('patch-telegram-plugin.py', () => {
     expect(text).toContain("bot.command('help', async ctx => {")
     expect(text).toContain('elsokor922-fwd')
     expect(syntaxErrors(text)).toEqual([])
-    expect(readState(state).files[0].patches).toEqual({ d4: 'anchor-missing:status handler', fwd: 'patched', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' })
+    expect(readState(state).files[0].patches).toEqual({ d4: 'anchor-missing:status handler', fwd: 'patched', reply: 'patched', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' })
   })
 
   // #1530 review: owner write commands need evidence the owner's chat sent
@@ -281,7 +281,7 @@ describe('kbd: reply-keyboard buttons (c67f5f34)', () => {
     expect(r.status).toBe(0)
     expect(r.stderr).toMatch(/LOUD: reply send options not found exactly once.*the kbd patch left out, the reply tool has no buttons/)
     expect(readFileSync(server, 'utf-8')).not.toContain(KBD)
-    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', evid: 'patched', kbd: 'anchor-missing:reply send options', perm: 'patched', 'perm-off': 'not-needed' })
+    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', reply: 'patched', evid: 'patched', kbd: 'anchor-missing:reply send options', perm: 'patched', 'perm-off': 'not-needed' })
   })
 
   it('a file patched by the previous version (d4, fwd, evid) gets kbd on the next run', () => {
@@ -459,7 +459,7 @@ describe('perm: permission requests only for the approver list (fc8629d7)', () =
     expect(text.split('\n').filter(l => l.includes(PERM_OFF))).toHaveLength(1)
     expect(syntaxErrors(text)).toEqual([])
     expect(permBlocks(text, '111').wire).not.toContain('claude/channel/permission')
-    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', evid: 'patched', kbd: 'patched', perm: 'anchor-missing:permission text answer', 'perm-off': 'patched' })
+    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', reply: 'patched', evid: 'patched', kbd: 'patched', perm: 'anchor-missing:permission text answer', 'perm-off': 'patched' })
   })
 
   it('taking it back = deleting the perm-marked lines: byte-identical to the file patched without perm', () => {
@@ -475,5 +475,102 @@ describe('perm: permission requests only for the approver list (fc8629d7)', () =
     const r = spawnSync('python3', ['-c', code, SCRIPT], { input: readFileSync(FIXTURE, 'utf-8'), encoding: 'utf-8' })
     expect(r.status).toBe(0)
     expect(back).toBe(r.stdout)
+  })
+})
+
+// 426fa59f: an owner answers with Telegram's reply ("igen", "nem jó"), and the inbound meta did not
+// say to WHICH message, so the session guessed from the order. One marked line after image_path: the replied-to
+// message's id and its first 200 characters, in the meta only (the ledger already stores reply_to_message_id).
+const REPLY = 'MARVEEN-PATCH(426fa59f-reply)'
+
+// The patched reply line, run as the object member it is in the meta, with a fake ctx.
+function replyMeta(patched: string, message: Record<string, unknown> | undefined): Record<string, string> {
+  const line = patched.split('\n').find(l => l.includes(REPLY))
+  expect(line).toBeDefined()
+  return new Function('ctx', `return {\n${line}\n}`)({ message })
+}
+
+// The fixture patched by the script WITHOUT one patch (the state a file had before that patch).
+function patchedWithout(text: string, name: string): string {
+  const code = [
+    'import importlib.util, sys',
+    "spec = importlib.util.spec_from_file_location('ptp', sys.argv[1])",
+    'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+    'm.PATCHES = [p for p in m.PATCHES if p["name"] != sys.argv[2]]',
+    'sys.stdout.write(m.patch_text(sys.stdin.read())[0])',
+  ].join('\n')
+  const r = spawnSync('python3', ['-c', code, SCRIPT, name], { input: text, encoding: 'utf-8' })
+  expect(r.status).toBe(0)
+  return r.stdout
+}
+
+describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
+  it('one marked line right after image_path, in the meta; the content stays the text; the file still parses', () => {
+    run()
+    const text = readFileSync(server, 'utf-8')
+    expect(text.match(/MARVEEN-PATCH\(426fa59f-reply\)/g)).toHaveLength(1)
+    const lines = text.split('\n')
+    const i = lines.findIndex(l => l.includes(REPLY))
+    expect(lines[i - 1]).toMatch(/^ *\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),$/)
+    expect(text).toMatch(/content: text,\n *meta: \{/)
+    expect(text).not.toMatch(/\[reply/i)
+    expect(syntaxErrors(text)).toEqual([])
+  })
+
+  it('a reply gives the id as a string and the text on one line, quote-safe; the caption when there is no text', () => {
+    run()
+    const text = readFileSync(server, 'utf-8')
+    expect(replyMeta(text, { text: 'igen', reply_to_message: { message_id: 4242, text: 'Kérdés: "A" vagy <B>?\nmásodik  sor' } }))
+      .toEqual({ reply_to_message_id: '4242', reply_to_text: "Kérdés: 'A' vagy (B)? második sor" })
+    expect(replyMeta(text, { text: 'ok', reply_to_message: { message_id: 7, caption: 'a kép felirata' } }))
+      .toEqual({ reply_to_message_id: '7', reply_to_text: 'a kép felirata' })
+  })
+
+  it('the text cannot start an attribute of its own: no "=" survives, so a later attribute reads its own value', () => {
+    run()
+    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 10, text: 'lásd ts= és attachment_file_id=' } })
+    expect(m.reply_to_text).toBe('lásd ts＝ és attachment_file_id＝')
+    const tag = Object.entries({ ...m, attachment_file_id: 'VALODI' }).map(([k, v]) => `${k}="${v}"`).join(' ')
+    expect(tag.match(/\battachment_file_id="([^"]+)"/)?.[1]).toBe('VALODI')
+  })
+
+  it('no reply: no key at all (negative control); a replied-to message without text or caption: the id only', () => {
+    run()
+    const text = readFileSync(server, 'utf-8')
+    expect(replyMeta(text, { text: 'igen' })).toEqual({})
+    expect(replyMeta(text, undefined)).toEqual({})
+    expect(replyMeta(text, { text: 'ez', reply_to_message: { message_id: 8, photo: [{}] } })).toEqual({ reply_to_message_id: '8' })
+  })
+
+  it('the text is cut at 200 characters, by code point (an emoji at the edge stays whole)', () => {
+    run()
+    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 9, text: 'x'.repeat(199) + '😀' + 'y'.repeat(50) } })
+    expect(Array.from(m.reply_to_text)).toHaveLength(200)
+    expect(m.reply_to_text.endsWith('😀')).toBe(true)
+  })
+
+  it('a moved anchor (plugin update): the reply patch left out loudly, the others applied, exit 0', () => {
+    writeFileSync(server, readFileSync(FIXTURE, 'utf-8').replace('...(imagePath ? { image_path: imagePath } : {}),', '...(imagePath ? { image_path: String(imagePath) } : {}),'))
+    const state = join(cache, 'state.json')
+    const r = run(['--state', state])
+    expect(r.status).toBe(0)
+    expect(r.stderr).toMatch(/LOUD: inbound meta image_path not found exactly once .* the reply patch left out/)
+    expect(readFileSync(server, 'utf-8')).not.toContain(REPLY)
+    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', reply: 'anchor-missing:inbound meta image_path', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' })
+  })
+
+  it('a file patched before this change gets the reply line on the next run, once', () => {
+    writeFileSync(server, patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply'))
+    expect(readFileSync(server, 'utf-8')).not.toContain(REPLY)
+    const r = run()
+    expect(r.stderr).toMatch(/patched .*\(reply\)/)
+    expect(readFileSync(server, 'utf-8').match(/MARVEEN-PATCH\(426fa59f-reply\)/g)).toHaveLength(1)
+  })
+
+  it('taking it back: deleting the marked line gives the file patched without it, byte for byte', () => {
+    run()
+    const withReply = readFileSync(server, 'utf-8')
+    const deleted = withReply.split('\n').filter(l => !l.includes(REPLY)).join('\n')
+    expect(deleted).toBe(patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply'))
   })
 })

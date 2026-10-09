@@ -217,6 +217,39 @@ emit_inbound_replyto 10000000001 2001 "lezarhato" 1999 | run_hook ledger-capture
 assert_eq "inbound capture: reply_to_message_id recorded" "1999" \
     "$(db_scalar "$DB_A2" "SELECT reply_to_message_id FROM conversation_log")"
 
+# 426fa59f: the Telegram tag now also carries reply_to_text (the quoted message's first 200 characters, a '"' in it
+# turned into "'", '<' '>' into '(' ')'). Still only the id is stored; and an attribute name must START an attribute:
+# a tag without its own message_id must not take reply_to_message_id for it.
+emit_inbound_attrs() { # attrs text [cwd]
+    python3 - "$@" <<'PYEOF'
+import json, sys
+attrs, text = sys.argv[1], sys.argv[2]
+block = f'<channel source="plugin:telegram:telegram" {attrs}>\n{text}\n</channel>'
+payload = {"hook_event_name": "UserPromptSubmit", "prompt": block}
+if len(sys.argv) > 3:
+    payload["cwd"] = sys.argv[3]
+print(json.dumps(payload))
+PYEOF
+}
+DB_A3="$TMPDIR_BASE/a3.db"
+emit_inbound_attrs $'chat_id="10000000001" message_id="2002" user="x" user_id="10000000001" ts="2026-10-09T09:00:00.000Z" reply_to_message_id="1999" reply_to_text="Kerdes: \'A\' vagy (B)? message_id=\'7\'"' "igen" \
+    | run_hook ledger-capture.py "$DB_A3"
+assert_eq "426fa59f: with reply_to_text the message_id is the tag's own" "2002" \
+    "$(db_scalar "$DB_A3" "SELECT message_id FROM conversation_log")"
+assert_eq "426fa59f: with reply_to_text the reply_to_message_id is recorded" "1999" \
+    "$(db_scalar "$DB_A3" "SELECT reply_to_message_id FROM conversation_log")"
+assert_eq "426fa59f: the quoted text is not stored, the row text is the message" "igen" \
+    "$(db_scalar "$DB_A3" "SELECT text FROM conversation_log")"
+DB_A4="$TMPDIR_BASE/a4.db"
+emit_inbound_attrs 'chat_id="10000000001" user="x" ts="2026-10-09T09:00:00.000Z" reply_to_message_id="1999"' "igen" \
+    | run_hook ledger-capture.py "$DB_A4"
+A4_ROWS="$(db_scalar "$DB_A4" "SELECT count(*) FROM conversation_log WHERE message_id = '1999'")"
+if [ "$A4_ROWS" = "NULL" ] || [ "$A4_ROWS" = "0" ]; then
+    pass "426fa59f: a tag without its own message_id does not take reply_to_message_id for it"
+else
+    fail "426fa59f: a tag without its own message_id took reply_to_message_id for it ($A4_ROWS row)"
+fi
+
 # ---------------------------------------------------------------------------
 # (b) OUTBOUND CAPTURE -> conversation_log direction='out'
 # ---------------------------------------------------------------------------

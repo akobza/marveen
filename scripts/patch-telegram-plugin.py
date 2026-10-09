@@ -34,6 +34,8 @@ must not rewrite the user-level cache other Claude Code sessions load
   one patch that fails CLOSED: when its anchors are not all there, a one-line
   fallback (perm-off) takes the plugin's permission capability away, so a
   permission request reaches nobody's chat instead of every allowlisted one;
+- the reply patch (426fa59f) is one marked line in the inbound meta: the
+  replied-to message's id and its first 200 characters, never in the content;
 - with --state FILE, the outcome per file (and per patch) is written there as
   JSON, so /status can say in one line when a patch is missing
   (src/web/system-status.ts) instead of the command silently falling back.
@@ -53,6 +55,7 @@ EVID_MARKER = "// MARVEEN-PATCH(cmd920-evid): inbound evidence for owner write c
 KBD_MARKER = "// MARVEEN-PATCH(c67f5f34-kbd): one-tap answer buttons"
 PERM_MARKER = "// MARVEEN-PATCH(fc8629d7-perm): permission requests only for the approver list"
 PERM_OFF_MARKER = "// MARVEEN-PATCH(fc8629d7-perm-off): permission relay off, the approver patch did not apply"
+REPLY_MARKER = "// MARVEEN-PATCH(426fa59f-reply): the message this one replies to, in the meta only"
 
 # Each anchor is the handler's full block, up to its closing `})` at column 0.
 ANCHORS = [
@@ -84,6 +87,27 @@ EVID_INSERT = (
     "try {{ if (statSync(evidFile).size > 262144) renameSync(evidFile, evidFile + '.1') }} catch {{}}; "
     "writeFileSync(evidFile, JSON.stringify({{ chat_id, message_id: msgId != null ? String(msgId) : null, "
     "text, at: Date.now() }}) + '\\n', {{ flag: 'a', mode: 0o600 }}) }} catch {{}} " + EVID_MARKER + "\n"
+)
+
+# An owner answers with Telegram's reply ("igen", "nem jo") and the inbound meta
+# does not say to WHICH message (426fa59f): the session had to guess from the
+# order. One meta line more, after image_path: the id of the replied-to message
+# (reply_to_message_id, the ledger already stores it,
+# scripts/hooks/ledger-capture.py) and its first 200 characters (reply_to_text:
+# its text or caption, on one line). In that text '"' becomes "'", '<' and '>'
+# become '(' and ')', so the value cannot close the attribute or open a tag in
+# the channel tag, and '=' becomes the fullwidth equals sign (U+FF1D): a text
+# ending in 'attachment_file_id=' would otherwise turn the value's closing quote
+# into the opening quote of a later attribute for a regex reader of the tag.
+# Meta only, like image_path: a "[reply to: ...]" line in the content would be
+# forgeable by any allowlisted sender typing it. No reply, no key.
+REPLY_ANCHOR = ("inbound meta image_path", re.compile(
+    r"^( *)\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),\n", re.MULTILINE))
+REPLY_INSERT = (
+    "{indent}...((r) => (r ? {{ reply_to_message_id: String(r.message_id), "
+    "...((t) => (t ? {{ reply_to_text: t }} : {{}}))(Array.from(String(r.text ?? r.caption ?? '')"
+    ".replace(/\\s+/g, ' ').trim().replace(/[\"<>=]/g, (c) => ({{ '\"': \"'\", '<': '(', '>': ')', '=': '\\uff1d' }})[c]))"
+    ".slice(0, 200).join('')) }} : {{}}))(ctx.message?.reply_to_message), " + REPLY_MARKER + "\n"
 )
 
 # The staff are asked one question at a time, with lettered options (A/B/C),
@@ -157,6 +181,8 @@ PATCHES = [
     {"name": "fwd", "marker": FWD_MARKER, "anchors": [FWD_ANCHOR], "mode": "insert-after",
      "insert": "{indent}...(ctx.message?.forward_origin ? {{ forwarded: '1' }} : {{}}), " + FWD_MARKER + "\n",
      "fallback": "forwarded messages are not marked, a forwarded command runs like a typed one"},
+    {"name": "reply", "marker": REPLY_MARKER, "anchors": [REPLY_ANCHOR], "mode": "insert-after", "insert": REPLY_INSERT,
+     "fallback": "a reply does not say which message it answers: the session guesses from the order"},
     {"name": "evid", "marker": EVID_MARKER, "anchors": [EVID_ANCHOR], "mode": "insert-before",
      "insert": EVID_INSERT,
      "fallback": "no inbound evidence is recorded, owner write commands are refused"},

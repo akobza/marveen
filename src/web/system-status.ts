@@ -247,6 +247,8 @@ export const PLUGIN_PATCH_MARKER = 'MARVEEN-PATCH(elsokor922-d4)'
 const PLUGIN_PATCHES = [
   { name: 'd4', marker: PLUGIN_PATCH_MARKER, label: '', fallback: 'a /status és a /help a plugin saját válasza' },
   { name: 'fwd', marker: 'MARVEEN-PATCH(elsokor922-fwd)', label: ' (továbbítás-jelölő)', fallback: 'egy továbbított parancs úgy fut, mint a begépelt' },
+  // 426fa59f: without it an owner's Telegram reply arrives without saying which message it answers.
+  { name: 'reply', marker: 'MARVEEN-PATCH(426fa59f-reply)', label: ' (válasz-hivatkozás)', fallback: 'egy Telegram-válasznál nem látszik, melyik üzenetre válaszol a küldő' },
   { name: 'evid', marker: 'MARVEEN-PATCH(cmd920-evid)', label: ' (bejövő-napló)', fallback: 'az író parancsok (/model, /context clear, saját parancsok) nem futnak, nincs mihez ellenőrizni őket' },
   { name: 'kbd', marker: 'MARVEEN-PATCH(c67f5f34-kbd)', label: ' (válaszgombok)', fallback: 'a kérdések gomb nélkül mennek ki, a válasz betűvel jön' },
   // fc8629d7: the one patch with a fail-closed fallback; which of the two stands is read from the file itself.
