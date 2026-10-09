@@ -98,6 +98,18 @@ export async function sendOwnerMessage(text: string): Promise<ChannelSendResult>
   return sendToChat(owner.chatId, text)
 }
 
+// Card 68cb6715: what a caller may say about an alert, for its delivery log
+// line (see logAlertDelivery). Never the text, never a chat id.
+export interface AlertMeta {
+  /** The agent the alert is about, when there is one. */
+  agent?: string | null
+  /** Which case raised it, e.g. 'permission-prompt'. */
+  kind: string
+}
+
+type AlertRecipient = 'owner' | 'alert-chat'
+type AlertOutcome = 'sent' | 'partial' | 'failed' | 'skipped'
+
 // True when operational alerts go to a chat other than the owner's. Callers
 // must then leave owner/partner conversation content (e.g. a preview of a
 // parked input line) out of the alert text.
@@ -107,13 +119,13 @@ export function alertIsRedirected(): boolean {
 
 // Operational alert (watchdogs, restarts, stuck sessions). Goes to
 // ALERT_CHAT_ID when it is set, otherwise to the owner chat.
-export async function notifyChannel(text: string): Promise<void> {
+export async function notifyChannel(text: string, meta?: AlertMeta): Promise<void> {
   return deliverWithSlack('alert', text, () => {
     const alertChat = normalizeChatId(ALERT_CHAT_ID)
     // sendToChat reports now, this caller does not care: drop the result so the
     // callback keeps its Promise<void> shape (slack-notify wiring contract).
-    if (alertChat) return sendToChat(alertChat, text).then(() => {})
-    return telegramOwner(text)
+    if (alertChat) return sendToChat(alertChat, text, meta, 'alert-chat').then(() => {})
+    return telegramOwner(text, meta)
   })
 }
 
@@ -151,11 +163,11 @@ function signalOwnerChatMissing(text: string, reason: string): void {
 
 // Owner-facing content (heartbeat digest, security events): always the owner
 // chat, never rerouted by ALERT_CHAT_ID.
-export async function notifyOwner(text: string): Promise<void> {
-  return deliverWithSlack('owner', text, () => telegramOwner(text))
+export async function notifyOwner(text: string, meta?: AlertMeta): Promise<void> {
+  return deliverWithSlack('owner', text, () => telegramOwner(text, meta))
 }
 
-async function telegramOwner(text: string): Promise<void> {
+async function telegramOwner(text: string, meta?: AlertMeta): Promise<void> {
   // CHATID0 -- resolveAlertOwnerChat, not a truthiness test on the raw .env
   // value. The installer writes ALLOWED_CHAT_ID=0 as its placeholder, and "0"
   // is neither empty nor falsy, so a plain truthiness/normalizeChatId-only
@@ -170,6 +182,9 @@ async function telegramOwner(text: string): Promise<void> {
   // and with several entries the alert is not sent (a guess would reach a
   // stranger). The reason is logged, so a skipped alert is visible.
   const owner = resolveAlertOwnerChat(undefined, CHANNEL_CHAT_ID, CHANNEL_PROVIDER)
+  // The skipped send gets its delivery line here, ahead of the branch below,
+  // which stays as it is (card 3ed09d25 extends that branch).
+  if (!CHANNEL_TOKEN || !owner.chatId) logAlertDelivery(meta, 'owner', 'skipped')
   if (!CHANNEL_TOKEN || !owner.chatId) {
     const reason = !CHANNEL_TOKEN ? 'nincs token' : `nincs tulajdonos-chat (${owner.reason})`
     logger.warn(`Channel ertesites kihagyva: ${reason}`)
@@ -178,16 +193,17 @@ async function telegramOwner(text: string): Promise<void> {
     if (CHANNEL_TOKEN) signalOwnerChatMissing(text, owner.reason ?? 'ismeretlen ok')
     return
   }
-  await sendToChat(owner.chatId, text)
+  await sendToChat(owner.chatId, text, meta, 'owner')
 }
 
 // PR1655 review, ask 2: this used to return void and swallow every provider
 // exception, so a caller could not tell a delivered notification from a dead
 // one. It reports now; every existing caller ignores the value, so nothing
 // else changes shape.
-async function sendToChat(chatId: string, text: string): Promise<ChannelSendResult> {
+async function sendToChat(chatId: string, text: string, meta?: AlertMeta, recipient: AlertRecipient = 'owner'): Promise<ChannelSendResult> {
   if (!CHANNEL_TOKEN) {
     logger.warn('Channel ertesites kihagyva: nincs token')
+    logAlertDelivery(meta, recipient, 'skipped')
     return { sent: false, reason: 'no-token' }
   }
 
@@ -221,6 +237,9 @@ async function sendToChat(chatId: string, text: string): Promise<ChannelSendResu
       }
     }
   }
+  const failedChunks = chunks.length - delivered
+  const outcome: AlertOutcome = failedChunks === 0 ? 'sent' : delivered > 0 ? 'partial' : 'failed'
+  logAlertDelivery(meta, recipient, outcome, chunks.length, failedChunks)
   if (delivered === 0) {
     logger.warn({ err: lastError, provider: CHANNEL_PROVIDER }, 'channel send failed on every chunk')
     return { sent: false, reason: 'send-failed' }
@@ -231,6 +250,23 @@ async function sendToChat(chatId: string, text: string): Promise<ChannelSendResu
     return { sent: false, reason: 'partial' }
   }
   return { sent: true }
+}
+
+// Card 68cb6715: every alert send leaves one line -- sent, partly sent, failed
+// or skipped -- so "which alerts did the owner get last night" is measurable
+// afterwards (2026-09-26: about 30 evening alerts reported, none of them in the
+// log). Who and which case come from the caller's meta when it gives one; the
+// recipient is a role, never a chat id, and the text never enters the line.
+function logAlertDelivery(
+  meta: AlertMeta | undefined,
+  recipient: AlertRecipient,
+  outcome: AlertOutcome,
+  chunks = 0,
+  failedChunks = 0,
+): void {
+  const fields = { agent: meta?.agent ?? null, kind: meta?.kind ?? null, recipient, outcome, chunks, failedChunks }
+  if (outcome === 'sent') logger.info(fields, 'alert delivery')
+  else logger.warn(fields, 'alert delivery')
 }
 
 // The plain-text form of a chunk formatForTelegram produced: its own tags
