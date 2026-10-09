@@ -35,7 +35,8 @@ must not rewrite the user-level cache other Claude Code sessions load
   fallback (perm-off) takes the plugin's permission capability away, so a
   permission request reaches nobody's chat instead of every allowlisted one;
 - the reply patch (426fa59f) is one marked line in the inbound meta: the
-  replied-to message's id and its first 200 characters, never in the content;
+  replied-to message's id and, when its author is the bot itself or an
+  allowlisted sender, its first 200 characters, never in the content;
 - with --state FILE, the outcome per file (and per patch) is written there as
   JSON, so /status can say in one line when a patch is missing
   (src/web/system-status.ts) instead of the command silently falling back.
@@ -101,13 +102,24 @@ EVID_INSERT = (
 # into the opening quote of a later attribute for a regex reader of the tag.
 # Meta only, like image_path: a "[reply to: ...]" line in the content would be
 # forgeable by any allowlisted sender typing it. No reply, no key.
+# The text comes only when the replied-to message's author is the bot itself
+# (ctx.me) or a sender on the allowlist (access.allowFrom, the list the gate
+# admits by): in a group, a reply to a member who is not allowlisted would
+# otherwise bring that member's words into the session. Any other author (a
+# group member, an anonymous admin, a channel post) gives the id only. The
+# line reads the handler's `const access = result.access`, so that line is
+# a second anchor (inserting nothing): without it the patch is left out loudly.
+REPLY_ACCESS = ("inbound handler access", re.compile(r"^ *const access = result\.access\n", re.MULTILINE),
+                "insert-after", "")
 REPLY_ANCHOR = ("inbound meta image_path", re.compile(
     r"^( *)\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),\n", re.MULTILINE))
 REPLY_INSERT = (
-    "{indent}...((r) => (r ? {{ reply_to_message_id: String(r.message_id), "
-    "...((t) => (t ? {{ reply_to_text: t }} : {{}}))(Array.from(String(r.text ?? r.caption ?? '')"
+    "{indent}...((r, ok) => (r ? {{ reply_to_message_id: String(r.message_id), "
+    "...(ok ? ((t) => (t ? {{ reply_to_text: t }} : {{}}))(Array.from(String(r.text ?? r.caption ?? '')"
     ".replace(/\\s+/g, ' ').trim().replace(/[\"<>=]/g, (c) => ({{ '\"': \"'\", '<': '(', '>': ')', '=': '\\uff1d' }})[c]))"
-    ".slice(0, 200).join('')) }} : {{}}))(ctx.message?.reply_to_message), " + REPLY_MARKER + "\n"
+    ".slice(0, 200).join('')) : {{}}) }} : {{}}))(ctx.message?.reply_to_message, "
+    "((a, me) => a !== '' && (a === me || access.allowFrom.includes(a)))"
+    "(String(ctx.message?.reply_to_message?.from?.id ?? ''), String(ctx.me?.id ?? ''))), " + REPLY_MARKER + "\n"
 )
 
 # The staff are asked one question at a time, with lettered options (A/B/C),
@@ -181,7 +193,7 @@ PATCHES = [
     {"name": "fwd", "marker": FWD_MARKER, "anchors": [FWD_ANCHOR], "mode": "insert-after",
      "insert": "{indent}...(ctx.message?.forward_origin ? {{ forwarded: '1' }} : {{}}), " + FWD_MARKER + "\n",
      "fallback": "forwarded messages are not marked, a forwarded command runs like a typed one"},
-    {"name": "reply", "marker": REPLY_MARKER, "anchors": [REPLY_ANCHOR], "mode": "insert-after", "insert": REPLY_INSERT,
+    {"name": "reply", "marker": REPLY_MARKER, "anchors": [REPLY_ACCESS, REPLY_ANCHOR], "mode": "insert-after", "insert": REPLY_INSERT,
      "fallback": "a reply does not say which message it answers: the session guesses from the order"},
     {"name": "evid", "marker": EVID_MARKER, "anchors": [EVID_ANCHOR], "mode": "insert-before",
      "insert": EVID_INSERT,

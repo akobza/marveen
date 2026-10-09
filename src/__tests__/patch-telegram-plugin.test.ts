@@ -482,12 +482,21 @@ describe('perm: permission requests only for the approver list (fc8629d7)', () =
 // say to WHICH message, so the session guessed from the order. One marked line after image_path: the replied-to
 // message's id and its first 200 characters, in the meta only (the ledger already stores reply_to_message_id).
 const REPLY = 'MARVEEN-PATCH(426fa59f-reply)'
+// v3: the text only when the replied-to author is the bot itself (ctx.me) or on the allowlist (access.allowFrom,
+// strings, the list the gate admits by); the patched line reads both.
+const BOT_ID = 424242
+const REPLY_ALLOWED = ['111']
 
-// The patched reply line, run as the object member it is in the meta, with a fake ctx.
-function replyMeta(patched: string, message: Record<string, unknown> | undefined): Record<string, string> {
+// The patched reply line, run as the object member it is in the meta, with a fake ctx and access.
+function replyMeta(
+  patched: string,
+  message: Record<string, unknown> | undefined,
+  me: { id: number } | null = { id: BOT_ID },
+  allowFrom: string[] = REPLY_ALLOWED,
+): Record<string, string> {
   const line = patched.split('\n').find(l => l.includes(REPLY))
   expect(line).toBeDefined()
-  return new Function('ctx', `return {\n${line}\n}`)({ message })
+  return new Function('ctx', 'access', `return {\n${line}\n}`)({ message, ...(me ? { me } : {}) }, { allowFrom })
 }
 
 // The fixture patched by the script WITHOUT one patch (the state a file had before that patch).
@@ -520,15 +529,15 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
   it('a reply gives the id as a string and the text on one line, quote-safe; the caption when there is no text', () => {
     run()
     const text = readFileSync(server, 'utf-8')
-    expect(replyMeta(text, { text: 'igen', reply_to_message: { message_id: 4242, text: 'Kérdés: "A" vagy <B>?\nmásodik  sor' } }))
+    expect(replyMeta(text, { text: 'igen', reply_to_message: { message_id: 4242, from: { id: 111 }, text: 'Kérdés: "A" vagy <B>?\nmásodik  sor' } }))
       .toEqual({ reply_to_message_id: '4242', reply_to_text: "Kérdés: 'A' vagy (B)? második sor" })
-    expect(replyMeta(text, { text: 'ok', reply_to_message: { message_id: 7, caption: 'a kép felirata' } }))
+    expect(replyMeta(text, { text: 'ok', reply_to_message: { message_id: 7, from: { id: 111 }, caption: 'a kép felirata' } }))
       .toEqual({ reply_to_message_id: '7', reply_to_text: 'a kép felirata' })
   })
 
   it('the text cannot start an attribute of its own: no "=" survives, so a later attribute reads its own value', () => {
     run()
-    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 10, text: 'lásd ts= és attachment_file_id=' } })
+    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 10, from: { id: 111 }, text: 'lásd ts= és attachment_file_id=' } })
     expect(m.reply_to_text).toBe('lásd ts＝ és attachment_file_id＝')
     const tag = Object.entries({ ...m, attachment_file_id: 'VALODI' }).map(([k, v]) => `${k}="${v}"`).join(' ')
     expect(tag.match(/\battachment_file_id="([^"]+)"/)?.[1]).toBe('VALODI')
@@ -544,9 +553,48 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
 
   it('the text is cut at 200 characters, by code point (an emoji at the edge stays whole)', () => {
     run()
-    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 9, text: 'x'.repeat(199) + '😀' + 'y'.repeat(50) } })
+    const m = replyMeta(readFileSync(server, 'utf-8'), { reply_to_message: { message_id: 9, from: { id: 111 }, text: 'x'.repeat(199) + '😀' + 'y'.repeat(50) } })
     expect(Array.from(m.reply_to_text)).toHaveLength(200)
     expect(m.reply_to_text.endsWith('😀')).toBe(true)
+  })
+
+  it('v3: the text only from the bot itself or an allowlisted sender; any other author gives the id only', () => {
+    run()
+    const text = readFileSync(server, 'utf-8')
+    // an allowlisted sender: access.allowFrom holds strings, from.id is a number
+    expect(replyMeta(text, { reply_to_message: { message_id: 1, from: { id: 111 }, text: 'a tulajdonos kérdése' } }))
+      .toEqual({ reply_to_message_id: '1', reply_to_text: 'a tulajdonos kérdése' })
+    // the bot's own message: the common case, an owner answers the agent's question
+    expect(replyMeta(text, { reply_to_message: { message_id: 2, from: { id: BOT_ID, is_bot: true }, text: 'Mehet a kiadás?' } }))
+      .toEqual({ reply_to_message_id: '2', reply_to_text: 'Mehet a kiadás?' })
+    // negative control: a group member who is not on the allowlist
+    expect(replyMeta(text, { reply_to_message: { message_id: 3, from: { id: 999 }, text: 'idegen szöveg' } }))
+      .toEqual({ reply_to_message_id: '3' })
+    // another bot is not the bot itself
+    expect(replyMeta(text, { reply_to_message: { message_id: 4, from: { id: 555, is_bot: true }, text: 'más bot' } }))
+      .toEqual({ reply_to_message_id: '4' })
+    // no author (an anonymous admin, a channel post)
+    expect(replyMeta(text, { reply_to_message: { message_id: 5, text: 'névtelen' } }))
+      .toEqual({ reply_to_message_id: '5' })
+  })
+
+  it('v3: without ctx.me the bot is not recognized, and an empty author id never matches', () => {
+    run()
+    const text = readFileSync(server, 'utf-8')
+    expect(replyMeta(text, { reply_to_message: { message_id: 6, from: { id: BOT_ID, is_bot: true }, text: 'x' } }, null))
+      .toEqual({ reply_to_message_id: '6' })
+    expect(replyMeta(text, { reply_to_message: { message_id: 7, text: 'y' } }, null, ['']))
+      .toEqual({ reply_to_message_id: '7' })
+  })
+
+  it('v3: the handler access line is a second anchor: without it the reply patch is left out loudly, the others applied', () => {
+    writeFileSync(server, readFileSync(FIXTURE, 'utf-8').replace('const access = result.access', 'const acc = result.access'))
+    const state = join(cache, 'state.json')
+    const r = run(['--state', state])
+    expect(r.status).toBe(0)
+    expect(r.stderr).toMatch(/LOUD: inbound handler access not found exactly once .* the reply patch left out/)
+    expect(readFileSync(server, 'utf-8')).not.toContain(REPLY)
+    expect(readState(state).files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', reply: 'anchor-missing:inbound handler access', evid: 'patched', kbd: 'patched', perm: 'patched', 'perm-off': 'not-needed' })
   })
 
   it('a moved anchor (plugin update): the reply patch left out loudly, the others applied, exit 0', () => {
