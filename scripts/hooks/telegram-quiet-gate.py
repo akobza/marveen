@@ -28,9 +28,11 @@ Decision (card 20e178fc):
     stored for a later send: what the night produces goes out after the window, in
     ONE batched message, by the agent's own batching path.
   - A missing quiet-hours.json is a deployment defect only on an install that has
-    used one: the quiet-hours.seen marker in the install's store directory, written
-    atomically the first time a real send is evaluated against a usable config
-    (never by a probe call, which names no gated tool). Without the marker a missing
+    used one: the quiet-hours.seen marker in the install's store directory, which records
+    the config's path the first time a real send is evaluated against it while usable
+    (never by a probe call, which names no gated tool); the reply guard, the Stop fallback
+    and the watchdog record their own state dirs' configs in the same file, so what
+    counts is that it records THIS path. Without that record a missing
     file means no quiet hours. With it, and for a file that exists but cannot be
     read or an entry that is malformed, every chat is stopped inside the fallback
     windows (the last fully read config's own windows, kept in the install's store

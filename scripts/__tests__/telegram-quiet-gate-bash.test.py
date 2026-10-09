@@ -261,7 +261,8 @@ with open(os.path.join(seen_root, ".env"), "w", encoding="utf-8") as f:
 seen_dir = os.path.join(seen_root, "store")
 os.makedirs(seen_dir)
 seen = os.path.join(seen_dir, "quiet-hours.seen")
-open(seen, "w").close()
+with open(seen, "w", encoding="utf-8") as f:  # the marker records THIS config's path: it was in use and is gone
+    f.write(json.dumps({"config": os.path.join(no_cfg, "quiet-hours.json"), "by": "test"}) + "\n")
 allow, text, err = decide(bash(SEND_888), d=no_cfg, seen=seen)
 check(not allow and "TELEPITESI HIBA" in err and "quiet-hours.json" in err,
       "config missing WITH the marker, at night: any chat held by the fallback window, the defect on stderr")

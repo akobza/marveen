@@ -165,12 +165,21 @@ def decision(d, chat, at, seen=NO_SEEN):
     return q.send_decision(d, chat, at, seen)
 
 
-def marker(zone="Europe/Budapest"):
+def marker(zone="Europe/Budapest", *used):
+    """A marker in a fresh install pinned to zone, recording the config of each state dir in `used`, one line per
+    path as remember_configured() writes it: a missing config is LOST only when the marker records its own path."""
     d = pinned_root("quiet-gate-seen-", zone)
     path = os.path.join(d, "store", "quiet-hours.seen")
     os.makedirs(os.path.dirname(path))
     open(path, "w").close()
+    for sd in used:
+        record(path, sd)
     return path
+
+
+def record(seen, sd):
+    with open(seen, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"config": q.config_path(sd), "by": "test"}) + "\n")
 
 POINTS = [
     ("2026-10-08T20:59:59Z", False, "CEST day 22:59:59"),
@@ -205,13 +214,19 @@ check(not hold and defect is None, "empty config (an install without quiet hours
 for at, when in ((night, "at night"), (day, "by day")):
     hold, why, defect = decision(state(None), PROTECTED, at)
     check(not hold and defect is None, "missing config WITHOUT the marker %s: send, no defect (an install that never had quiet hours)" % when)
-seen = marker()
 d = state(None)
+seen = marker("Europe/Budapest", d)
 hold, why, defect = decision(d, OTHER, night, seen)
 check(hold and defect and "missing" in defect and "quiet-hours.json" in defect and seen in defect,
       "missing config WITH the marker at night: held for ANY chat, the defect names the file and the marker")
 hold, why, defect = decision(d, OTHER, day, seen)
 check(not hold and defect and "missing" in defect, "missing config WITH the marker by day: send, the defect is still reported")
+# The marker is per config PATH (the reply guard, the Stop fallback and the watchdog record their own state dir's
+# config in the same file): a marker that records only another channel's config, or nothing, says nothing about this one.
+for other_seen, what in ((marker("Europe/Budapest", ok_dir), "records only another channel's config"),
+                         (marker(), "records no config")):
+    hold, why, defect = decision(state(None), OTHER, night, other_seen)
+    check(not hold and defect is None, "missing config, the marker %s: send at night, no defect" % what)
 for raw, what in (("", "a 0-byte file"), ("{not json", "a file that is not JSON"), ("[1, 2]", "a file that is not an object")):
     d = state(raw)
     hold, why, defect = decision(d, OTHER, night)
@@ -281,7 +296,9 @@ for raw, what in (("", "a 0-byte config"), ("{not json", "a config that is not J
           "(2) %s on a UTC install with last good windows: 23:30 Budapest held by the kept window, the defect reported" % what)
     check(decision(broken, OTHER, MORNING_BP, utc_seen)[0] is False,
           "(2) %s: 07:30 Budapest (05:30 UTC, inside a UTC 23-07) sent: the kept window, not the install's zone" % what)
-hold, why, defect = decision(state(None), OTHER, NIGHT_BP, utc_seen)
+lost_dir = state(None)
+record(utc_seen, lost_dir)
+hold, why, defect = decision(lost_dir, OTHER, NIGHT_BP, utc_seen)
 check(hold and defect and "missing" in defect, "(2) a config lost after use: the kept window holds 23:30 Budapest")
 bad_entry = state({PROTECTED: {"start": "23:00", "end": "07:60", "tz": "Europe/Budapest"}})
 check(decision(bad_entry, PROTECTED, NIGHT_BP, utc_seen)[0] is True, "(2) a malformed entry: the kept window holds 23:30 Budapest")
@@ -310,6 +327,14 @@ check(decision(state(""), OTHER, z("2026-10-08T22:30:00Z"), utc_seen)[0] is True
       "with two kept windows, a time inside either one holds (22:30 UTC: inside 22:00-06:00 UTC)")
 q.remember_configured(state(two), utc_seen, "unchanged")
 check(json.load(open(q.last_good_path(utc_seen), encoding="utf-8")).get("by") == "changed", "the same windows again do not rewrite the file")
+# A channel's own config, recorded by the reply guard, the Stop fallback or the watchdog (keep_windows=False), is
+# marked as in use but never becomes the fallback of the install's config.
+chan = state({OTHER: {"start": "01:00", "end": "02:00", "tz": "UTC"}})
+before = open(q.last_good_path(utc_seen), encoding="utf-8").read()
+check(q.remember_configured(chan, utc_seen, "telegram-reply-guard", keep_windows=False) is True
+      and open(q.last_good_path(utc_seen), encoding="utf-8").read() == before
+      and os.path.realpath(q.config_path(chan)) in q.seen_configs(utc_seen),
+      "keep_windows=False: the channel's config is recorded in the marker, the kept windows unchanged")
 open(q.last_good_path(nk_seen), "w").write("{broken")
 check("az alapablak" in decision(state(""), OTHER, NIGHT_BP, nk_seen)[1], "a broken kept file: the install's zone default, no crash")
 
@@ -362,7 +387,7 @@ lost = install(None)
 expect_hold = q._window_holds(q.FALLBACK_WINDOW, time.time(), lost)[0]  # no kept windows there: the install's zone
 edge = datetime.datetime.now(ZoneInfo(q.install_zone(lost))).strftime("%H:%M") in ("22:59", "23:00", "06:59", "07:00")
 os.makedirs(os.path.join(lost, "store"))
-open(seen_at(lost), "w").close()
+record(seen_at(lost), os.path.join(lost, ".claude", "channels", "telegram"))
 rc, err = run_gate(lost, call(TOOL + "reply", OTHER))
 check("quiet-hours.json" in err and "missing" in errlog(lost) and "telegram-quiet-gate" in errlog(lost),
       "gate: a config lost after use (the marker is there) leaves the defect on stderr and in the error log")
