@@ -86,7 +86,7 @@ import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInher
 import { readEnvFile } from '../env.js'
 import { loadProfileTemplate, profileWantsThinChiefHandoff } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureProjectRootInClaudeMd, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureThinChiefHandoffSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection } from './agent-scaffold.js'
+import { enforceStrictPermissionMode, writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureProjectRootInClaudeMd, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureThinChiefHandoffSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { recordInjectedPrompt } from './injected-prompt-registry.js'
 import { getSecret } from './vault.js'
@@ -113,6 +113,7 @@ export function delay(ms: number): Promise<void> {
 import { CHANNEL_PLUGIN_IDS } from './plugin-ids.js'
 import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
 import { exactTmuxTarget, sessionOfTmuxTarget } from '../tmux-target.js'
+import { expandAndValidateConfigDir } from '../config-dir-path.js'
 export { CHANNEL_PLUGIN_IDS }
 
 // Pure: compute the enabledPlugins map for a sub-agent so that exactly its own
@@ -517,12 +518,21 @@ export function ensureMainAgentIsolatedConfigDir(
   return provisionMainIsolatedConfigDir(provider)
 }
 
+// The generic isolated CLAUDE_CONFIG_DIR of the main agent: the plain isolated
+// setup and every token-mode plan share it. The path only -- nothing is
+// provisioned here (provisionMainIsolatedConfigDir does that), so a read-only
+// caller can ask where the main agent's transcripts live (8c338dc4: the
+// rotation's continue check).
+export function mainAgentSharedConfigDir(): string {
+  return join(PROJECT_ROOT, '.channels-config')
+}
+
 // Shared provisioning call for the generic isolated dir, factored out so the
 // fleet-token-gated path (above) and the token-mode-rotation path (below)
 // cannot drift on what they actually provision.
 function provisionMainIsolatedConfigDir(provider?: string): string | null {
   return provisionIsolatedConfigDir(
-    join(PROJECT_ROOT, '.channels-config'),
+    mainAgentSharedConfigDir(),
     PROJECT_ROOT,
     getProviderType(provider),
     MAIN_AGENT_ID,
@@ -616,7 +626,21 @@ export function readExtraChannelPluginIds(): string[] {
 export type MainSharedConfigTrigger =
   /** A fleet setup-token exists but the resolution came back empty: the setting
    *  is missing, not declined. Shape of issue #835; the isolation-lost trigger
-   *  is structurally blind to it because there is no .channels-config dir yet. */
+   *  is structurally blind to it because there is no .channels-config dir yet.
+   *
+   *  NARROWED (issue #1805): only when this launch does NOT export the token.
+   *  Both launch paths export CLAUDE_CODE_OAUTH_TOKEN whenever the token file
+   *  is non-empty (scripts/channels.sh at the top; the shared-root branch of
+   *  buildMainSessionRespawnCmd), and Claude Code's documented precedence puts
+   *  that env token (rank 5) above the /login session (rank 7):
+   *  https://code.claude.com/docs/en/authentication#authentication-precedence.
+   *  Measured 2026-10-09 on 2.1.294, isolated temp CLAUDE_CONFIG_DIR: an EXPIRED
+   *  .credentials.json next to a valid env token -> rc 0, the file untouched;
+   *  the same file without the token -> "OAuth session expired". So an exported
+   *  token is what authenticates and there is nothing to expire or 401. The
+   *  old notice claimed the opposite and asked for a restart that costs the
+   *  running conversation: 23 such false notices were measured on one healthy
+   *  host (#1805). */
   | 'fleet-token-unused'
   /** This install HAS run isolated (its .channels-config is still on disk), yet
    *  this launch resolved to the shared root -- so the setting was LOST, e.g.
@@ -631,6 +655,11 @@ export function mainSharedConfigTrigger(state: {
   fleetToken: boolean
   /** PROJECT_ROOT/.channels-config exists on disk. */
   isolatedDirExists: boolean
+  /** This launch exports the fleet token as CLAUDE_CODE_OAUTH_TOKEN. REQUIRED on
+   *  purpose (issue #1805, the reporter's point): a defaulted fact is how a
+   *  caller picks a verdict it never measured, and this trigger's history is a
+   *  verdict asserted without its evidence. */
+  fleetTokenExported: boolean
 }): MainSharedConfigTrigger {
   // Running isolated -- the whole point of the guard is already satisfied.
   if (state.isolatedConfigDir) return null
@@ -639,22 +668,33 @@ export function mainSharedConfigTrigger(state: {
   // could apply. Swapping these would report a LOST setting as a fresh install
   // and send the operator to the wrong fix.
   if (state.isolatedDirExists) return 'isolation-lost'
-  if (state.fleetToken) return 'fleet-token-unused'
+  // An exported fleet token outranks the /login session (see the type's note), so
+  // a shared root that exports it authenticates from the token and is healthy.
+  // Only a launch that holds the token but does NOT export it is left exposed.
+  if (state.fleetToken && !state.fleetTokenExported) return 'fleet-token-unused'
   return null
 }
 
-/** Reads the three facts mainSharedConfigTrigger decides on. Separate from the
+/** Reads the four facts mainSharedConfigTrigger decides on. Separate from the
  *  decision so the decision needs no filesystem, and separate from the emitter
  *  so the emitter can be swapped in a test. */
 export function readMainSharedConfigState(isolatedConfigDir: string | null): {
   isolatedConfigDir: string | null
   fleetToken: boolean
   isolatedDirExists: boolean
+  fleetTokenExported: boolean
 } {
+  const fleetToken = hasFleetOauthToken()
   return {
     isolatedConfigDir,
-    fleetToken: hasFleetOauthToken(),
+    fleetToken,
     isolatedDirExists: existsSync(join(PROJECT_ROOT, '.channels-config')),
+    // Both main launch paths export the token exactly when the file is non-empty:
+    // scripts/channels.sh (from .env, else store/.claude-oauth-token) and the
+    // shared-root branch of buildMainSessionRespawnCmd (opts.config.fleetToken).
+    // Pinned by main-shared-config-guard.test.ts, so a launcher that stops
+    // exporting it turns this fact false in a test before it does on a host.
+    fleetTokenExported: fleetToken,
   }
 }
 
@@ -676,7 +716,13 @@ export function resolveMainAgentConfigDir(): string | null {
   let raw = ''
   try { raw = String(getEffectiveSettingValue('MAIN_AGENT_CONFIG_DIR') ?? '').trim() } catch { return null }
   if (!raw) return null
-  const dir = raw.startsWith('~') ? join(homedir(), raw.slice(1)) : raw
+  // SECSZIVEK1007: a value from .env or the systemd environment never met the
+  // settings write check; the read applies the same path rules.
+  const dir = expandAndValidateConfigDir(raw, homedir())
+  if (!dir) {
+    logger.warn('main-agent config dir: MAIN_AGENT_CONFIG_DIR is not a valid config dir path, keeping the shared ~/.claude')
+    return null
+  }
   if (!existsSync(dir)) {
     logger.warn({ dir }, 'main-agent config dir: MAIN_AGENT_CONFIG_DIR does not exist, keeping the shared ~/.claude')
     return null
@@ -1026,6 +1072,17 @@ function provisionIsolatedConfigDir(
         // Deliberately loud: rewriting an unparseable own-settings file from
         // the shared one is exactly the silent-loss shape this block fixes.
         logger.warn({ err, name, path: ownSettingsPath }, 'isolated-config: unparseable own settings.json, rewriting from shared')
+      }
+    }
+    // #1837: the shared copy can carry the operator's permissions.defaultMode
+    // (bypassPermissions is a common operator setting), which would make a
+    // strict profile's allow-list inert. Pinned AFTER the own-settings merge so
+    // nothing above can bring the bypass back. The main agent has no profile.
+    if (name !== MAIN_AGENT_ID) {
+      let permissionMode: string | undefined
+      try { permissionMode = loadProfileTemplate(resolveAgentSecurityProfile(name))?.permissionMode } catch { permissionMode = undefined }
+      if (enforceStrictPermissionMode(settings, permissionMode)) {
+        logger.info({ name }, 'isolated-config: strict profile, permissions.defaultMode pinned to dontAsk (#1837)')
       }
     }
     // Atomic: the file's CONTENT now depends on reading its own previous
