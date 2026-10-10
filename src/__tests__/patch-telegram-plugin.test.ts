@@ -504,16 +504,16 @@ function replyMeta(
   return new Function('ctx', 'access', `return {\n${line}\n}`)({ message, ...(me ? { me } : {}) }, { allowFrom })
 }
 
-// The fixture patched by the script WITHOUT one patch (the state a file had before that patch).
-function patchedWithout(text: string, name: string): string {
+// The fixture patched by the script WITHOUT the named patches (the state a file had before them).
+function patchedWithout(text: string, ...names: string[]): string {
   const code = [
     'import importlib.util, sys',
     "spec = importlib.util.spec_from_file_location('ptp', sys.argv[1])",
     'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
-    'm.PATCHES = [p for p in m.PATCHES if p["name"] != sys.argv[2]]',
+    'm.PATCHES = [p for p in m.PATCHES if p["name"] not in sys.argv[2:]]',
     'sys.stdout.write(m.patch_text(sys.stdin.read())[0])',
   ].join('\n')
-  const r = spawnSync('python3', ['-c', code, SCRIPT, name], { input: text, encoding: 'utf-8' })
+  const r = spawnSync('python3', ['-c', code, SCRIPT, ...names], { input: text, encoding: 'utf-8' })
   expect(r.status).toBe(0)
   return r.stdout
 }
@@ -679,5 +679,25 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
     expect(r.stderr).toMatch(/LOUD: inbound meta image_path not found exactly once .* the reply patch left out/)
     expect(readFileSync(server, 'utf-8')).toBe(moved)
     expect(readState(state).files[0].patches.reply).toBe('anchor-missing:inbound meta image_path')
+  })
+
+  it('all or nothing in a run that writes: another patch goes in, the reply patch adds and removes nothing, the v2 line stays', () => {
+    // evid is left out as well, so this run writes the file; the test above writes nothing and cannot see what the reply
+    // patch would have put into a written file (the v2 line removed without the v3 line)
+    const v2 = afterImagePath(patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply', 'evid'), V2_LINE)
+    const moved = v2.replace('...(imagePath ? { image_path: imagePath } : {}),', '...(imagePath ? { image_path: String(imagePath) } : {}),')
+    expect(moved).not.toBe(v2)
+    writeFileSync(server, moved)
+    const state = join(cache, 'state.json')
+    const r = run(['--state', state])
+    expect(r.status).toBe(0)
+    expect(r.stderr).toMatch(/LOUD: inbound meta image_path not found exactly once .* the reply patch left out/)
+    const text = readFileSync(server, 'utf-8')
+    expect(text).toBe(patchedWithout(moved, 'reply'))
+    expect(text).not.toBe(moved)
+    expect(text.split('\n').filter(l => l.includes(REPLY_V2))).toEqual([V2_LINE])
+    expect(text).not.toContain(REPLY)
+    expect(readState(state).files[0].patches.reply).toBe('anchor-missing:inbound meta image_path')
+    expect(readState(state).files[0].patches.evid).toBe('patched')
   })
 })
