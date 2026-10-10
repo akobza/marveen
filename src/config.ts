@@ -357,6 +357,14 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 // the other cannot be correct for both deployment shapes, so it is its own key.
 // Empty preserves the previous behaviour exactly (public URL, else localhost).
 export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
+// LIVETREEGIT1010: a production git work tree the fleet works on and the unix
+// user that owns it. With BOTH set, every agent CLAUDE.md gets a generated rule
+// (ensureLiveTreeGitSection in web/agent-scaffold.ts): every git command on that
+// tree, `git status` and `git diff` included, runs as the owner. Empty by
+// default -- distribution-safe, no install's path or user is baked in -- and
+// either one missing means no block.
+export const LIVE_GIT_TREE_PATH = (cfg('LIVE_GIT_TREE_PATH') ?? '').trim()
+export const LIVE_GIT_TREE_OWNER = (cfg('LIVE_GIT_TREE_OWNER') ?? '').trim()
 
 // FLEETVENV923: the fleet's shared Python virtualenv. When `<dir>/bin` exists it
 // is prepended to every agent launch PATH (sub-agents via startAgentProcess,

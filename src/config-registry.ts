@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
 import { expandAndValidateConfigDir } from './config-dir-path.js'
+import { liveGitTreePathError, liveGitTreeOwnerError } from './live-git-tree.js'
 // Single source of truth for settings the dashboard's "Beallitasok" page can
 // show and edit. Each entry describes one .env-backed config key: its type
 // (drives the input widget + validation), default, human description, the
@@ -311,6 +312,26 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+  },
+  {
+    key: 'LIVE_GIT_TREE_PATH',
+    type: 'string',
+    default: '',
+    description: 'Egy éles (deploy) git-munkafa abszolút útja, amelyet egy saját Unix-felhasználó birtokol (LIVE_GIT_TREE_OWNER). Ha mindkettő be van állítva, minden ügynök CLAUDE.md-je generált szabályt kap: azon a fán minden git, a sima status és a diff is, csak a tulajdonosként fut. Üres = nincs ilyen szabály. Az ügynökök következő indulásakor lép életbe.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+    validate: (v) => (v.trim() === '' ? null : liveGitTreePathError(v.trim())),
+  },
+  {
+    key: 'LIVE_GIT_TREE_OWNER',
+    type: 'string',
+    default: '',
+    description: 'A LIVE_GIT_TREE_PATH fa tulajdonosa (Unix-felhasználónév). A generált szabály ezzel futtatja a gitet: runuser -u <tulajdonos> -- git -C <fa> ... Üres = nincs ilyen szabály.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+    validate: (v) => (v.trim() === '' ? null : liveGitTreeOwnerError(v.trim())),
   },
   {
     key: 'FLEET_PYTHON_VENV',
