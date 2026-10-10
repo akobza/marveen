@@ -481,7 +481,11 @@ describe('perm: permission requests only for the approver list (fc8629d7)', () =
 // 426fa59f: an owner answers with Telegram's reply ("igen", "nem jó"), and the inbound meta did not
 // say to WHICH message, so the session guessed from the order. One marked line after image_path: the replied-to
 // message's id and its first 200 characters, in the meta only (the ledger already stores reply_to_message_id).
-const REPLY = 'MARVEEN-PATCH(426fa59f-reply)'
+const REPLY = 'MARVEEN-PATCH(426fa59f-reply-v3)'
+// The earlier marker (the v2 line, and the first v3 build), superseded: a line with it is removed (review finding D10).
+const REPLY_V2 = 'MARVEEN-PATCH(426fa59f-reply)'
+// The v2 line as the v2 patcher wrote it on this fixture, byte for byte.
+const V2_LINE = readFileSync(join(__dirname, 'fixtures', 'telegram-plugin-0.0.7', 'reply-v2-line.txt'), 'utf-8').replace(/\n$/, '')
 // v3: the text only when the replied-to author is the bot itself (ctx.me) or on the allowlist (access.allowFrom,
 // strings, the list the gate admits by); the patched line reads both.
 const BOT_ID = 424242
@@ -493,8 +497,9 @@ function replyMeta(
   message: Record<string, unknown> | undefined,
   me: { id: number } | null = { id: BOT_ID },
   allowFrom: string[] = REPLY_ALLOWED,
+  marker: string = REPLY,
 ): Record<string, string> {
-  const line = patched.split('\n').find(l => l.includes(REPLY))
+  const line = patched.split('\n').find(l => l.includes(marker))
   expect(line).toBeDefined()
   return new Function('ctx', 'access', `return {\n${line}\n}`)({ message, ...(me ? { me } : {}) }, { allowFrom })
 }
@@ -517,7 +522,8 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
   it('one marked line right after image_path, in the meta; the content stays the text; the file still parses', () => {
     run()
     const text = readFileSync(server, 'utf-8')
-    expect(text.match(/MARVEEN-PATCH\(426fa59f-reply\)/g)).toHaveLength(1)
+    expect(text.match(/MARVEEN-PATCH\(426fa59f-reply-v3\)/g)).toHaveLength(1)
+    expect(text).not.toContain(REPLY_V2)
     const lines = text.split('\n')
     const i = lines.findIndex(l => l.includes(REPLY))
     expect(lines[i - 1]).toMatch(/^ *\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),$/)
@@ -612,7 +618,7 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
     expect(readFileSync(server, 'utf-8')).not.toContain(REPLY)
     const r = run()
     expect(r.stderr).toMatch(/patched .*\(reply\)/)
-    expect(readFileSync(server, 'utf-8').match(/MARVEEN-PATCH\(426fa59f-reply\)/g)).toHaveLength(1)
+    expect(readFileSync(server, 'utf-8').match(/MARVEEN-PATCH\(426fa59f-reply-v3\)/g)).toHaveLength(1)
   })
 
   it('taking it back: deleting the marked line gives the file patched without it, byte for byte', () => {
@@ -620,5 +626,58 @@ describe('reply: the replied-to message in the inbound meta (426fa59f)', () => {
     const withReply = readFileSync(server, 'utf-8')
     const deleted = withReply.split('\n').filter(l => !l.includes(REPLY)).join('\n')
     expect(deleted).toBe(patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply'))
+  })
+
+  // Review finding D10: the v2 line carried the marker the first v3 build kept, so on a file the v2 had patched the
+  // v3 said "already" and the v2 line stayed, which gives the text of ANY replied-to author. The v3 marker is its own now,
+  // the earlier one superseded: its line goes before the v3 line goes in.
+  const afterImagePath = (text: string, line: string) =>
+    text.replace(/^( *\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),\n)/m, (m: string) => `${m}${line}\n`)
+  const fresh = () => patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'none')
+
+  it('D10: a file the v2 patched becomes v3 on the next run: the v2 line gone, byte for byte the fresh patch; then already', () => {
+    const v2 = afterImagePath(patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply'), V2_LINE)
+    expect(v2.split('\n').filter(l => l.includes(REPLY_V2))).toEqual([V2_LINE])
+    // why it matters: the v2 line gives the text of a group member who is not allowlisted
+    expect(replyMeta(v2, { reply_to_message: { message_id: 3, from: { id: 999 }, text: 'idegen szöveg' } }, undefined, undefined, REPLY_V2))
+      .toEqual({ reply_to_message_id: '3', reply_to_text: 'idegen szöveg' })
+    writeFileSync(server, v2)
+    const state = join(cache, 'state.json')
+    expect(run(['--state', state]).stderr).toMatch(/patched .*\(reply\)/)
+    const text = readFileSync(server, 'utf-8')
+    expect(text).not.toContain(REPLY_V2)
+    expect(text).toBe(fresh())
+    expect(replyMeta(text, { reply_to_message: { message_id: 3, from: { id: 999 }, text: 'idegen szöveg' } })).toEqual({ reply_to_message_id: '3' })
+    expect(readState(state).files[0].patches.reply).toBe('patched')
+    run(['--state', state])
+    expect(readFileSync(server, 'utf-8')).toBe(text)
+    expect(readState(state).files[0].patches.reply).toBe('already')
+  })
+
+  it('the first v3 build (the earlier marker on the v3 code) gets the v3 marker: the same code, byte for byte the fresh patch', () => {
+    const old = fresh().replace(REPLY, REPLY_V2)
+    expect(old).not.toContain(REPLY)
+    writeFileSync(server, old)
+    run()
+    expect(readFileSync(server, 'utf-8')).toBe(fresh())
+  })
+
+  it('an older patcher run after this one puts the v2 line back next to the v3 line: the next run removes it', () => {
+    writeFileSync(server, afterImagePath(fresh(), V2_LINE))
+    expect(readFileSync(server, 'utf-8')).toContain(REPLY)
+    expect(run().stderr).toMatch(/patched .*\(reply\)/)
+    expect(readFileSync(server, 'utf-8')).toBe(fresh())
+  })
+
+  it('all or nothing: a v2 file whose anchor moved keeps its v2 line, and the reply patch is left out loudly', () => {
+    const v2 = afterImagePath(patchedWithout(readFileSync(FIXTURE, 'utf-8'), 'reply'), V2_LINE)
+    const moved = v2.replace('...(imagePath ? { image_path: imagePath } : {}),', '...(imagePath ? { image_path: String(imagePath) } : {}),')
+    writeFileSync(server, moved)
+    const state = join(cache, 'state.json')
+    const r = run(['--state', state])
+    expect(r.status).toBe(0)
+    expect(r.stderr).toMatch(/LOUD: inbound meta image_path not found exactly once .* the reply patch left out/)
+    expect(readFileSync(server, 'utf-8')).toBe(moved)
+    expect(readState(state).files[0].patches.reply).toBe('anchor-missing:inbound meta image_path')
   })
 })

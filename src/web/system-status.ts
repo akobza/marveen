@@ -247,8 +247,10 @@ export const PLUGIN_PATCH_MARKER = 'MARVEEN-PATCH(elsokor922-d4)'
 const PLUGIN_PATCHES = [
   { name: 'd4', marker: PLUGIN_PATCH_MARKER, label: '', fallback: 'a /status és a /help a plugin saját válasza' },
   { name: 'fwd', marker: 'MARVEEN-PATCH(elsokor922-fwd)', label: ' (továbbítás-jelölő)', fallback: 'egy továbbított parancs úgy fut, mint a begépelt' },
-  // 426fa59f: without it an owner's Telegram reply arrives without saying which message it answers.
-  { name: 'reply', marker: 'MARVEEN-PATCH(426fa59f-reply)', label: ' (válasz-hivatkozás)', fallback: 'egy Telegram-válasznál nem látszik, melyik üzenetre válaszol a küldő' },
+  // 426fa59f: without it an owner's Telegram reply arrives without saying which message it answers. The earlier marker
+  // (the v2 line, which gave the text of any replied-to author, and the first v3 build) is not "missing": the patcher
+  // replaces its line at the next channel start (D10), so it is a line of its own.
+  { name: 'reply', marker: 'MARVEEN-PATCH(426fa59f-reply-v3)', label: ' (válasz-hivatkozás)', fallback: 'egy Telegram-válasznál nem látszik, melyik üzenetre válaszol a küldő', oldMarker: 'MARVEEN-PATCH(426fa59f-reply)', oldNote: 'a régi reply-sor áll (a v2 vagy az első v3), a következő csatorna-indítás cseréli' },
   { name: 'evid', marker: 'MARVEEN-PATCH(cmd920-evid)', label: ' (bejövő-napló)', fallback: 'az író parancsok (/model, /context clear, saját parancsok) nem futnak, nincs mihez ellenőrizni őket' },
   { name: 'kbd', marker: 'MARVEEN-PATCH(c67f5f34-kbd)', label: ' (válaszgombok)', fallback: 'a kérdések gomb nélkül mennek ki, a válasz betűvel jön' },
   // fc8629d7: the one patch with a fail-closed fallback; which of the two stands is read from the file itself.
@@ -270,7 +272,9 @@ export function telegramPluginPatchStatus(stateFile = join(STORE_DIR, 'telegram-
   for (const p of PLUGIN_PATCHES) {
     const missing: string[] = []
     const missingVersions: string[] = []
+    const stale: string[] = []
     for (const v of versions) {
+      if (p.oldMarker !== undefined && texts.get(v)!.includes(p.oldMarker)) { stale.push(v); continue }
       if (texts.get(v)!.includes(p.marker)) continue
       const file = state.files?.find(f => f.version === v)
       const recorded = file ? (file.patches?.[p.name] ?? file.status) : undefined
@@ -283,6 +287,7 @@ export function telegramPluginPatchStatus(stateFile = join(STORE_DIR, 'telegram-
     // A fail-closed fallback counts only when it stands in EVERY version that misses the patch.
     const closed = p.closedMarker !== undefined && missingVersions.every(v => texts.get(v)!.includes(p.closedMarker!))
     if (missing.length) lines.push(`HIÁNYZIK${p.label}: ${missing.join(', ')} · ${closed ? p.closedFallback : p.fallback}`)
+    if (stale.length) lines.push(`RÉGI${p.label}: ${stale.join(', ')} · ${p.oldNote}`)
   }
   if (lines.length === 0) return `rendben (${versions.join(', ')})`
   return lines.join('; ')

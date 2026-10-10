@@ -20,7 +20,8 @@ when the variable is unset). Never both: an install with its own config dir
 must not rewrite the user-level cache other Claude Code sessions load
 (maintainer review on #1529, 2026-09-25).
 
-- idempotent: a file carrying the marker is left alone;
+- idempotent: a file carrying the marker is left alone (a patch that superseded
+  an earlier marker also removes that marker's line, see the reply patch);
 - all-or-nothing per patch: if ANY anchor of a patch is missing (a plugin
   update changed the code), that patch is left out and one loud line says so
   -- /status and /help then fall back to the plugin's own answers, or a
@@ -36,7 +37,12 @@ must not rewrite the user-level cache other Claude Code sessions load
   permission request reaches nobody's chat instead of every allowlisted one;
 - the reply patch (426fa59f) is one marked line in the inbound meta: the
   replied-to message's id and, when its author is the bot itself or an
-  allowlisted sender, its first 200 characters, never in the content;
+  allowlisted sender, its first 200 characters, never in the content. Its
+  marker says v3: the earlier marker (the v2 line, which gave the text of ANY
+  replied-to author, and the first v3 build) is superseded, and a line
+  carrying it is removed before the v3 line goes in, so a file the v2 patched
+  becomes v3 on the next run instead of saying "already" (review finding
+  D10); if an anchor is missing the file is left as it was (all or nothing);
 - with --state FILE, the outcome per file (and per patch) is written there as
   JSON, so /status can say in one line when a patch is missing
   (src/web/system-status.ts) instead of the command silently falling back.
@@ -56,7 +62,9 @@ EVID_MARKER = "// MARVEEN-PATCH(cmd920-evid): inbound evidence for owner write c
 KBD_MARKER = "// MARVEEN-PATCH(c67f5f34-kbd): one-tap answer buttons"
 PERM_MARKER = "// MARVEEN-PATCH(fc8629d7-perm): permission requests only for the approver list"
 PERM_OFF_MARKER = "// MARVEEN-PATCH(fc8629d7-perm-off): permission relay off, the approver patch did not apply"
-REPLY_MARKER = "// MARVEEN-PATCH(426fa59f-reply): the message this one replies to, in the meta only"
+REPLY_MARKER = "// MARVEEN-PATCH(426fa59f-reply-v3): the message this one replies to, in the meta only"
+# The earlier reply marker (the v2 line, and the first v3 build carried it too): superseded, its line is removed.
+REPLY_MARKER_V2 = "// MARVEEN-PATCH(426fa59f-reply): the message this one replies to, in the meta only"
 
 # Each anchor is the handler's full block, up to its closing `})` at column 0.
 ANCHORS = [
@@ -193,7 +201,8 @@ PATCHES = [
     {"name": "fwd", "marker": FWD_MARKER, "anchors": [FWD_ANCHOR], "mode": "insert-after",
      "insert": "{indent}...(ctx.message?.forward_origin ? {{ forwarded: '1' }} : {{}}), " + FWD_MARKER + "\n",
      "fallback": "forwarded messages are not marked, a forwarded command runs like a typed one"},
-    {"name": "reply", "marker": REPLY_MARKER, "anchors": [REPLY_ACCESS, REPLY_ANCHOR], "mode": "insert-after", "insert": REPLY_INSERT,
+    {"name": "reply", "marker": REPLY_MARKER, "supersedes": [REPLY_MARKER_V2], "anchors": [REPLY_ACCESS, REPLY_ANCHOR],
+     "mode": "insert-after", "insert": REPLY_INSERT,
      "fallback": "a reply does not say which message it answers: the session guesses from the order"},
     {"name": "evid", "marker": EVID_MARKER, "anchors": [EVID_ANCHOR], "mode": "insert-before",
      "insert": EVID_INSERT,
@@ -214,10 +223,17 @@ def log(msg):
 
 
 def apply_patch(text, patch):
-    """Returns (new_text, status). status: 'patched' | 'already' | 'anchor-missing:<name>'."""
-    if patch["marker"] in text:
+    """Returns (new_text, status). status: 'patched' | 'already' | 'anchor-missing:<name>'.
+    A "supersedes" marker's whole line is removed first (also when the patch's own line is already there: an older
+    patcher run after a newer one puts the old line back); an anchor missing returns the text as it was."""
+    stale = [old for old in patch.get("supersedes", ()) if old in text]
+    if patch["marker"] in text and not stale:
         return text, "already"
     out = text
+    for old in stale:
+        out = re.sub(r"^[^\n]*" + re.escape(old) + r"[^\n]*(?:\n|\Z)", "", out, flags=re.MULTILINE)
+    if patch["marker"] in out:
+        return out, "patched"
     for anchor in patch["anchors"]:
         name, rx = anchor[0], anchor[1]
         mode = anchor[2] if len(anchor) > 2 else patch["mode"]
