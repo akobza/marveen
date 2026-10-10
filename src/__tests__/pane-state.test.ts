@@ -548,6 +548,43 @@ describe('detectPaneState', () => {
     expect(detectPaneState(quotedAbove)).toBe('unknown')
   })
 
+  // FEEDBACKDRAFT1001: a session holding a self-drafted feedback report adds the feedback-draft counter after the
+  // counters, and the counter stays after the draft modal closes. Captured live from fleet panes (tmux capture-pane,
+  // the last non-empty line): the first form on 2026-10-01, the next two on 2026-10-10. The alone and the plural
+  // forms are not captured; they follow the shape.
+  it('reads the feedback-draft counter in the bare footer as idle', () => {
+    for (const tail of [
+      '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · 1 feedback draft',
+      '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback draft',
+      '  ⏵⏵ bypass permissions on · 6 shells · 1 feedback draft',
+      '  ⏵⏵ bypass permissions on · 1 feedback draft',
+      '  ⏵⏵ bypass permissions on · 2 shells · 2 feedback drafts',
+    ]) {
+      expect(detectPaneState(modeFooter(tail)), tail).toBe('idle')
+      expect(isReadyForPrompt(modeFooter(tail)), tail).toBe(true)
+    }
+  })
+
+  it('keeps the bare footer rules for the feedback-draft counter', () => {
+    for (const tail of [
+      '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback draft pending', // more text after it on the line
+      '  ⏵⏵ bypass permissions on · tasks · 1 feedback draft', // not directly after the mode
+    ]) {
+      expect(detectPaneState(modeFooter(tail)), tail).toBe('unknown')
+    }
+    // A counter cut on a narrow pane is the tmux-clipped footer of #1743, which reads idle on the last line.
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 shell · 1 feedback d…'))).toBe('idle')
+  })
+
+  // BARECOUNTER0930 (a review case): a RAW bare footer line in the visible pane -- the output of
+  // `tmux capture-pane ... | tail -1` in a Bash tool result -- must not be taken for the footer.
+  it('keeps a parked input typing under a raw bare footer line in tool output', () => {
+    const raw = ['● Bash(tmux capture-pane -p -t x | awk NF | tail -1)', '  ⎿  ' + BARE_ONE_SHELL_FOOTER.trim(), ''].join('\n')
+    const typing = ['', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP, BARE_ONE_SHELL_FOOTER].join('\n')
+    expect(detectPaneState(raw + '\n' + typing)).toBe('typing')
+    expect(isReadyForPrompt(raw + '\n' + typing)).toBe(false)
+  })
+
   // LIVEFOOTERBOX0930: the live footer is the LAST footer line, with the input box right above it.
   it('keeps a parked input typing under a raw old-form footer line in tool output', () => {
     const typing = ['', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')

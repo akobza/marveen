@@ -105,7 +105,13 @@ const FOOTER_TRUNCATED_RX = /(?:[A-Za-z][\w-]* ){1,3}on · [^\n]*·[^\n]*…\s*$
 // MONITORTAIL1010: the live footer joins the monitor count to the shells with a comma and shows
 // it alone when no shell runs (`· 1 shell, 1 monitor`, `· 1 monitor`; captured
 // from fleet panes on 2026-09-30 and 2026-10-10): both forms count as well.
-const FOOTER_SHELL_TAIL_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · (?:\d+ shells?(?:(?:,| ·) \d+ monitors?)?|\d+ monitors?)\s*$/
+// FEEDBACKDRAFT1001: a session holding a self-drafted feedback report adds
+// ` · N feedback draft(s)` after the counts (`· 1 shell, 1 monitor · 1 feedback
+// draft` captured on 2026-10-01, `· 6 shells · 1 feedback draft` on 2026-10-10),
+// and the counter stays after the draft modal closes; it is accepted after the
+// counts or alone, still as the whole rest of the last line. The modal itself is
+// not idle: detectPaneState checks detectsFeedbackDraftModal after the footer.
+const FOOTER_SHELL_TAIL_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · (?:(?:\d+ shells?(?:(?:,| ·) \d+ monitors?)?|\d+ monitors?)(?: · \d+ feedback drafts?)?|\d+ feedback drafts?)\s*$/
 
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
@@ -1106,9 +1112,13 @@ export function detectsModelConsentDialog(pane: string): boolean {
 //   │ 1 to review · 2 to send · 0 to dismiss       │
 //   ╰──────────────────────────────────────────────╯
 // Unlike the resume/consent modals this one leaves the NORMAL IDLE FOOTER on
-// screen ("bypass permissions on … · 1 feedback draft"), so detectPaneState
-// still reads the pane as idle and delivery keeps "succeeding" into a pane
-// that swallows the keystrokes. IDLE_FOOTER_RX is therefore NOT usable as a
+// screen ("bypass permissions on … · 1 feedback draft"), so the footer alone
+// reads idle: on 2026-08-31 delivery kept "succeeding" into a pane that
+// swallowed the keystrokes. Since FEEDBACKDRAFT1001 detectPaneState checks this
+// detector after the footer and reads the pane 'unknown' while the modal is
+// up, so every injector takes its not-ready path, where
+// clearFeedbackModalAndRecheck dismisses the modal and asks again; the counter
+// left in the footer after that reads idle. IDLE_FOOTER_RX is NOT usable as a
 // negative guard here, and quote-proofing has to come from somewhere else:
 // the option line must sit INSIDE the modal's box border. A message that
 // merely quotes "1 to review · 2 to send · 0 to dismiss" renders in the
@@ -1277,6 +1287,10 @@ export function detectPaneState(
     }
     return 'unknown'
   }
+
+  // The feedback-draft modal keeps the idle footer on screen (FEEDBACKDRAFT1001):
+  // not ready, so the injectors take the not-ready path that dismisses it.
+  if (detectsFeedbackDraftModal(pane)) return 'unknown'
 
   if (detectsThinkingBlockError(pane)) return 'error'
 
