@@ -2730,3 +2730,39 @@ describe('idle footer that ends in a background-shell count (VAGTECHIDLE1009)', 
     expect(detectsPermissionDialog(pane)).toBe(true)
   })
 })
+
+describe('the monitor count in the bare background footer (MONITORTAIL1010)', () => {
+  // Captured from fleet panes (tmux capture-pane -p, the last non-empty line) on 2026-09-30 and again on
+  // 2026-10-10: the live footer joins the monitor count to the shells with a comma, and shows the monitor
+  // count alone when no shell runs. The VAGTECHIDLE1009 rule above read both as 'unknown', so a pane with a
+  // running monitor was never delivered to.
+  const SHELL_AND_MONITOR = '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor'
+  const MONITOR_ALONE = '  ⏵⏵ bypass permissions on · 1 monitor'
+
+  it.each([
+    ['· 1 shell, 1 monitor (captured live)', SHELL_AND_MONITOR],
+    ['· 1 monitor (captured live)', MONITOR_ALONE],
+    ['· 2 monitors', MONITOR_ALONE.replace('1 monitor', '2 monitors')],
+    ['· 2 shells, 3 monitors', SHELL_AND_MONITOR.replace('1 shell, 1 monitor', '2 shells, 3 monitors')],
+    // after the shift+tab hint the full-footer rule reads it idle already (a control, not a witness of the change)
+    ['after the shift+tab hint', '  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell, 1 monitor'],
+  ])('reads the bare footer %s as idle', (_label, tail) => {
+    const pane = modeFooter(tail)
+    expect(detectPaneState(pane)).toBe('idle')
+    expect(isReadyForPrompt(pane)).toBe(true)
+  })
+
+  it('keeps the bare tail rules for the monitor forms', () => {
+    for (const tail of [
+      '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor running', // more text after the count
+      '  ⏵⏵ bypass permissions on · tasks · 1 monitor', // not directly after the mode
+      '  · 2 monitors', // no mode
+      '  ⏵⏵ bypass permissions on · 1 shell, monitor', // no count
+    ]) {
+      expect(detectPaneState(modeFooter(tail))).toBe('unknown')
+    }
+    // not the last line: the same words in a log line in the scrollback
+    const above = ['2026-10-10 log: bypass permissions on · 1 shell, 1 monitor', '', SEP, '❯ ', SEP, '  some status line'].join('\n')
+    expect(detectPaneState(above)).toBe('unknown')
+  })
+})

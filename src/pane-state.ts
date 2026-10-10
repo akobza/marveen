@@ -102,7 +102,10 @@ const FOOTER_TRUNCATED_RX = /(?:[A-Za-z][\w-]* ){1,3}on · [^\n]*·[^\n]*…\s*$
 // mode word, `on`, then only `· N shell(s)` and an optional `· N monitor(s)`
 // to the end of the line, and ONLY on the last non-empty line, so the same
 // words quoted in a log line in the scrollback never count.
-const FOOTER_SHELL_TAIL_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · \d+ shells?(?: · \d+ monitors?)?\s*$/
+// MONITORTAIL1010: the live footer joins the monitor count to the shells with a comma and shows
+// it alone when no shell runs (`· 1 shell, 1 monitor`, `· 1 monitor`; captured
+// from fleet panes on 2026-09-30 and 2026-10-10): both forms count as well.
+const FOOTER_SHELL_TAIL_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\))? · (?:\d+ shells?(?:(?:,| ·) \d+ monitors?)?|\d+ monitors?)\s*$/
 
 /**
  * Index of the idle footer line, or -1. The full footer may sit anywhere the
