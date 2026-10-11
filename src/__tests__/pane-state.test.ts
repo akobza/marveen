@@ -305,6 +305,18 @@ const RAW_OLD_FOOTER_SCROLLBACK = [
   '',
 ].join('\n')
 const QUOTED_BARE_FOOTER_REPLY = ['● A lábléc most:', BARE_ONE_SHELL_FOOTER, ''].join('\n')
+// A reply or a tool result that quotes a whole idle frame at column 0: the separator sits right above the quoted
+// footer line, so the box rule alone would take that line for the live footer. The bare tail and the clipped form
+// count on the last non-empty line only, and that rule is what keeps a dialog under such a quote seen (a review case:
+// with either form taken on any line the dialog read idle, and no other test failed). The full form has no such rule.
+const quotedIdleFrame = (footer: string): string => [SEP, '❯ ', SEP, footer, ''].join('\n')
+const QUOTED_FRAME_LAST_LINE_FORMS = [
+  BARE_ONE_SHELL_FOOTER,
+  BARE_SHELL_AND_MONITOR_FOOTER,
+  '  ⏵⏵ bypass permissions on · 1 monitor',
+  '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback draft',
+  '  ⏵⏵ bypass permissions on · install gh for PR status · 3 sh…',
+]
 const IDLE_BARE_ONE_SHELL = modeFooter(BARE_ONE_SHELL_FOOTER)
 const IDLE_BARE_TWO_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '2 shells'))
 const IDLE_BARE_THREE_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '3 shells'))
@@ -2110,6 +2122,21 @@ describe('detectsPermissionDialog', () => {
     }
   })
 
+  // The last-line rule of the bare tail and the clipped form (quotedIdleFrame): alone the quoted frame is an idle
+  // frame, so the box rule is met, and only the last-line rule keeps the dialog and the menu below it seen.
+  it('still sees the dialog and the menu under a quoted idle frame with a bare or clipped footer', () => {
+    for (const footer of QUOTED_FRAME_LAST_LINE_FORMS) {
+      const above = quotedIdleFrame(footer)
+      expect(detectPaneState(above), footer).toBe('idle')
+      for (const dialog of [PERMISSION_DIALOG, BASH_PERMISSION_DIALOG]) {
+        expect(detectsPermissionDialog(above + '\n' + dialog), footer).toBe(true)
+        expect(detectPaneState(above + '\n' + dialog), footer).toBe('unknown')
+        expect(isReadyForPrompt(above + '\n' + dialog), footer).toBe(false)
+      }
+      expect(detectsBlockingMenu(above + '\n' + GENUINE_MENU), footer).toBe(true)
+    }
+  })
+
   // The other side of the rule (footerVetoesDialog): in a frame without the input box a footer
   // as the LAST line still vetoes, so a quoted menu hint above it is not a menu. Two of the
   // vetoed detectors answer with keystrokes; the quote-proofing must not depend on the box.
@@ -2718,6 +2745,12 @@ describe('detectsFirstRunGate / mcpTrustAcceptKeys: the MCP approval dialog', ()
   it('still classifies it under a footer line that is not the live footer (LIVEFOOTERBOX0930)', () => {
     expect(detectsFirstRunGate(RAW_OLD_FOOTER_SCROLLBACK + '\n' + MCP_PANE)).toBe('mcp-trust')
     expect(detectsFirstRunGate(QUOTED_BARE_FOOTER_REPLY + '\n' + MCP_PANE)).toBe('mcp-trust')
+  })
+
+  it('still classifies it under a quoted idle frame with a bare or clipped footer (the last-line rule)', () => {
+    for (const footer of QUOTED_FRAME_LAST_LINE_FORMS) {
+      expect(detectsFirstRunGate(quotedIdleFrame(footer) + '\n' + MCP_PANE), footer).toBe('mcp-trust')
+    }
   })
 
   it('selects THIS server with cursor-relative keys, never by number', () => {
