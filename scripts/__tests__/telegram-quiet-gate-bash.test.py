@@ -11,8 +11,9 @@ WHAT IT PINS
   - the parser: which Bash commands are Bot API sends and to which chat, over the forms the decision
     names (curl and wget; -d, --data-urlencode, -F, --json, a JSON body, the URL's query, @file and
     --post-file bodies; bash -c, eval, $( ), backticks, a heredoc, here-string or pipe fed to a shell,
-    wrappers and runners; a URL in a variable), and the commands that are not sends (the host in grep,
-    echo, a commit message, a comment, a heredoc that only writes a file, the body of a request to
+    a script a heredoc writes and the same command runs, a heredoc whose end line never comes, wrappers
+    and runners; a URL in a variable), and the commands that are not sends (the host in grep, echo, a
+    commit message, a comment, a heredoc that only writes a file nobody runs, the body of a request to
     another host, a reading method, scripts/notify.sh). A chat it cannot read is None, never a guess;
   - the lexer reads every well-formed case itself (the line-level fallback is for unreadable text
     only), and the fallback still finds the send in a command with an unbalanced quote;
@@ -155,6 +156,10 @@ SENDS = [
     ("xargs", "echo 999 | xargs -I{} curl %s -d chat_id={}" % U, [(S, None)]),
     ("inside if", "if true; then curl %s -d chat_id=999; fi" % U, [(S, "999")]),
     ("no chat_id at all", "curl %s -d text=hi" % U, [(S, None)]),
+    ("a script a heredoc writes and the command runs", "cat > /tmp/s.sh <<'EOF'\ncurl -s %s -d chat_id=999\nEOF\nbash /tmp/s.sh" % U, [(S, "999")]),
+    ("the same script run as ./s.sh", "cat > s.sh <<'EOF'\ncurl -s %s -d chat_id=999\nEOF\nchmod +x s.sh && ./s.sh" % U, [(S, "999")]),
+    ("a heredoc whose end line never comes", "cat <<EOF\ncurl -s %s -d chat_id=999" % U, [(S, "999")]),
+    ("a << in an arithmetic expression", "(( x = 1 << 2 ))\ncurl -s %s -d chat_id=999" % U, [(S, "999")]),
     # not sends
     ("grep for the host", 'grep -rn "api.telegram.org" scripts/', []),
     ("echo of a send", 'echo "%s chat_id=999"' % U, []),
