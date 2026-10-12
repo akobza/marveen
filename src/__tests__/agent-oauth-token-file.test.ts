@@ -297,7 +297,10 @@ describe('launcher wiring (agent-process.ts)', () => {
     const decide = FN.indexOf('decideOwnOauthToken({')
     expect(decide).toBeGreaterThan(0)
     expect(decide).toBeLessThan(FN.indexOf('return startRemoteAgentProcess('))
-    expect(decide).toBeLessThan(FN.indexOf('if (isAgentRunning(name))'))
+    // The running check reads fresh (card ea6f9b07: the shared list-sessions answer is bypassed here).
+    const running = FN.indexOf('if (isAgentRunning(name, { fresh: true }))')
+    expect(running).toBeGreaterThan(0)
+    expect(decide).toBeLessThan(running)
     expect(decide).toBeLessThan(FN.indexOf('runTmux('))
     const refused = FN.slice(FN.indexOf("if (ownOauth.kind === 'refused') {"))
     expect(refused.slice(0, 400)).toMatch(/return \{ ok: false, error: `oauthTokenFile: /)

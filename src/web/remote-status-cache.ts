@@ -12,8 +12,10 @@
 // window per agent (the dominant fix), so the dashboard is not frozen on every
 // poll, but it is not non-blocking. A throwing fetch (host unreachable) never
 // escapes: the last-known value is returned if we have one, otherwise the
-// caller-supplied fallback. Local agents are never cached -- their tmux calls
-// are sub-millisecond, so they always fetch fresh.
+// caller-supplied fallback. Local agents are not cached here: their run state is
+// shared per tmux server in agent-process.ts (listSessionsOutput). The local tmux
+// call itself is fast, but every call forks this large process, and the fork
+// blocks the event loop until the child's exec (card ea6f9b07).
 //
 // (Fully async/non-blocking refresh via child_process.spawn is a deferred idea.)
 export class RemoteStatusCache<T> {
