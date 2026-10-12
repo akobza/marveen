@@ -596,11 +596,15 @@ export async function recoverStuckInputForSession(
   prev: StuckInputState,
   thresholds: StuckInputThresholds,
   allowPlainReinject: boolean,
+  parkedView?: string | null,
 ): Promise<StuckInputState> {
   // Ghost-stripped capture: a dim autocomplete hint in an empty box must NOT
   // read as parked input, or the recovery below would re-type + submit it
   // (phantom prompt-injection). See captureParkedInputView / stripGhostSuggestion.
-  const pane = captureParkedInputView(session)
+  // A caller that already took this view of the pane in the same tick, with
+  // nothing sent to the pane since, hands it in (the fast watcher, card
+  // ea6f9b07) instead of forking a second identical capture.
+  const pane = parkedView !== undefined ? parkedView : captureParkedInputView(session)
   const sig = pane != null ? stuckInputSignature(pane) : null
   const decision = decideStuckInputRecovery(sig, prev, Date.now(), thresholds)
   if (decision.recover && pane != null) {

@@ -152,13 +152,15 @@ const alertedSpells = new Set<string>()
 // Returns true when a parked-paste spell is active (recovered or still inside
 // its confirm/dedup window) so the caller SKIPS the normal recovery this tick;
 // false when there is no parked paste (caller runs the normal 'typing' path).
+// `pane` is this tick's ghost-stripped capture of the session (the sweep takes
+// ONE per session and hands it to both paths); false means nothing was sent.
 function recoverParkedPaste(
   label: string,
   session: string,
   host: string | null,
   thresholds: StuckInputThresholds,
+  pane: string | null,
 ): boolean {
-  const pane = captureParkedInputView(session, host)
   const sig = pane == null ? null : parkedPasteSignature(pane)
   if (sig == null) return false
 
@@ -184,11 +186,11 @@ function recoverParkedPaste(
 // Bare-Enter recovery (host-aware). Used for the MAIN session (host null) and
 // for REMOTE sub-agents, where the local-tmux clear+re-inject is not
 // available. channel-monitor owns the clear+re-inject escalation for these.
-function bareEnterRecovery(label: string, session: string, host: string | null): void {
-  // Ghost-stripped capture: a bare recovery Enter submits whatever is parked,
-  // so a dim autocomplete hint read as parked input would be Enter-submitted as
-  // a forged message. captureParkedInputView removes the SGR-2 ghost first.
-  const pane = captureParkedInputView(session, host)
+function bareEnterRecovery(label: string, session: string, host: string | null, pane: string | null): void {
+  // Ghost-stripped capture (the sweep's captureParkedInputView of this tick): a
+  // bare recovery Enter submits whatever is parked, so a dim autocomplete hint
+  // read as parked input would be Enter-submitted as a forged message.
+  // captureParkedInputView removes the SGR-2 ghost first.
   // A failed capture is treated as "nothing parked" -- it ends any active
   // spell rather than holding stale state across a transient tmux miss.
   const sig = pane == null ? null : stuckInputSignature(pane)
@@ -241,9 +243,9 @@ function bareEnterRecovery(label: string, session: string, host: string | null):
 // this flag), only the ghost-risky plain-text branch is closed. Local
 // sub-agents pass TRUE: the env-var strips their ghost at the source, so their
 // plain re-inject (an inter-agent message the TUI failed to submit) is safe.
-async function checkLocalSession(label: string, session: string, alertOnGiveUp: boolean, allowPlainReinject: boolean): Promise<void> {
+async function checkLocalSession(label: string, session: string, alertOnGiveUp: boolean, allowPlainReinject: boolean, pane: string | null): Promise<void> {
   const prev = watchState.get(session) ?? NO_STATE
-  const next = await recoverStuckInputForSession(session, prev, LOCAL_FAST_THRESHOLDS, allowPlainReinject)
+  const next = await recoverStuckInputForSession(session, prev, LOCAL_FAST_THRESHOLDS, allowPlainReinject, pane)
 
   if (next.parkedSig === null) {
     watchState.delete(session)
@@ -292,9 +294,12 @@ export function startStuckInputWatcher(): NodeJS.Timeout {
     try {
       // Parked paste placeholder takes precedence (mutually exclusive with a
       // typing-parked box); only run the normal 'typing' recovery when there is
-      // no stuck paste this tick.
-      if (!recoverParkedPaste(MAIN_AGENT_ID, MAIN_CHANNELS_SESSION, null, LOCAL_FAST_THRESHOLDS)) {
-        await checkLocalSession(MAIN_AGENT_ID, MAIN_CHANNELS_SESSION, false, false)
+      // no stuck paste this tick. ONE ghost-stripped capture per session per
+      // tick (card ea6f9b07): both paths read the same pane milliseconds apart,
+      // and the typing path only runs when the paste path sent nothing.
+      const pane = captureParkedInputView(MAIN_CHANNELS_SESSION, null)
+      if (!recoverParkedPaste(MAIN_AGENT_ID, MAIN_CHANNELS_SESSION, null, LOCAL_FAST_THRESHOLDS, pane)) {
+        await checkLocalSession(MAIN_AGENT_ID, MAIN_CHANNELS_SESSION, false, false, pane)
       }
     } catch (err) {
       logger.debug({ err }, 'stuck-input-watcher: main agent check error')
@@ -312,13 +317,14 @@ export function startStuckInputWatcher(): NodeJS.Timeout {
         // the host-aware bare Enter. In both cases a parked paste placeholder is
         // handled first via a time-gated bare Enter (the 'typing'-gated paths
         // below never see it -- a placeholder reads as 'busy').
+        const pane = captureParkedInputView(session, host)
         if (host == null) {
-          if (!recoverParkedPaste(name, session, null, LOCAL_FAST_THRESHOLDS)) {
-            await checkLocalSession(name, session, true, true)
+          if (!recoverParkedPaste(name, session, null, LOCAL_FAST_THRESHOLDS, pane)) {
+            await checkLocalSession(name, session, true, true, pane)
           }
         } else {
-          if (!recoverParkedPaste(name, session, host, THRESHOLDS)) {
-            bareEnterRecovery(name, session, host)
+          if (!recoverParkedPaste(name, session, host, THRESHOLDS, pane)) {
+            bareEnterRecovery(name, session, host, pane)
           }
         }
       } catch (err) {
