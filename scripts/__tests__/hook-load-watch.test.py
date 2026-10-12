@@ -522,6 +522,23 @@ CALLER_PATH_GATE_PY = ("import json, os, sys\n"
                        ")\n"
                        "json.load(sys.stdin)\n"
                        "sys.exit(0 if os.path.isfile(ONESHOT) or True else 0)\n")
+# dc33f582 (a)(i): a join inside a function; HERE at module level is scripts/, and the function may bind its own HERE
+FN_JOIN_GATE_PY = ("import json, os, sys\n"
+                   "HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n"
+                   "def lazy():\n"
+                   "%s"
+                   "    return os.path.join(HERE, 'hlw-fn.py')\n"
+                   "json.load(sys.stdin)\n"
+                   "sys.exit(0 if lazy() else 0)\n")
+FN_REBIND = "    HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sub')\n"
+# dc33f582 (a)(ii): a computed path outside scripts/ (in the root's store/, or above the root)
+OUT_JOIN_GATE_PY = ("import json, os, sys\n"
+                    "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+                    "TOP = os.path.realpath(os.path.join(HERE, '..', '..'))\n"
+                    "P = os.path.join(TOP, 'store', 'hlw-out.py')\n"
+                    "Q = os.path.join(HERE, '..', '..', '..', 'hlw-above.py')\n"
+                    "json.load(sys.stdin)\n"
+                    "sys.exit(0 if (P, Q) else 0)\n")
 TALK_GATE_PY = ("import json, sys\n"
                 "# a send looks like 'send.py' in a command; here the name is data, not a dependency\n"
                 "NAMES = ['send.py', 'mailer.mjs']\n"
@@ -660,6 +677,70 @@ class Missing(DependencyRoot):
         rc, out = run(self.root, "--check")
         self.assertEqual(rc, 1, out)
         self.assertEqual(re.findall(r"MISSING rc=None +(\S+) ", out), ["scripts/hooks/hlw-oneshot.py"])
+
+    def test_a_join_in_a_function_that_keeps_the_module_name_is_computed(self):
+        # dc33f582 (a)(i), positive: the function does not bind HERE, so the module-level value holds (scripts/hlw-fn.py)
+        self.add_gate("scripts/hooks/fn-join-gate.py", FN_JOIN_GATE_PY % "", "python3")
+        write(self.p("scripts/hlw-fn.py"), "X = 1\n", 0o644)
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("MISSING", out)
+
+    def test_a_join_in_a_function_that_rebinds_the_name_falls_back_to_the_old_rule(self):
+        # dc33f582 (a)(i), negative: the function binds its own HERE (scripts/hooks/sub); the module-level path exists, but it
+        # is not the one the function reads, so the old rule decides and reports beside the gate
+        self.add_gate("scripts/hooks/fn-join-gate.py", FN_JOIN_GATE_PY % FN_REBIND, "python3")
+        write(self.p("scripts/hlw-fn.py"), "X = 1\n", 0o644)
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(re.findall(r"MISSING rc=None +(\S+) ", out), ["scripts/hooks/hlw-fn.py"])
+
+    def test_a_computed_path_outside_scripts_is_found_there(self):
+        # dc33f582 (a)(ii), positive: both computed paths exist (store/ in the root, and the one above the root)
+        self.add_gate("scripts/hooks/out-join-gate.py", OUT_JOIN_GATE_PY, "python3")
+        write(self.p("store/hlw-out.py"), "X = 1\n", 0o644)
+        write(os.path.join(self.tmp, "hlw-above.py"), "X = 1\n", 0o644)
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("MISSING", out)
+
+    def test_a_missing_computed_path_outside_scripts_is_reported_there(self):
+        # dc33f582 (a)(ii), negative: neither file is there; each is shown at its computed path, the one in the root relative
+        # to it, the one above the root absolute (before, both were silent: the shown path was kept under scripts/ only)
+        self.add_gate("scripts/hooks/out-join-gate.py", OUT_JOIN_GATE_PY, "python3")
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(sorted(re.findall(r"MISSING rc=None +(\S+) ", out)),
+                         sorted(["store/hlw-out.py", os.path.join(self.tmp, "hlw-above.py")]))
+        self.assertIn("local dependencies named in a gate's source but missing: 2", out)
+
+    def _link_root_gate(self, name):
+        # dc33f582 (b): the install root reached through a symlink, the gate wired by the link's path, so __file__ is the
+        # link's spelling while realpath() gives the real one
+        link = os.path.join(self.tmp, "install-link")
+        os.symlink(self.root, link)
+        write(self.p("scripts/hooks/link-gate.py"), CALLER_PATH_GATE_PY % name)
+        path = self.p("agents/a1/.claude/settings.json")
+        d = json.loads(read(path))
+        d["hooks"]["PreToolUse"].append({"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10,
+                                         "command": 'python3 "%s/scripts/hooks/link-gate.py"' % link}]})
+        write(path, json.dumps(d), 0o644)
+        return link
+
+    def test_a_symlinked_root_finds_the_computed_file(self):
+        # dc33f582 (b), positive
+        link = self._link_root_gate("hlw-link.py")
+        write(self.p("scripts/hlw-link.py"), "X = 1\n", 0o644)
+        rc, out = run(link, "--check")
+        self.assertNotIn("hlw-link.py", out)
+        self.assertIn("local dependencies named in a gate's source but missing: 0", out)
+
+    def test_a_symlinked_root_shows_a_missing_computed_file_under_its_own_spelling(self):
+        # dc33f582 (b), negative: the realpath()ed piece is turned back to the root's own spelling, so the finding is
+        # scripts/<name>, not a path through the real directory
+        link = self._link_root_gate("hlw-link-no-such.py")
+        rc, out = run(link, "--check")
+        self.assertEqual(re.findall(r"MISSING rc=None +(\S+) ", out), ["scripts/hlw-link-no-such.py"])
 
     def test_an_installed_module_is_not_missing(self):
         self.add_gate("scripts/hooks/opt-gate.py", OPT_GATE_PY, "python3")

@@ -53,7 +53,10 @@ the literal pieces, '..' included -- os.path.join(os.path.realpath(os.path.join(
 with HERE = os.path.dirname(os.path.abspath(__file__)) names <root>/scripts/x.py, not scripts/hooks/x.py --, and a
 missing one is shown there. Computable: a string literal, __file__, a name bound once at module level to such an
 expression, and os.path.join/dirname/normpath of them, abspath/realpath of an absolute one; the computed path counts
-for the missing rule only (what is loaded is unchanged). The missing rule reads the
+for the missing rule only (what is loaded is unchanged). A name the enclosing function, lambda or class binds itself
+(a parameter, an assignment, an import) is not the module-level one, so a join there that uses it is left to the old
+rule (card dc33f582 (a)(i)); and a missing computed path is reported wherever it falls, outside scripts/ too, shown
+relative to the install root, or absolute above it (dc33f582 (a)(ii)). The missing rule reads the
 source without its comments and (python) docstrings: a commented-out load or import is no finding (card 06c9aa79 (3)).
 WHAT IT DOES NOT SEE. A dependency whose path is put together at run time (a computed or formatted path, a name
 read from config or the environment) rather than written as a literal; a node specifier without its extension; a
@@ -285,12 +288,17 @@ def load_literals(path, text):
 PATH_FUNCS = ("join", "dirname", "normpath", "abspath", "realpath")
 
 
-def module_bindings(text):
+def py_tree(text):
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def module_bindings(tree):
     """The names a python source binds exactly once, at module level, by a plain one-target assignment: {name: its
     expression}. A name bound again anywhere at module level (or declared global in a function) is left out."""
-    try:
-        tree = ast.parse(text)
-    except (SyntaxError, ValueError):
+    if tree is None:
         return {}
     stores, bound = {}, {}
 
@@ -322,13 +330,50 @@ def module_bindings(text):
     return {k: v for k, v in bound.items() if stores.get(k) == 1}
 
 
-def eval_path(node, path, bound, busy=()):
+def local_scopes(tree):
+    """dc33f582 (a)(i): (first line, last line, names) for every function, lambda and class: the names its own body
+    binds (parameters, assignments, imports, nested definitions), less the ones it declares global. A join inside it
+    that uses such a name does not see the module-level value."""
+    scopes = []
+    for node in (ast.walk(tree) if tree is not None else ()):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        names, declared_global = set(), set()
+        if not isinstance(node, ast.ClassDef):
+            a = node.args
+            names.update(x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y])
+
+        def visit(n):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(n.name)
+                return
+            if isinstance(n, ast.Lambda):
+                return
+            if isinstance(n, ast.Global):
+                declared_global.update(n.names)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                names.add(n.id)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                names.update((x.asname or x.name).split(".")[0] for x in n.names)
+            for c in ast.iter_child_nodes(n):
+                visit(c)
+
+        for stmt in (node.body if isinstance(node.body, list) else [node.body]):
+            visit(stmt)
+        scopes.append((node.lineno, getattr(node, "end_lineno", None) or node.lineno, names - declared_global))
+    return scopes
+
+
+def eval_path(node, path, bound, busy=(), shadow=frozenset()):
     """The value of a path expression, or None: a string literal, __file__ (the caller's own path), a name of `bound`, and
     os.path.join/dirname/normpath of them, abspath/realpath of an absolute one (of a relative one they depend on the
-    working directory)."""
+    working directory). A name in `shadow` is bound where the expression stands (dc33f582 (a)(i)): not computable.
+    A module-level binding's own expression is read at module level, without the shadow."""
     if isinstance(node, ast.Constant):
         return node.value if isinstance(node.value, str) else None
     if isinstance(node, ast.Name):
+        if node.id in shadow:
+            return None
         if node.id == "__file__":
             return path
         if node.id in bound and node.id not in busy:
@@ -339,7 +384,7 @@ def eval_path(node, path, bound, busy=()):
             or not isinstance(f.value, ast.Attribute) or f.value.attr != "path"
             or not isinstance(f.value.value, ast.Name) or f.value.value.id != "os"):
         return None
-    args = [None if isinstance(a, ast.Starred) else eval_path(a, path, bound, busy) for a in node.args]
+    args = [None if isinstance(a, ast.Starred) else eval_path(a, path, bound, busy, shadow) for a in node.args]
     if not args or any(a is None for a in args):
         return None
     if f.attr == "join":
@@ -355,9 +400,10 @@ def eval_path(node, path, bound, busy=()):
     return os.path.normpath(args[0]) if f.attr == "abspath" else os.path.realpath(args[0])
 
 
-def joined_path(path, args, lit, bound):
+def joined_path(path, args, lit, bound, shadow=frozenset()):
     """d299443e: the absolute path the load form os.path.join(<args>) gives the quoted name `lit` when `lit` is a direct
-    argument and the pieces up to it are computable (eval_path); None otherwise."""
+    argument and the pieces up to it are computable (eval_path, with the names the enclosing scopes bind as `shadow`);
+    None otherwise."""
     try:
         call = ast.parse("f(%s)" % args, mode="eval").body
     except (SyntaxError, ValueError):
@@ -366,7 +412,7 @@ def joined_path(path, args, lit, bound):
         return None
     for i, arg in enumerate(call.args):
         if isinstance(arg, ast.Constant) and arg.value == lit:
-            pieces = [eval_path(a, path, bound) for a in call.args[:i + 1]]
+            pieces = [eval_path(a, path, bound, (), shadow) for a in call.args[:i + 1]]
             if all(p is not None for p in pieces) and os.path.isabs(os.path.join(*pieces)):
                 return os.path.normpath(os.path.join(*pieces))
     return None
@@ -557,11 +603,14 @@ def local_deps(path, index):
         return set(), {}
     here, scripts, found, missing = os.path.dirname(path), os.path.join(ROOT, "scripts"), set(), {}
 
-    def miss(cands, why):
+    def miss(cands, why, anywhere=False):
+        # dc33f582 (a)(ii): a computed path is shown wherever it falls (relative under the root, absolute above it); the
+        # other candidates only under scripts/, as before
         shown = [p for p in dict.fromkeys(os.path.normpath(c) for c in cands)
-                 if p != path and os.path.commonpath([scripts, p]) == scripts]
+                 if p != path and (anywhere or os.path.commonpath([scripts, p]) == scripts)]
         if shown:
-            missing.setdefault(tuple(os.path.relpath(p, ROOT) for p in shown), why)
+            missing.setdefault(tuple(os.path.relpath(p, ROOT) if os.path.commonpath([ROOT, p]) == ROOT else p
+                                     for p in shown), why)
 
     def line_of(offset):
         return "%s:%d" % (os.path.relpath(path, ROOT), text.count("\n", 0, offset) + 1)
@@ -607,15 +656,18 @@ def local_deps(path, index):
                 break
     # d299443e: the path the load form computes from the caller's location (realpath()ed pieces are shown under <root>'s own
     # spelling again, so the scripts/ filter and the shown path stay the same for a symlinked root)
-    bound, root_real = module_bindings(text) if is_py else {}, os.path.realpath(ROOT)
+    tree = py_tree(text) if is_py else None
+    bound, scopes, root_real = module_bindings(tree), local_scopes(tree), os.path.realpath(ROOT)
     for lit, offset, args in (load_literals(path, code) if code is not None else ()):
-        full = joined_path(os.path.abspath(path), args, lit, bound) if args is not None else None
+        line = text.count("\n", 0, offset) + 1
+        shadow = frozenset().union(*(names for first, last, names in scopes if first <= line <= last))
+        full = joined_path(os.path.abspath(path), args, lit, bound, shadow) if args is not None else None
         if full and os.path.commonpath([root_real, full]) == root_real:
             full = os.path.join(ROOT, os.path.relpath(full, root_real))
         if any(os.path.isfile(os.path.normpath(c)) for c in (os.path.join(here, lit), os.path.join(ROOT, lit), full) if c):
             continue
         miss([full or (os.path.join(ROOT, lit) if lit.startswith("scripts/") else os.path.join(here, lit))],
-             'a forrásban betöltött "%s" (%s)' % (lit, line_of(offset)))
+             'a forrásban betöltött "%s" (%s)' % (lit, line_of(offset)), anywhere=bool(full))
     return found, missing
 
 
