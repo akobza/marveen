@@ -47,7 +47,13 @@ finding, named with the gates that reach it, in the same alert. A dependency the
 in the same alert, because the gate fails on it the same way (card 06c9aa79 (2)): a python import that is neither
 stdlib, nor a local file (resolved as above), nor an installed module (searched outside the install root), shown
 at the importing file's directory and scripts/lib; and a file name in a load form -- os.path.join(..., "<name>")
-in python, a relative import/require specifier in node -- shown at the path it resolves to. The missing rule reads the
+in python, a relative import/require specifier in node -- shown at the path it resolves to. A python load form whose
+pieces up to the name are computable is also looked for at that path (card d299443e): the caller's own location and
+the literal pieces, '..' included -- os.path.join(os.path.realpath(os.path.join(HERE, "..", "..")), "scripts", "x.py")
+with HERE = os.path.dirname(os.path.abspath(__file__)) names <root>/scripts/x.py, not scripts/hooks/x.py --, and a
+missing one is shown there. Computable: a string literal, __file__, a name bound once at module level to such an
+expression, and os.path.join/dirname/normpath of them, abspath/realpath of an absolute one; the computed path counts
+for the missing rule only (what is loaded is unchanged). The missing rule reads the
 source without its comments and (python) docstrings: a commented-out load or import is no finding (card 06c9aa79 (3)).
 WHAT IT DOES NOT SEE. A dependency whose path is put together at run time (a computed or formatted path, a name
 read from config or the environment) rather than written as a literal; a node specifier without its extension; a
@@ -260,15 +266,110 @@ def call_args(text, start):
 
 
 def load_literals(path, text):
-    """(file name, offset) for every quoted .py/.mjs/.cjs/.js name the source LOADS: an argument of os.path.join(...) at
-    any depth in python, a relative import/export-from/import()/require() specifier in node."""
+    """(file name, offset, the join's argument text or None) for every quoted .py/.mjs/.cjs/.js name the source LOADS: an
+    argument of os.path.join(...) at any depth in python, a relative import/export-from/import()/require() specifier in node."""
     if path.endswith(".py"):
         for m in PY_JOIN.finditer(text):
-            for lit in FILE_LIT.finditer(call_args(text, m.end())):
-                yield lit.group(1), m.end() + lit.start()
+            args = call_args(text, m.end())
+            for lit in FILE_LIT.finditer(args):
+                yield lit.group(1), m.end() + lit.start(), args
     elif path.endswith((".mjs", ".cjs", ".js")):
         for m in JS_LOAD.finditer(text):
-            yield m.group(2), m.start(2)
+            yield m.group(2), m.start(2), None
+
+
+# d299443e: a load form built from the caller's own location names its file by the pieces up to the quoted name, not by
+# the name alone: schedule-dated-post-gate.py reads os.path.join(os.path.realpath(os.path.join(HERE, "..", "..")), "scripts",
+# "egyszeri.py") with HERE = os.path.dirname(os.path.abspath(__file__)), that is <root>/scripts/egyszeri.py. Only the forms
+# below are computed; anything else (the environment, a config value, a name bound twice) leaves the name to the old rule.
+PATH_FUNCS = ("join", "dirname", "normpath", "abspath", "realpath")
+
+
+def module_bindings(text):
+    """The names a python source binds exactly once, at module level, by a plain one-target assignment: {name: its
+    expression}. A name bound again anywhere at module level (or declared global in a function) is left out."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return {}
+    stores, bound = {}, {}
+
+    def count(name, n=1):
+        stores[name] = stores.get(name, 0) + n
+
+    def visit(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count(node.name)
+            return
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            count(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                count((alias.asname or alias.name).split(".")[0])
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    for node in tree.body:
+        visit(node)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            bound[node.targets[0].id] = node.value
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                count(name, 2)
+    return {k: v for k, v in bound.items() if stores.get(k) == 1}
+
+
+def eval_path(node, path, bound, busy=()):
+    """The value of a path expression, or None: a string literal, __file__ (the caller's own path), a name of `bound`, and
+    os.path.join/dirname/normpath of them, abspath/realpath of an absolute one (of a relative one they depend on the
+    working directory)."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        if node.id == "__file__":
+            return path
+        if node.id in bound and node.id not in busy:
+            return eval_path(bound[node.id], path, bound, busy + (node.id,))
+        return None
+    f = node.func if isinstance(node, ast.Call) else None
+    if (f is None or node.keywords or not isinstance(f, ast.Attribute) or f.attr not in PATH_FUNCS
+            or not isinstance(f.value, ast.Attribute) or f.value.attr != "path"
+            or not isinstance(f.value.value, ast.Name) or f.value.value.id != "os"):
+        return None
+    args = [None if isinstance(a, ast.Starred) else eval_path(a, path, bound, busy) for a in node.args]
+    if not args or any(a is None for a in args):
+        return None
+    if f.attr == "join":
+        return os.path.join(*args)
+    if len(args) != 1:
+        return None
+    if f.attr == "dirname":
+        return os.path.dirname(args[0])
+    if f.attr == "normpath":
+        return os.path.normpath(args[0])
+    if not os.path.isabs(args[0]):
+        return None
+    return os.path.normpath(args[0]) if f.attr == "abspath" else os.path.realpath(args[0])
+
+
+def joined_path(path, args, lit, bound):
+    """d299443e: the absolute path the load form os.path.join(<args>) gives the quoted name `lit` when `lit` is a direct
+    argument and the pieces up to it are computable (eval_path); None otherwise."""
+    try:
+        call = ast.parse("f(%s)" % args, mode="eval").body
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(call, ast.Call) or call.keywords:
+        return None
+    for i, arg in enumerate(call.args):
+        if isinstance(arg, ast.Constant) and arg.value == lit:
+            pieces = [eval_path(a, path, bound) for a in call.args[:i + 1]]
+            if all(p is not None for p in pieces) and os.path.isabs(os.path.join(*pieces)):
+                return os.path.normpath(os.path.join(*pieces))
+    return None
 
 
 
@@ -504,10 +605,16 @@ def local_deps(path, index):
         for cand in (os.path.join(here, m.group(1)), os.path.join(ROOT, m.group(1))):
             if add(cand):
                 break
-    for lit, offset in (load_literals(path, code) if code is not None else ()):
-        if any(os.path.isfile(os.path.normpath(c)) for c in (os.path.join(here, lit), os.path.join(ROOT, lit))):
+    # d299443e: the path the load form computes from the caller's location (realpath()ed pieces are shown under <root>'s own
+    # spelling again, so the scripts/ filter and the shown path stay the same for a symlinked root)
+    bound, root_real = module_bindings(text) if is_py else {}, os.path.realpath(ROOT)
+    for lit, offset, args in (load_literals(path, code) if code is not None else ()):
+        full = joined_path(os.path.abspath(path), args, lit, bound) if args is not None else None
+        if full and os.path.commonpath([root_real, full]) == root_real:
+            full = os.path.join(ROOT, os.path.relpath(full, root_real))
+        if any(os.path.isfile(os.path.normpath(c)) for c in (os.path.join(here, lit), os.path.join(ROOT, lit), full) if c):
             continue
-        miss([os.path.join(ROOT, lit) if lit.startswith("scripts/") else os.path.join(here, lit)],
+        miss([full or (os.path.join(ROOT, lit) if lit.startswith("scripts/") else os.path.join(here, lit))],
              'a forrásban betöltött "%s" (%s)' % (lit, line_of(offset)))
     return found, missing
 

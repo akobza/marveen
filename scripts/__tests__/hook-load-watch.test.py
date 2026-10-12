@@ -512,6 +512,16 @@ DEEP_GATE_PY = ("import importlib.util, json, os, sys\np = json.load(sys.stdin)\
                 "    spec = importlib.util.spec_from_file_location('_deep_dep', path)\n"
                 "    spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
                 "sys.exit(0)\n")
+# d299443e: the shape of schedule-dated-post-gate.py (the 44ac3366 gate): the file is named by the caller's own location and
+# the literal pieces, '..' included, so it lives at <root>/scripts/<name>, not beside the gate. The gate only checks that
+# the file is there (fail-open), as the real one does.
+CALLER_PATH_GATE_PY = ("import json, os, sys\n"
+                       "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+                       "ONESHOT = os.environ.get('HLW_ONESHOT') or os.path.join(\n"
+                       "    os.path.realpath(os.path.join(HERE, '..', '..')), 'scripts', '%s',\n"
+                       ")\n"
+                       "json.load(sys.stdin)\n"
+                       "sys.exit(0 if os.path.isfile(ONESHOT) or True else 0)\n")
 TALK_GATE_PY = ("import json, sys\n"
                 "# a send looks like 'send.py' in a command; here the name is data, not a dependency\n"
                 "NAMES = ['send.py', 'mailer.mjs']\n"
@@ -620,6 +630,36 @@ class Missing(DependencyRoot):
         self.assertEqual(rc, 1, out)
         self.assertRegex(out, r'MISSING rc=None +scripts/hooks/deep-dep\.py \(1 ügynök\) probe=import \(<- scripts/hooks/deep-gate\.py\) '
                               r'\| HIÁNYZIK: scripts/hooks/deep-dep\.py; a forrásban betöltött "deep-dep\.py" \(scripts/hooks/deep-gate\.py:5\)')
+
+    def test_a_load_form_built_from_the_callers_location_is_found_there(self):
+        # d299443e: the 44ac3366 gate's shape; the file is at <root>/scripts/, nothing of that name beside the gate or at
+        # the root, so only the path computed from the caller's location finds it (the old rule reported scripts/hooks/<name>)
+        self.add_gate("scripts/hooks/caller-path-gate.py", CALLER_PATH_GATE_PY % "hlw-oneshot.py", "python3")
+        write(self.p("scripts/hlw-oneshot.py"), "X = 1\n", 0o644)
+        self.assertFalse(os.path.exists(self.p("scripts/hooks/hlw-oneshot.py")) or os.path.exists(self.p("hlw-oneshot.py")))
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("MISSING", out)
+        self.assertIn("local dependencies named in a gate's source but missing: 0", out)
+
+    def test_the_same_load_form_for_a_missing_scripts_file_stays_missing_and_is_shown_there(self):
+        # d299443e, the negative control: the same shape for a scripts/<name> that is not there is still a finding, shown at
+        # the computed path (the old rule showed it beside the gate)
+        self.add_gate("scripts/hooks/caller-path-gate.py", CALLER_PATH_GATE_PY % "hlw-no-such.py", "python3")
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r'MISSING rc=None +scripts/hlw-no-such\.py \(1 ügynök\) probe=import \(<- scripts/hooks/caller-path-gate\.py\) '
+                              r'\| HIÁNYZIK: scripts/hlw-no-such\.py; a forrásban betöltött "hlw-no-such\.py" \(scripts/hooks/caller-path-gate\.py:4\)')
+        self.assertIn("local dependencies named in a gate's source but missing: 1", out)
+
+    def test_a_load_form_with_a_name_bound_twice_is_not_computed(self):
+        # d299443e: only a name bound ONCE at module level is followed; bound again, the old rule decides (shown beside the gate)
+        twice = (CALLER_PATH_GATE_PY % "hlw-oneshot.py").replace("json.load(sys.stdin)\n", "HERE = '/elsewhere'\njson.load(sys.stdin)\n", 1)
+        self.add_gate("scripts/hooks/caller-path-gate.py", twice, "python3")
+        write(self.p("scripts/hlw-oneshot.py"), "X = 1\n", 0o644)
+        rc, out = run(self.root, "--check")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(re.findall(r"MISSING rc=None +(\S+) ", out), ["scripts/hooks/hlw-oneshot.py"])
 
     def test_an_installed_module_is_not_missing(self):
         self.add_gate("scripts/hooks/opt-gate.py", OPT_GATE_PY, "python3")
