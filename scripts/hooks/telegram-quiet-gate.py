@@ -7,8 +7,21 @@ only stops DEMANDING a reply inside the window (cards 30d968cd / 352c3b42), and 
 reply tool itself sent whatever the model wrote. This gate stops it.
 
 What it gates: the Telegram reply, react and edit_message tools (download_attachment
-only reads). The decision is telegram_quiet_hours.send_decision(), shared with
+only reads), and a Bash command that calls the Bot API's sending methods itself with
+curl or wget (card 23724bf8; telegram_bash_send.py finds the calls and their chats).
+The decision is telegram_quiet_hours.send_decision(), shared with
 telegram_fallback_send.py, so the manual Bot API fallback cannot slip past it.
+
+The Bash branch (card 23724bf8), decided with the same send_decision(), no exception
+inside it: every send found in the command is judged by its chat, and one that holds
+stops the whole command. A chat the command does not spell out (a variable, a file,
+stdin) is "cannot say": held while any configured window holds, sent outside every
+window. The refusal names the held chat, or asks for the chat_id written out, and names
+the emergency path. A command without the Bot API host is never parsed (the cost of the
+branch on every other Bash call is one substring test). scripts/notify.sh stays outside
+on purpose, it is that emergency path: it sends only to the install owner's chat and
+takes no chat_id, which scripts/__tests__/telegram-quiet-gate-bash.test.py holds it to,
+and it never shows the Bot API host in the command that runs it.
 
 Decision (card 20e178fc):
   - STOP, not queue: exit 2, the reason and the way forward on stderr. Nothing is
@@ -61,6 +74,7 @@ GATED_TOOLS = {
     "mcp__plugin_telegram_telegram__react",
     "mcp__plugin_telegram_telegram__edit_message",
 }
+BOT_API_HOST = "api.telegram.org"
 
 HOOK = "telegram-quiet-gate"
 
@@ -81,26 +95,64 @@ def _report_defect(defect):
         pass  # the stderr line above already carries it
 
 
+def _sends(payload):
+    """[(what, chat)]: the sends this call would make, [] for a call that sends nothing."""
+    tool = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    if tool in GATED_TOOLS:
+        return [(tool.rsplit("__", 1)[-1], tool_input.get("chat_id"))]
+    command = tool_input.get("command")
+    if tool != "Bash" or not isinstance(command, str) or BOT_API_HOST not in command.lower():
+        return []
+    found = _load("telegram_bash_send").sends(command, payload.get("cwd"))
+    return [(method or "ismeretlen metodus", chat) for method, chat in found]
+
+
 def decide(payload, state_dir, now_epoch, seen_path):
     """(allow, stderr_text). Writes only the defect report and, for a real send, the marker;
     tests call it with their own clock and paths."""
-    tool = str(payload.get("tool_name") or "")
-    if tool not in GATED_TOOLS:
+    sends = _sends(payload)
+    if not sends:
         return True, ""
-    tool_input = payload.get("tool_input")
-    chat_id = tool_input.get("chat_id") if isinstance(tool_input, dict) else None
     quiet = _load("telegram_quiet_hours")
-    hold, why, defect = quiet.send_decision(state_dir, chat_id, now_epoch, seen_path)
+    held, defects = [], []
+    for what, chat in sends:
+        hold, why, defect = quiet.send_decision(state_dir, chat, now_epoch, seen_path)
+        if defect and defect not in defects:
+            defects.append(defect)
+        if hold:
+            held.append((what, chat, why))
     quiet.remember_configured(state_dir, seen_path, HOOK)
-    if defect:
+    for defect in defects:
         _report_defect(defect)
-    if not hold:
+    if not held:
         return True, ""
+    if payload.get("tool_name") == "Bash":
+        return False, _bash_refusal(held)
     return False, (
         "CSENDES-IDO KAPU: TILTVA (%s). Oka: %s. A csendes idoben semmilyen Telegram-uzenet nem megy ki "
         "ebbe a chatbe: valasz, reakcio es szerkesztes sem, akkor sem, ha a reply-guard valaszt kerne. "
         "Ne probald mas uton (Bash, Bot API, tartalek-kuldo). Ami most keletkezett, az a csendes ido "
-        "utan EGY kotegelt uzenetben megy." % (tool.rsplit("__", 1)[-1], why)
+        "utan EGY kotegelt uzenetben megy." % (held[0][0], held[0][2])
+    )
+
+
+def _bash_refusal(held):
+    named = "; ".join("%s -> %s" % (what, "ismeretlen cimzett" if chat is None else "chat %s" % chat)
+                      for what, chat, _why in held)
+    text = (
+        "CSENDES-IDO KAPU: TILTVA (Bash, Telegram Bot API: %s). Oka: %s. A csendes idoben semmilyen "
+        "Telegram-uzenet nem megy ki ebbe a chatbe, Bash-bol (curl, wget) sem. Ami most keletkezett, az a "
+        "csendes ido utan EGY kotegelt uzenetben megy." % (named, held[0][2])
+    )
+    if any(chat is None for _what, chat, _why in held):
+        text += (
+            " A kapu nem tudja kiolvasni, melyik chatbe megy (valtozo, fajl, stdin vagy hianyzo chat_id): ha "
+            "nem vedett chatbe kuldesz, ird ki a chat_id-t literalisan a parancsba, es a kapu el tudja donteni."
+        )
+    return text + (
+        " Veszhelyzetben (eles kieses, adatvesztes) a tulajdonosi csevegesbe a vesz-ut megy: "
+        "bash scripts/notify.sh \"<uzenet>\" (chat_id-t nem fogad)."
     )
 
 

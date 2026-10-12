@@ -30,6 +30,8 @@ WHAT IT PINS
     the three tools and not download_attachment, inside the card 723bbb70 fail-closed
     tail: run through bash, the intact gate's decision is unchanged and a gate file
     with a syntax error blocks (rc 2), where the raw call lets it through (rc 1).
+    (The same matcher also covers Bash since card 23724bf8: the Bash branch is pinned
+    in telegram-quiet-gate-bash.test.py.)
 
 NEGATIVE CONTROL, IN THIS FILE
   The gate is copied with its decision cut out (the send_decision call replaced by a
@@ -330,9 +332,9 @@ check(raw_rc == 1, "negative control: the raw call on the same broken file exits
 
 # 7. NEGATIVE CONTROL: the same in-window probe on a copy with the decision cut out ----------------
 src = open(GATE, encoding="utf-8").read()
-marker = '    hold, why, defect = quiet.send_decision(state_dir, chat_id, now_epoch, seen_path)\n'
+marker = '        hold, why, defect = quiet.send_decision(state_dir, chat, now_epoch, seen_path)\n'
 check(src.count(marker) == 1, "negative control: the decision marker is found exactly once in the gate")
-cut = src.replace(marker, '    hold, why, defect = False, "", None\n')
+cut = src.replace(marker, '        hold, why, defect = False, "", None\n')
 check(cut != src and "send_decision" not in cut.split("def decide", 1)[1], "negative control: the cut removed the decision")
 rc, err = run_gate(install({PROTECTED: around_now(-60, 60)}, gate_src=cut), call(TOOL + "reply"))
 check(rc == 0, "negative control: without the decision the in-window reply goes through (the probe above measures the gate)")
