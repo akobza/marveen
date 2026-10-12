@@ -24,6 +24,7 @@ import { runLogRotationSweep, LOG_ROTATION_SWEEP_MS } from './web/log-rotation.j
 import { sweepScheduledRunSnapshots } from './web/scheduled-run-snapshot.js'
 import { renameSharedCredentialsIfSafe, fleetTokenBootPass } from './web/claude-credentials-guard.js'
 import { startWebServer } from './web.js'
+import { scheduleCpuProfileWindow, CPU_PROFILE_ENV } from './web/cpu-profile-window.js'
 import { endAllDetachedGroups } from './web/detached-groups.js'
 import { logger } from './logger.js'
 import { startInviteMonitor, stopInviteMonitor } from './web/channel-invites.js'
@@ -616,6 +617,9 @@ async function main(): Promise<void> {
 
   // Web dashboard
   webServer = startWebServer(WEB_PORT)
+
+  // A one-off CPU profile window, only when MARVEEN_CPU_PROFILE_WINDOW is set (card ea6f9b07).
+  scheduleCpuProfileWindow(process.env[CPU_PROFILE_ENV], join(STORE_DIR, 'cpu-profiles'))
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')
