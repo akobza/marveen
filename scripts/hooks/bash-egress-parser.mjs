@@ -548,9 +548,9 @@ function argAt(orig, masked, pos) {
   return id ? { ident: id[1], next: k + id[1].length, tuple } : null
 }
 // Every EXTERNAL destination host of the network calls in a code body (unsorted, unique).
-export function codeDestinations(body, lang) {
+export function codeDestinations(body, lang, mask = null) {
   const orig = String(body ?? '')
-  const masked = maskCode(orig, lang)
+  const masked = mask ?? maskCode(orig, lang)
   if (masked.length !== orig.length) return []
   const bound = new Map()
   for (const m of masked.matchAll(BIND)) {
@@ -581,6 +581,248 @@ export function codeDestinations(body, lang) {
   }
   return [...hosts]
 }
+// --- (f) WHAT A PYTHON HEREDOC BODY RUNS BESIDES ITS OWN CALLS (95800e1d (3)) ---
+// The destination reading (d) finds a network call in the CODE and reads where it goes. A Python heredoc body can run
+// code the reading does not see as code: a string it hands to exec / eval / compile (or __import__ / import_module /
+// getattr), a fullwidth name (Python reads identifiers as NFKC), an f-string's braces (they run), a file it writes and
+// then runs, imports or loads, and a command line it starts (subprocess, os.system / popen / exec*, runpy). This section
+// reads those as what they are: the string as Python code (judged by the same rules), the command line by classify
+// itself, with the files this body writes visible to it. A string the scan cannot read to its end is not vouched for:
+// a network primitive or client named anywhere AND an external URL anywhere denies (fail-closed, as the upstream does).
+// Why not the upstream's "a body that CAN run a string is judged as text": measured on the fleet's Bash corpus
+// (543 563 commands), that reading denied 11 sub-agent commands that pass today, each an external URL carried as DATA
+// next to a subprocess, importlib or exec used for local work (a comment posted to the dashboard through a localhost
+// curl, a hook test's fixture list, a docker exec). Not judged (allowed, as before): a dynamic name lookup that is never
+// called (`m = __import__('x'); u = "https://..."`), a written file that is not code, a command line or path that is not
+// a literal.
+const PY_STRING_PREFIX = /^(?:[rR][bBfF]?|[bB][rR]?|[uU]|[fF][rR]?)$/
+// The program with its string literals and comments blanked (length-preserving, newlines kept), or null when the scan
+// cannot vouch for where a string ends. An f-string's TEXT is blanked like any literal, its {expressions} are code
+// (they run), with their own strings blanked; `{{` / `}}` are text. An f-string whose braces do not balance is null.
+export function pythonCodeOnly(text) {
+  const out = []
+  const n = text.length
+  let i = 0
+  while (i < n) {
+    const c = text[i]
+    if (c === '#') {
+      let j = text.indexOf('\n', i)
+      if (j === -1) j = n
+      out.push(' '.repeat(j - i)); i = j; continue
+    }
+    if (c !== '"' && c !== "'") { out.push(c); i++; continue }
+    let k = i
+    while (k > 0 && /[A-Za-z0-9_]/.test(text[k - 1])) k--
+    const word = text.slice(k, i)
+    if (word !== '' && !PY_STRING_PREFIX.test(word)) return null // return"x", ab"x": not a plain literal
+    const triple = text.startsWith(c.repeat(3), i)
+    const delim = triple ? c.repeat(3) : c
+    let j = i + delim.length
+    let closed = false
+    while (j < n) {
+      if (text[j] === '\\') { j += 2; continue }
+      if (text.startsWith(delim, j)) { closed = true; break }
+      if (!triple && text[j] === '\n') return null // an unterminated one-line string
+      j++
+    }
+    if (!closed) return null
+    const body = text.slice(i + delim.length, j)
+    if (/[fF]/.test(word)) {
+      const masked = fstringMask(body)
+      if (masked === null) return null
+      out.push(delim + masked + delim)
+    } else {
+      out.push(delim + body.replace(/[^\n]/g, ' ') + delim)
+    }
+    i = j + delim.length
+  }
+  return out.join('')
+}
+// An f-string body with its text blanked and its {expressions} kept (their own string contents blanked), or null when
+// the braces do not balance or an expression's string does not end inside it.
+function fstringMask(body) {
+  let out = ''
+  let i = 0
+  while (i < body.length) {
+    const c = body[i]
+    if ((c === '{' || c === '}') && body[i + 1] === c) { out += '  '; i += 2; continue }
+    if (c === '}') return null
+    if (c !== '{') { out += c === '\n' ? '\n' : ' '; i++; continue }
+    let depth = 0
+    let j = i
+    for (; j < body.length; j++) {
+      const d = body[j]
+      if (d === "'" || d === '"') {
+        const e = body.indexOf(d, j + 1)
+        if (e === -1) return null
+        out += d + body.slice(j + 1, e).replace(/[^\n]/g, ' ') + d
+        j = e
+        continue
+      }
+      if (d === '{' || d === '(' || d === '[') depth++
+      else if (d === '}' || d === ')' || d === ']') depth--
+      out += d
+      if (depth === 0) break
+    }
+    if (depth !== 0) return null
+    i = j + 1
+  }
+  return out
+}
+// The common escapes of a non-raw literal, enough to read the code a string holds.
+function pyUnescape(s) {
+  return s.replace(/\\(['"\\ntr])/g, (all, c) => ({ n: '\n', t: '\t', r: '\r' })[c] ?? c)
+}
+// The plain string literal (no f-string) that starts at `pos` (after blanks) of the code mask: { value, end }, or null.
+function pyLiteralAt(text, mask, pos) {
+  const m = /^[ \t]*([rRbBuU]{0,2})(['"])/.exec(mask.slice(pos, pos + 12))
+  if (!m) return null
+  const q = pos + m[0].length - 1
+  const close = mask.startsWith(m[2].repeat(3), q) ? m[2].repeat(3) : m[2]
+  const end = mask.indexOf(close, q + close.length)
+  if (end === -1) return null
+  const raw = text.slice(q + close.length, end)
+  return { value: /[rR]/.test(m[1]) ? raw : pyUnescape(raw), end: end + close.length }
+}
+// The index of the bracket that closes the one at `open` in the code mask (strings are blank there), or -1.
+function pyClose(mask, open) {
+  let depth = 0
+  for (let j = open; j < mask.length; j++) {
+    const d = mask[j]
+    if (d === '(' || d === '[' || d === '{') depth++
+    else if (d === ')' || d === ']' || d === '}') { depth--; if (depth === 0) return j }
+  }
+  return -1
+}
+// The literal arguments of the call whose `(` is at `open`: an array with one entry per top-level argument, a plain
+// string value or a list of them, or null for any other argument.
+function pyArgs(text, mask, open) {
+  const close = pyClose(mask, open)
+  if (close === -1) return []
+  const out = []
+  let k = open + 1
+  while (k < close) {
+    let e = k
+    let depth = 0
+    for (; e < close; e++) {
+      const d = mask[e]
+      if (d === '(' || d === '[' || d === '{') depth++
+      else if (d === ')' || d === ']' || d === '}') depth--
+      else if (d === ',' && depth === 0) break
+    }
+    const seg = mask.slice(k, e)
+    const lit = pyLiteralAt(text, mask, k)
+    if (lit && /^\s*$/.test(mask.slice(lit.end, e))) out.push(lit.value)
+    else if (/^\s*\[/.test(seg)) {
+      const lb = k + seg.indexOf('[')
+      const rb = pyClose(mask, lb)
+      const items = rb === -1 ? null : pyArgs(text, mask.slice(0, lb) + '(' + mask.slice(lb + 1, rb) + ')' + mask.slice(rb + 1), lb)
+      out.push(items && items.length && items.every((x) => typeof x === 'string') ? items : null)
+    } else out.push(/^\s*[A-Za-z_]\w*\s*=/.test(seg) ? { kw: seg.trim() } : null)
+    k = e + 1
+  }
+  return out
+}
+const shQuote = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`)
+const NET_WORDS_PY = (text) => NET_PRIMITIVE.test(text.replace(/\burllib\.parse\b/g, 'URLPARSE')) || NET_CLIENT_WORD.test(text)
+// What a Python heredoc body runs besides its own calls: { hosts } the external destinations found in code the reading
+// (d) does not see as code, { runs } the command lines it starts (for classify), { written } [path, content] of the
+// files it writes. `depth` bounds the strings-in-strings recursion.
+export function pythonBodyPlan(body, depth = 0) {
+  const text = String(body ?? '').normalize('NFKC')
+  const plan = { hosts: [], runs: [], written: [] }
+  const mask = pythonCodeOnly(text)
+  if (mask === null || mask.length !== text.length) {
+    if (NET_WORDS_PY(text)) plan.hosts = [...new Set([...text.matchAll(URL_RE)].map((m) => m[0]).filter(isExternal).map(hostOf))]
+    return plan
+  }
+  const hosts = new Set(codeDestinations(text, 'py', mask))
+  // names bound to a plain string literal (the last binding wins)
+  const bound = new Map()
+  for (const m of mask.matchAll(/(?:^|[\n;])[ \t]*([A-Za-z_]\w*)[ \t]*=(?!=)/g)) {
+    const lit = pyLiteralAt(text, mask, m.index + m[0].length)
+    if (lit) bound.set(m[1], lit.value)
+  }
+  const firstArg = (open) => {
+    const args = pyArgs(text, mask, open)
+    if (typeof args[0] === 'string') return args[0]
+    const id = /^\s*([A-Za-z_]\w*)\s*[,)]/.exec(mask.slice(open + 1, open + 80))
+    return id ? (bound.get(id[1]) ?? null) : null
+  }
+  // the files this body writes: open(P, 'w'...).write(S), `with open(P, 'w') as F:` ... F.write(S), Path(P).write_text(S)
+  const files = new Map()
+  const addWrite = (p, s) => { if (typeof p === 'string' && typeof s === 'string') files.set(p, (files.get(p) ?? '') + s) }
+  for (const m of mask.matchAll(/(?<![\w.])open\s*\(/g)) {
+    const open = m.index + m[0].length - 1
+    const args = pyArgs(text, mask, open)
+    if (typeof args[0] !== 'string' || !/[wax]/.test(typeof args[1] === 'string' ? args[1] : '')) continue
+    const close = pyClose(mask, open)
+    const chained = /^\s*\.\s*write\s*\(/.exec(mask.slice(close + 1, close + 40))
+    if (chained) addWrite(args[0], firstArg(close + chained[0].length))
+    const asName = /^\s*as\s+([A-Za-z_]\w*)\s*:/.exec(mask.slice(close + 1, close + 60))
+    if (asName) for (const w of mask.matchAll(new RegExp(`\\b${asName[1]}\\s*\\.\\s*write\\s*\\(`, 'g'))) addWrite(args[0], firstArg(w.index + w[0].length - 1))
+  }
+  for (const m of mask.matchAll(/\bPath\s*\(/g)) {
+    const open = m.index + m[0].length - 1
+    const p = firstArg(open)
+    const close = pyClose(mask, open)
+    const wt = /^\s*\.\s*write_text\s*\(/.exec(mask.slice(close + 1, close + 40))
+    if (p && wt) addWrite(p, firstArg(close + wt[0].length))
+  }
+  plan.written = [...files]
+  const writtenModule = (name) => [...files.keys()].find((p) => p.split('/').pop() === `${name}.py`)
+  // strings handed to the code runners: judged as Python, by these same rules
+  if (depth < 3) {
+    for (const m of mask.matchAll(/(?<![\w.])(?:exec|eval|compile|__import__|getattr)\s*\(|\bimport_module\s*\(/g)) {
+      const src = firstArg(m.index + m[0].length - 1)
+      if (src === null) continue
+      const inner = pythonBodyPlan(src, depth + 1)
+      for (const h of inner.hosts) hosts.add(h)
+      plan.runs.push(...inner.runs)
+      plan.written.push(...inner.written)
+    }
+  }
+  // the command lines it starts
+  const procAlias = new Set(['subprocess'])
+  for (const m of mask.matchAll(/\bimport\s+[^\n;]*?\bsubprocess\s+as\s+([A-Za-z_]\w*)/g)) procAlias.add(m[1])
+  const fromProc = /\bfrom\s+subprocess\s+import\b/.test(mask)
+  const procRe = new RegExp(`(?:\\b(?:${[...procAlias].join('|')})\\s*\\.\\s*${fromProc ? '|(?<![\\w.])' : ''})(run|call|check_call|check_output|Popen|getoutput|getstatusoutput)\\s*\\(`, 'g')
+  const asLine = (a) => (typeof a === 'string' ? a : Array.isArray(a) ? a.map(shQuote).join(' ') : null)
+  for (const m of mask.matchAll(procRe)) {
+    const line = asLine(pyArgs(text, mask, m.index + m[0].length - 1)[0])
+    if (line) plan.runs.push(line)
+  }
+  for (const m of mask.matchAll(/\bos\s*\.\s*(system|popen)\s*\(/g)) {
+    const line = firstArg(m.index + m[0].length - 1)
+    if (line) plan.runs.push(line)
+  }
+  for (const m of mask.matchAll(/\bos\s*\.\s*(exec[lv]p?e?|spawn[lv]p?e?)\s*\(/g)) {
+    const args = pyArgs(text, mask, m.index + m[0].length - 1)
+    const a = m[1].startsWith('spawn') ? args.slice(1) : args // spawn*(mode, path, ...)
+    const path = typeof a[0] === 'string' ? a[0] : null
+    const rest = Array.isArray(a[1]) ? a[1].slice(1) : a.slice(2).filter((x) => typeof x === 'string')
+    if (path) plan.runs.push([path, ...rest].map(shQuote).join(' '))
+  }
+  for (const m of mask.matchAll(/\b(?:run_path|spec_from_file_location|SourceFileLoader)\s*\(/g)) {
+    const args = pyArgs(text, mask, m.index + m[0].length - 1)
+    const p = m[0].startsWith('run_path') ? args[0] : args[1]
+    if (typeof p === 'string') plan.runs.push(`python3 ${shQuote(p)}`)
+  }
+  // a module this body wrote, imported
+  for (const m of mask.matchAll(/(?:^|[\n;:])[ \t]*(?:import\s+([\w., \t]+)|from\s+([\w.]+)\s+import\b)/g)) {
+    for (const name of (m[1] ?? m[2]).split(',').map((x) => x.trim().split(/\s+/)[0].split('.')[0]).filter(Boolean)) {
+      const p = writtenModule(name)
+      if (p) plan.runs.push(`python3 ${shQuote(p)}`)
+    }
+  }
+  for (const m of mask.matchAll(/\bimport_module\s*\(/g)) {
+    const name = firstArg(m.index + m[0].length - 1)
+    const p = name ? writtenModule(name.split('.')[0]) : null
+    if (p) plan.runs.push(`python3 ${shQuote(p)}`)
+  }
+  plan.hosts = [...hosts]
+  return plan
+}
 // Heredoc bodies of the ORIGINAL text, with the offset of their opener. The opener is found in the
 // MASKED text (a `<<` inside quotes is not one; `<<<` is a here-string, not a heredoc).
 function heredocBodies(orig, masked) {
@@ -593,7 +835,7 @@ function heredocBodies(orig, masked) {
     const nl = orig.indexOf('\n', m.index + m[0].length)
     if (nl === -1) continue
     const rel = new RegExp(`^[ \\t]*${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*$`, 'm').exec(orig.slice(nl + 1))
-    if (rel) out.push({ at: m.index, body: orig.slice(nl + 1, nl + 1 + rel.index), start: nl + 1, end: nl + 1 + rel.index + rel[0].length })
+    if (rel) out.push({ at: m.index, body: orig.slice(nl + 1, nl + 1 + rel.index), start: nl + 1, end: nl + 1 + rel.index + rel[0].length, quoted: m[3] === undefined })
   }
   return out
 }
@@ -931,7 +1173,9 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
   if (!parsed) return { deny: false, reason: 'unparseable', hosts: [] }
   const env = { ...(ctx.env ?? {}), ...collectAssignments(orig, masked) }
   const loops = collectLoops(orig, masked, env)
-  const written = new Map() // absolute path -> the heredoc `cat > PATH` wrote earlier in this command
+  // absolute path -> the heredoc `cat > PATH` wrote earlier in this command (or, for a command line a Python heredoc
+  // starts, a file that body writes: ctx.written, see (f))
+  const written = new Map(ctx.written ?? [])
   let cwd = ctx.cwd ?? null
   const absPath = (p) => (/[$`*?]/.test(p) ? null : isAbsolute(p) ? p : cwd ? resolve(cwd, p) : null)
   // The program an interpreter reads from a pipe: the upstream heredoc, the file it cats, or the text it prints;
@@ -1029,10 +1273,31 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
           if (r.deny) return { deny: true, reason: `${kind}-${r.reason}`, hosts: r.hosts }
         }
       } else if (body !== null && lang) {
-        const { hosts: own, items } = bodyDestinations(body, lang, baseDir)
-        const hosts = [...new Set([...own, ...(netCapable(items) ? envUrlDestinations(body, realEnv) : [])])]
-          .filter((h) => !vendorHosts.has(h) && !hostInDomains(h, vendorDomains))
-        if (hosts.length) return { deny: true, reason: `${kind}-external`, hosts }
+        // An unquoted-tag heredoc is expanded by the shell before the interpreter reads it: a loop variable or an
+        // assignment of this command is its value there (`for u in <url>; do python3 - <<EOF ... '$u' ...`). The
+        // body as written is judged too, so the expansion can only add a deny.
+        const expanded = kind === 'heredoc' && !here.quoted ? loopVariants(body, env, loops) : []
+        if (expanded === null && netCapable([{ body, lang }])) return { deny: true, reason: `${kind}-loop-unbounded`, hosts: [] }
+        for (const b of [body, ...(expanded ?? [])]) {
+          const { hosts: own, items } = bodyDestinations(b, lang, baseDir)
+          const hosts = [...new Set([...own, ...(netCapable(items) ? envUrlDestinations(b, realEnv) : [])])]
+            .filter((h) => !vendorHosts.has(h) && !hostInDomains(h, vendorDomains))
+          if (hosts.length) return { deny: true, reason: `${kind}-external`, hosts }
+          // (f): what a Python heredoc body runs besides its own calls
+          if (kind === 'heredoc' && lang === 'py') {
+            const plan = pythonBodyPlan(b)
+            const hidden = plan.hosts.filter((h) => !vendorHosts.has(h) && !hostInDomains(h, vendorDomains))
+            if (hidden.length) return { deny: true, reason: 'heredoc-hidden-external', hosts: hidden }
+            if (depth < 4 && plan.runs.length) {
+              const seen = new Map(written)
+              for (const [p, content] of plan.written) { const abs = absPath(p); if (abs) seen.set(abs, content) }
+              for (const run of plan.runs) {
+                const r = classify(run, depth + 1, vendorHosts, vendorDomains, { cwd, env: realEnv, written: seen })
+                if (r.deny) return { deny: true, reason: `heredoc-run-${r.reason}`, hosts: r.hosts }
+              }
+            }
+          }
+        }
       }
     }
     for (const text of [plain, ...(variants ?? [])]) {
@@ -1075,11 +1340,62 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
 // 2026-10-12, 543 563 commands: 0 new denies): every upstream deny, except 'heredoc-external' on a python or node heredoc,
 // whose body this layer reads itself. There the upstream rule also denies a localhost call that carries an external URL as
 // data (77 false denies on the same traffic: the google-dwd helper path, dashboard posts, own services).
+// WHICH heredoc gave that deny (95800e1d (3), test finding (1)): matching the exception on the whole command text let a
+// perl or ruby heredoc's external call through whenever the same command also held a harmless python or node heredoc, or
+// only the TEXT `python3 - <<` (an echo, a comment). So the upstream is asked again, on the command with exactly the
+// python- and node-read heredoc bodies blanked (found with this layer's own parse, so a quoted or commented opener is no
+// heredoc): if it still denies, the deny came from another body and is taken; if not, it came from a python or node body,
+// which this layer reads itself, and is not. No such body: taken. A re-ask that throws: taken (fail-closed). A command
+// this layer cannot parse, or a caller without `again`: the text rule below, as before.
 const PYNODE_HEREDOC = /\b(?:python3?(?:\.\d+)?|node)\b[^\n|;&<]*(?<!<)<<(?!<)/
-export function upstreamVerdictApplies(command, head) {
+export function upstreamVerdictApplies(command, head, again = null) {
   if (!head?.deny) return false
   if (head.reason !== 'heredoc-external') return true
-  return !PYNODE_HEREDOC.test(String(command ?? ''))
+  const raw = String(command ?? '')
+  const blanked = typeof again === 'function' ? withoutPyNodeHeredocBodies(raw) : null
+  if (blanked === null) return !PYNODE_HEREDOC.test(raw)
+  if (blanked === raw) return true
+  try { return again(blanked)?.deny === true } catch { return true }
+}
+// The command with the bodies of the heredocs a python or node interpreter reads blanked (newlines and terminator lines
+// kept), or null when this layer cannot parse it. The offsets are this layer's (continuation lines joined, substitutions
+// lifted, both length-aware), mapped back to the raw text.
+export function withoutPyNodeHeredocBodies(command) {
+  const raw = String(command ?? '')
+  let norm = ''
+  const at = []
+  for (let i = 0; i < raw.length; i++) {
+    const m = /^\\\r?\n/.exec(raw.slice(i, i + 3))
+    if (m) { norm += ' '; at.push(i); i += m[0].length - 1; continue }
+    norm += raw[i]; at.push(i)
+  }
+  at.push(raw.length)
+  const { stripped: orig } = liftSubstitutions(norm)
+  const masked = maskInertLiterals(orig)
+  if (masked === null || masked.length !== orig.length) return null
+  const docs = heredocBodies(orig, masked)
+  const liveText = blankRanges(orig, [...docs.map((d) => [d.start, d.end]), ...caseRanges(masked)])
+  const env = collectAssignments(orig, masked)
+  const out = raw.split('')
+  for (const [a, b] of spans(masked)) {
+    const here = docs.find((d) => d.at >= a && d.at < b)
+    if (!here) continue
+    const av = shellWords(expand(liveText.slice(a, b), env))
+    const un = unwrapLaunchers(av)
+    let word = (av[un.at] ?? '').split('/').pop()
+    let rest = av.slice(un.at + 1)
+    const run = unwrapRunner(word, rest)
+    if (run) { word = run.word; rest = run.rest }
+    if (word === 'npx' || word === 'bunx') {
+      let k = 0
+      while (k < rest.length && rest[k].startsWith('-')) k++
+      if (SCRIPT_INTERPRETER.test((rest[k] ?? '').split('/').pop())) { word = rest[k].split('/').pop(); rest = rest.slice(k + 1) }
+    }
+    const lang = langOf(word)
+    if ((lang !== 'py' && lang !== 'js') || !scriptOf(rest, word)?.stdin) continue
+    for (let k = at[here.start]; k < at[here.start + here.body.length]; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' '
+  }
+  return out.join('')
 }
 
 const GATE_MSG =
@@ -1131,7 +1447,8 @@ if (isInvokedDirectly()) {
     }
     let h = null
     try { h = up.classify(payload?.tool_input?.command, 0, up.loadVendorHosts(), up.loadVendorDomains()) } catch (e) { internalErrorDenies('upstream', e) }
-    if (upstreamVerdictApplies(payload?.tool_input?.command, h)) r = { deny: true, reason: `upstream-${h.reason}`, hosts: h.hosts }
+    const again = (c) => up.classify(c, 0, up.loadVendorHosts(), up.loadVendorDomains())
+    if (upstreamVerdictApplies(payload?.tool_input?.command, h, again)) r = { deny: true, reason: `upstream-${h.reason}`, hosts: h.hosts }
   }
   if (r.deny) {
     try {
