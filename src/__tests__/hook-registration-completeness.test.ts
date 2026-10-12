@@ -72,6 +72,8 @@ const EXEMPT: Record<string, string> = {
     'shared library: the credential detector and state, imported by credential-gate.py and scripts/credential-gate-cli.py (CREDGATE1003); not itself a hook',
   'telegram_quiet_hours.py':
     'shared library: the per-chat quiet-hours window check, imported by telegram-reply-guard.py, telegram_progress.py, telegram_progress_clear.py and telegram_progress_watchdog.py; not itself a hook',
+  'telegram_bash_send.py':
+    'shared library: finds the Bot API sends (curl, wget) written into a Bash command and their chats, imported by telegram-quiet-gate.py (card 23724bf8); not itself a hook',
   'memory-save.sh':
     'legacy: referenced only by a historical rebuild prompt, wired nowhere; kept pending a maintainer decision to remove it',
   'telegram-ack.py':

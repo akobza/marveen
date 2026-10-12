@@ -15,8 +15,9 @@ import { MAIN_AGENT_ID } from '../config.js'
 // Card 20e178fc: the quiet-hours SEND gate (scripts/hooks/telegram-quiet-gate.py)
 // must sit on every Telegram tool that writes into a chat, for the main agent (its
 // committed project settings) and for every sub-agent (the scaffold), like the copy
-// gate. What the gate DECIDES is measured in scripts/__tests__/telegram-quiet-gate.test.py;
-// here the wiring.
+// gate. Card 23724bf8: and on Bash, where a Bot API send can be written into the
+// command. What the gate DECIDES is measured in scripts/__tests__/telegram-quiet-gate.test.py
+// and telegram-quiet-gate-bash.test.py; here the wiring.
 
 const TOOL = 'mcp__plugin_telegram_telegram__'
 const WRITES = ['reply', 'react', 'edit_message'].map((t) => TOOL + t)
@@ -46,8 +47,9 @@ describe('telegram quiet gate wiring (card 20e178fc)', () => {
       expect(agentGetsTelegramQuietGate(n)).toBe(true)
     }
   })
-  it('the matcher full-matches the three writing tools and leaves download_attachment alone', () => {
+  it('the matcher full-matches the three writing tools and Bash, and leaves download_attachment alone', () => {
     for (const t of WRITES) expect(fullMatch(TELEGRAM_QUIET_GATE_MATCHER, t)).toBe(true)
+    expect(fullMatch(TELEGRAM_QUIET_GATE_MATCHER, 'Bash')).toBe(true)
     expect(fullMatch(TELEGRAM_QUIET_GATE_MATCHER, TOOL + 'download_attachment')).toBe(false)
   })
   it('wires the gate under that matcher, inside the card 723bbb70 fail-closed tail', () => {
@@ -116,7 +118,9 @@ describe("the main agent's entry, run as written on a disposable copy", () => {
   it('intact, it decides as the bare call does, an allow and a block among the inputs', () => {
     const command = String(mainHook().command)
     const inputs = [
-      JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'true' } }), // not a gated tool
+      JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'true' } }), // no Bot API call in it
+      // a Bot API send in Bash: no config and no marker, so no quiet hours
+      JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'curl -s https://api.telegram.org/bot$T/sendMessage -d chat_id=1' } }),
       reply, // no config and no marker: no quiet hours
       'not json', // the gate's own block
     ]
@@ -127,7 +131,7 @@ describe("the main agent's entry, run as written on a disposable copy", () => {
       expect(b.stderr).not.toContain(GATE_FAIL_CLOSED_TAG)
       return b.rc
     })
-    expect(rcs).toEqual([0, 0, 2])
+    expect(rcs).toEqual([0, 0, 0, 2])
   }, 60_000)
 
   it('a syntax error in the gate file blocks (2), where the bare call exits 1 and the send would go', () => {
