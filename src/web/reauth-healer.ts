@@ -4,7 +4,7 @@ import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, PROJECT_ROOT, RESPAWN_ENABLED, APP_TZ } from '../config.js'
 import { resolveFromPath } from '../platform.js'
 import { listAgentNames } from './agent-config.js'
-import { isAgentRunning, capturePane, startAgentProcess } from './agent-process.js'
+import { isAgentRunning, capturePane, startAgentProcess, invalidateTmuxSessionList } from './agent-process.js'
 import { isRestartInFlight } from './restart-lock.js'
 import { quarantineFleetTokenIfDead } from './claude-credentials-guard.js'
 import { resolveAgentSession } from './channel-mcp-reconnect.js'
@@ -361,7 +361,7 @@ async function restartFirstRunGatedAgent(name: string, session: string): Promise
     return
   }
   await new Promise<void>((resolve) => {
-    execFile(TMUX, ['kill-session', '-t', exactTmuxTarget(session)], { timeout: 5000 }, () => resolve())
+    execFile(TMUX, ['kill-session', '-t', exactTmuxTarget(session)], { timeout: 5000 }, () => { invalidateTmuxSessionList(); resolve() })
   })
   await sleep(1000)
   try {

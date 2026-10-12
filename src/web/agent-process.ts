@@ -1696,7 +1696,13 @@ function runTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opts: {
   // makes tmux emit `can't find session: agent-X` / `no server running`; without
   // this those leaked as ~450 bare (non-pino) lines into store/dashboard.log.
   // Callers that care read err.stderr via logger.warn({ err }).
-  execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), stdio: ['ignore', 'ignore', 'pipe'] })
+  try {
+    execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), stdio: ['ignore', 'ignore', 'pipe'] })
+  } finally {
+    // A failed kill-session can still have changed the list (the session died
+    // under it), so the shared answer is dropped either way.
+    if (SESSION_CHANGING_TMUX_COMMANDS.has(tmuxArgs[0])) invalidateTmuxSessionList()
+  }
 }
 
 function captureTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opts: { timeout?: number } = {}): string {
@@ -1707,30 +1713,82 @@ function captureTmux(target: string | null | TmuxTarget, tmuxArgs: string[], opt
   return execFileSync(inv.file, inv.args, { timeout: opts.timeout ?? (host ? 8000 : 3000), encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
+// ONE `tmux list-sessions` per tmux server per short window (card ea6f9b07).
+//
+// The answer of `list-sessions` covers the whole server, yet every run-state and
+// session-existence check used to fork its own copy: a monitor sweep over N agents
+// forked N identical children, and so did every poll of the agents list. The cost
+// is not tmux (that part is fast) but the fork of this large process: each child
+// blocks the event loop from the fork until its exec, and that window grows with
+// the parent's size and the machine's memory pressure (measured on a production
+// dashboard of ~0.9 GB RSS: up to 51.8 s for a single child, 631 s of such stalls
+// in a 12-hour window, list-sessions among the most frequent commands). Fewer
+// forks is the fix; an async spawn would still pay the same window.
+//
+// Keyed by the resolved target (remote host, OS user), so a per-user agent's own
+// tmux server keeps its own answer. A failed query is cached with its exit status
+// too: classifyRunStateFromExit needs the status, and a stopped per-user server
+// ("no server running") must not be re-forked for every agent of the sweep.
+// Every path that creates, kills or renames a session drops the cache (runTmux
+// above, and the modules that drive tmux directly import invalidateTmuxSessionList);
+// the start/stop guards read fresh. Anything else that changes the list (a
+// session that dies on its own) is seen at most SESSION_LIST_TTL_MS later.
+export const SESSION_LIST_TTL_MS = 2000
+const SESSION_CHANGING_TMUX_COMMANDS = new Set(['new-session', 'kill-session', 'kill-server', 'rename-session'])
+type SessionListEntry = { at: number; out: string } | { at: number; failedStatus: number | null | undefined }
+const sessionListCache = new Map<string, SessionListEntry>()
+
+export function invalidateTmuxSessionList(): void {
+  sessionListCache.clear()
+}
+
+function exitStatusOf(err: unknown): number | null | undefined {
+  return (err && typeof err === 'object' && 'status' in err)
+    ? (err as { status?: number | null }).status
+    : undefined
+}
+
+function listSessionsOutput(target: TmuxTarget, fresh: boolean): string {
+  const resolved = resolveTarget(target, ['list-sessions'])
+  const key = `${resolved.host ?? ''}\u0000${resolved.runAsUser ?? ''}`
+  const now = Date.now()
+  const hit = fresh ? undefined : sessionListCache.get(key)
+  if (hit && now - hit.at < SESSION_LIST_TTL_MS) {
+    if ('out' in hit) return hit.out
+    throw Object.assign(new Error('tmux list-sessions failed (shared answer)'), { status: hit.failedStatus })
+  }
+  try {
+    const out = captureTmux(target, ['list-sessions', '-F', '#{session_name}'])
+    sessionListCache.set(key, { at: now, out })
+    return out
+  } catch (err) {
+    sessionListCache.set(key, { at: now, failedStatus: exitStatusOf(err) })
+    throw err
+  }
+}
+
 // Tri-state run state. For a remote agent a failed list-sessions query is
 // 'unreachable' (the session is almost certainly still alive on the laptop --
 // an SSH drop must never read as 'stopped', which would trigger a wrong
 // auto-restart or a duplicate start). See classifyRunState.
-export function agentRunState(name: string): AgentRunState {
+// `fresh` bypasses the shared list-sessions answer: the start/stop guards use it.
+export function agentRunState(name: string, opts: { fresh?: boolean } = {}): AgentRunState {
   const target = agentTmuxTarget(name)
   const host = target.host
   try {
-    const out = captureTmux(target, ['list-sessions', '-F', '#{session_name}'])
+    const out = listSessionsOutput(target, opts.fresh === true)
     return classifyRunState(out, agentSessionName(name), host != null)
   } catch (err) {
     // tmux list-sessions exits non-zero ("no server running") when there are
     // zero sessions -- on a REACHABLE remote that means 'stopped', not
     // 'unreachable'. Only a true ssh transport failure (exit 255 / killed)
     // is unreachable. The exit status carries that distinction.
-    const status = (err && typeof err === 'object' && 'status' in err)
-      ? (err as { status?: number | null }).status
-      : undefined
-    return classifyRunStateFromExit(status, host != null)
+    return classifyRunStateFromExit(exitStatusOf(err), host != null)
   }
 }
 
-export function isAgentRunning(name: string): boolean {
-  return agentRunState(name) === 'running'
+export function isAgentRunning(name: string, opts: { fresh?: boolean } = {}): boolean {
+  return agentRunState(name, opts) === 'running'
 }
 
 // Host-aware "does this tmux session exist" check, shared by the message router
@@ -1748,7 +1806,7 @@ export function sessionExistsOnHost(host: string | null, session: string): boole
     const target: TmuxTarget = host
       ? { host }
       : { host: null, runAsUser: sessionRunAsUserMap().get(session) ?? null }
-    return sessionInList(captureTmux(target, ['list-sessions', '-F', '#{session_name}']), session)
+    return sessionInList(listSessionsOutput(target, false), session)
   } catch {
     return false
   }
@@ -1791,7 +1849,7 @@ function startRemoteAgentProcess(
   workdir: string,
   opts: { fresh?: boolean },
 ): { ok: boolean; error?: string } {
-  const state = agentRunState(name)
+  const state = agentRunState(name, { fresh: true })
   if (state === 'running') return { ok: false, error: 'Agent is already running' }
   if (state === 'unreachable') {
     return { ok: false, error: `Remote host '${host}' unreachable -- refusing to start (cannot confirm state)` }
@@ -1921,7 +1979,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   ensureSharedClaudeOnboarded()
 
 
-  if (isAgentRunning(name)) return { ok: false, error: 'Agent is already running' }
+  if (isAgentRunning(name, { fresh: true })) return { ok: false, error: 'Agent is already running' }
 
   const agentProvider = resolveAgentProvider(name)
   const provider = getProvider(agentProvider)
@@ -2811,7 +2869,7 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
 
 export async function stopAgentProcess(name: string): Promise<{ ok: boolean; error?: string }> {
   const session = agentSessionName(name)
-  if (!isAgentRunning(name)) return { ok: false, error: 'Agent is not running' }
+  if (!isAgentRunning(name, { fresh: true })) return { ok: false, error: 'Agent is not running' }
 
   const target = agentTmuxTarget(name)
   const host = target.host
@@ -2876,7 +2934,7 @@ export async function restartAgentProcess(
     // guard's resume prompt); a wake still owed by an earlier --continue
     // restart must not land in that session as a second instruction.
     if (opts.fresh) cancelRestartWake(name)
-    if (isAgentRunning(name)) {
+    if (isAgentRunning(name, { fresh: true })) {
       const stopResult = await stopAgentProcess(name)
       if (!stopResult.ok) return { ok: false, error: stopResult.error || 'Failed to stop running agent before restart' }
     }

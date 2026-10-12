@@ -8,7 +8,7 @@ import {
 import { resolveFromPath } from '../../platform.js'
 import { APP_TZ } from '../../config.js'
 import { logger } from '../../logger.js'
-import { fleetVenvPathPrefix } from '../agent-process.js'
+import { fleetVenvPathPrefix, invalidateTmuxSessionList } from '../agent-process.js'
 import { readBody, json } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 import { exactTmuxTarget } from '../../tmux-target.js'
@@ -44,7 +44,9 @@ function captureSession(session: string): string | null {
 function killSession(session: string): void {
   try {
     execFileSync(TMUX, ['kill-session', '-t', exactTmuxTarget(session)], { timeout: 3000 })
-  } catch { /* already dead */ }
+  } catch { /* already dead */ } finally {
+    invalidateTmuxSessionList()
+  }
 }
 
 export function spawnBackgroundTask(agentId: string, prompt: string): BackgroundTask | { error: string } {
@@ -74,6 +76,8 @@ export function spawnBackgroundTask(agentId: string, prompt: string): Background
     logger.error({ err, id, session }, 'Failed to spawn background task tmux session')
     finishBackgroundTask(id, 'failed', '(spawn failed)')
     return { error: 'Nem sikerült elindítani a háttérfeladatot' }
+  } finally {
+    invalidateTmuxSessionList()
   }
 
   logger.info({ id, agentId, session, prompt: prompt.slice(0, 100) }, 'Background task started')

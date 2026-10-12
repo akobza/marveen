@@ -245,8 +245,10 @@ itt írhatod meg.
 
 // Short-TTL caches so the synchronous, frequently-polled status endpoints
 // (`/api/agents` on load, `/api/agents/activity` every 3s) don't issue a fresh
-// blocking ssh call per remote agent per request. Only remote agents are cached;
-// local agents fetch fresh (sub-ms tmux). See remote-status-cache.ts.
+// blocking ssh call per remote agent per request. Only remote agents are cached
+// here; a local agent's run state comes from the shared list-sessions answer in
+// agent-process.ts (one fork per tmux server per short window, card ea6f9b07).
+// See remote-status-cache.ts.
 const remoteRunStateCache = new RemoteStatusCache<AgentRunState>(5000)
 const remotePaneCache = new RemoteStatusCache<string | null>(3000)
 

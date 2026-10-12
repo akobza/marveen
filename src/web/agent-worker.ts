@@ -15,6 +15,7 @@ import {
   isSessionReadyForPrompt,
   sendPromptToSession,
   sessionExistsOnHost,
+  invalidateTmuxSessionList,
   hasFleetOauthToken,
   FLEET_OAUTH_TOKEN_PATH,
   buildCustomProviderLaunchEnv,
@@ -634,7 +635,11 @@ function startWorkerSessionFor(ctx: WorkerCtx): void {
     customEnvPrefix +
     `cd ${shArg(ctx.home)} && ` +
     `${shArg(claudeLaunchBin)} --dangerously-skip-permissions --model ${shArg(workerModel)}`
-  execFileSync(TMUX, ['new-session', '-d', '-s', ctx.session, '-c', ctx.home, 'bash', '-lc', launch], { timeout: 8000 })
+  try {
+    execFileSync(TMUX, ['new-session', '-d', '-s', ctx.session, '-c', ctx.home, 'bash', '-lc', launch], { timeout: 8000 })
+  } finally {
+    invalidateTmuxSessionList()
+  }
   logger.info({ session: ctx.session, cwd: ctx.home }, 'agent-worker: launched interactive worker session')
   // APRO920 (c)(2): same rationale as startAgentProcess's model-resolved log --
   // which config-chain element supplied the --model value.
@@ -821,6 +826,7 @@ function restartWorkerSession(ctx: WorkerCtx): void {
   // TMUXWINDOWATTR920: stderr piped; "not running" is the expected case here,
   // so it is logged at debug with the site instead of copied onto stderr.
   try { execFileSync(TMUX, ['kill-session', '-t', exactTmuxTarget(ctx.session)], { timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }) } catch (err) { logger.debug({ site: 'agent-worker.restart', session: ctx.session, tmux: tmuxStderr(err) }, 'tmux kill-session: not running') }
+  invalidateTmuxSessionList()
   try { startWorkerSessionFor(ctx) } catch (err) { logger.warn({ err, session: ctx.session }, 'agent-worker: restart failed') }
 }
 
