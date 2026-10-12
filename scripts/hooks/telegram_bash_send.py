@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct Telegram Bot API sends written into a Bash command (card 23724bf8).
+"""Direct Telegram Bot API sends written into a Bash command (cards 23724bf8, 25af1415).
 
 The quiet-hours send gate (telegram-quiet-gate.py, card 20e178fc) stops the Telegram reply, react and
 edit_message tools and the manual fallback sender inside a chat's quiet hours. A model that writes the
@@ -24,6 +24,16 @@ runners whose arguments are a command (ssh, su -c, docker/podman/kubectl exec, f
 A URL in a shell variable set in the same command is expanded; a URL argument whose host is a variable
 or a substitution, in a command that names the Bot API host, is a send with an unknown method.
 
+An interpreter's code text counts too (card 25af1415, decision of 2026-10-12 (2)): the code a command gives
+python/python3 (-c, or on its stdin: a heredoc, a here-string, a pipe, "python -") or node (-e/--eval, -p/--print,
+or on its stdin), and a script file a heredoc of the same command writes and an interpreter of the same command
+runs. It is a send when its TEXT holds both the Bot API host and a sending method: a method in an
+api.telegram.org/bot.../<method> URL, or a Bot API sending method name written out (sendMessage, sendPhoto,
+copyMessage, editMessageText, setMessageReaction, ...; camelCase, so "sender" or "sendall" is no method). The
+chats are the chat_id values written in it (chat_id=999, a quoted chat_id key with 999, chat_id: '@name'), each a literal or
+None, and None when there is none. The rule reads the text, not the program: a print() naming the host and a
+method counts as well, and a method name built at run time does not.
+
 Where the chat is read from: chat_id in the URL's query string; curl's -d/--data*/--data-urlencode/-F/
 --form*/--json/--url-query and wget's --post-data/--body-data values (form pairs or a JSON body); the
 body file of curl's @file and of wget's --post-file/--body-file (at most 64 KB, a relative path taken
@@ -34,10 +44,12 @@ another host), a reading method (getMe, getUpdates, ...), and a heredoc that onl
 (cat > x <<EOF) which the same command does not run. A heredoc body IS read as commands when it is fed to
 a shell, when the same command also runs a script file (bash x.sh, sh x, source x, ./x, a path to a .sh:
 the body may be that script), and when its end line never comes (bash reads such a body to the end of the
-text; a "<<" misread inside an arithmetic expression is caught the same way). Not covered, by the scope of
-card 23724bf8 (curl and wget written into the command): a send made by an interpreter's own HTTP client
-(python, node, ...), by a script file the command runs but did not write (scripts/notify.sh is one, see the
-gate), and a host spelled so that the command text does not hold it.
+text; a "<<" misread inside an arithmetic expression is caught the same way); it is read as code text when
+it is fed to python or node, or when the same command runs a python or node script file.
+
+Not covered, the limit of the machine gate (card 25af1415; telegram-quiet-gate.py states it too): a script
+file the command runs but did not write in the same command (scripts/notify.sh is one, see the gate), and a
+Bot API host that the command text does not hold (built at run time, read from a file or the environment).
 
 Never raises: text the lexer cannot read (an unbalanced quote) is judged line by line, and that fallback
 leans towards "send": a stopped send costs a retry, a missed one breaks the owner's rule. Pure: no
@@ -49,6 +61,10 @@ import re
 HOST = "api.telegram.org"
 URL = re.compile(r"^(?:https?://)?api\.telegram\.org(?::\d+)?/bot[^/\s]*/(?P<method>[^/?#\s]*)", re.I)
 SEND_METHOD = re.compile(r"^(send[a-z]*|copymessages?|forwardmessages?|editmessage[a-z]*|setmessagereaction)$", re.I)
+CODE_URL = re.compile(r"api\.telegram\.org(?::\d+)?/bot[^/\s'\"`]*/([A-Za-z]*)", re.I)
+CODE_METHOD = re.compile(
+    r"(?<![A-Za-z0-9_])(send[A-Z][A-Za-z]*|copyMessages?|forwardMessages?|editMessage[A-Z][A-Za-z]*|setMessageReaction)(?![A-Za-z0-9_])")
+CODE_CHAT = re.compile(r"(?<![A-Za-z0-9_])chat_id[\"']?\s*[=:]\s*[\"']?([^&\s,;})\]\"'`\\]*)")
 LITERAL_CHAT = re.compile(r"^(-?\d+|@[A-Za-z][A-Za-z0-9_]{2,})$")
 CHAT_JSON = re.compile(r"[\"']chat_id[\"']\s*:\s*(\"[^\"]*\"|'[^']*'|[^,}\s]+)")
 CHAT_LINE = re.compile(r"chat_id[\"']?\s*[=:]\s*[\"']?([^&\s,}\"']*)")
@@ -68,6 +84,10 @@ WRAPPERS = {"sudo", "doas", "env", "command", "exec", "nohup", "setsid", "time",
 RUNNERS = {"ssh", "su", "runuser", "sg", "flock", "script", "docker", "podman", "kubectl", "nsenter", "chroot",
            "unshare", "firejail", "watch", "parallel", "tmux", "screen", "systemd-run"}
 EXECUTORS = FETCHERS | SHELLS | RUNNERS | {"eval"}
+PYTHON = re.compile(r"^python(\d+(\.\d+)?)?$")
+NODES = {"node", "nodejs"}
+NODE_VALUE = {"-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions", "--input-type",
+              "--title", "--env-file"}
 RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac", "coproc"}
 DECLARERS = {"export", "local", "declare", "typeset", "readonly"}
 OPERATORS = ("&&", "||", ";;", "|&", ";&")
@@ -119,18 +139,24 @@ def _sends(text, cwd, depth):
     if depth > MAX_DEPTH:
         return _fallback(text)
     try:
-        cmds, subs, kept = _lex(text)
+        cmds, subs, kept, codes = _lex(text)
         if kept and any(_runs_file(words) for words, _op in cmds):
             subs += kept  # a heredoc may have written the script this command runs
+        if kept and _written(cmds) & {_interp_script(words) for words, _op in cmds}:
+            codes += kept  # ... or the code file this command's python or node runs: the file a redirection wrote
         out = []
         for body in subs:
             out += _sends(body, cwd, depth + 1)
+        for code in codes:
+            out += _code_sends(code)
         assigns = {}
         for k, (words, op) in enumerate(cmds):
             out += _command(words, assigns, cwd, depth)
             if op in ("|", "|&") and k + 1 < len(cmds) and _shell_reads_stdin(cmds[k + 1][0]):
                 fed = [w for w in words[1:] if not w.startswith(REDIRECT)]
                 out += _sends("\n".join([" ".join(fed)] + [w for w in fed if SPACE.search(w)]), cwd, depth + 1)
+            if op in ("|", "|&") and k + 1 < len(cmds) and _interp_reads_stdin(cmds[k + 1][0]):
+                out += _code_sends("\n".join(w for w in words[1:] if not w.startswith(REDIRECT)))
         return out
     except Exception:  # the lexer gave up (an unbalanced quote, say): judge it line by line
         return _fallback(text)
@@ -237,11 +263,12 @@ def _heredoc_body(text, i, delim, strip_tabs):
 
 
 def _lex(text):
-    """([(words, the operator after them)], [the command texts inside it], [the other heredoc bodies]): the
-    command texts are the substitutions, the heredoc bodies fed to a shell and the bodies whose end line never
-    came. Raises ValueError on an unbalanced quote."""
-    cmds, subs, kept, cur, parts, line_words, pending = [], [], [], [], None, [], []
-    redirect_next = False
+    """([(words, the operator after them)], [the command texts inside it], [the other heredoc bodies], [the code
+    texts]): the command texts are the substitutions, the heredoc bodies fed to a shell and the bodies whose end
+    line never came; the code texts are the heredoc bodies fed to python or node (card 25af1415). Raises
+    ValueError on an unbalanced quote."""
+    cmds, subs, kept, codes, cur, parts, line_words, pending = [], [], [], [], [], None, [], []
+    redirect_next, line_start = False, 0
     i, n = 0, len(text)
 
     def add(s):
@@ -311,10 +338,13 @@ def _lex(text):
             end_cmd("\n")
             i += 1
             fed = any(os.path.basename(w) in SHELLS or os.path.basename(w) == "ssh" for w in line_words)
+            code = any(_interp_reads_stdin(words) for words, _op in cmds[line_start:])
             for delim, strip_tabs in pending:
                 body, i, closed = _heredoc_body(text, i, delim, strip_tabs)
                 (subs if fed or not closed else kept).append(body)
-            pending, line_words = [], []
+                if code:
+                    codes.append(body)
+            pending, line_words, line_start = [], [], len(cmds)
         elif text.startswith("<<<", i):
             end_word()
             cur.append("<<<")
@@ -349,7 +379,7 @@ def _lex(text):
             add(c)
             i += 1
     end_cmd("")
-    return cmds, subs, kept
+    return cmds, subs, kept, codes
 
 
 # --- commands -----------------------------------------------------------------------------------------
@@ -385,10 +415,13 @@ def _command(words, assigns, cwd, depth):
         return _fetch(name, [_expand(a, assigns) for a in args], cwd)
     if name == "eval":
         return _sends(" ".join(_expand(a, assigns) for a in args), cwd, depth + 1)
+    if _is_interp(name):
+        return [found for code in _interp_args(name, [_expand(a, assigns) for a in args])[0] for found in _code_sends(code)]
     out = []
     if name in WRAPPERS or name in RUNNERS:
         for k, a in enumerate(args):
-            if os.path.basename(_expand(a, assigns)) in EXECUTORS:
+            nxt = os.path.basename(_expand(a, assigns))
+            if nxt in EXECUTORS or _is_interp(nxt):
                 out += _command(args[k:], dict(assigns), cwd, depth + 1)
                 break
     if name in SHELLS or name in RUNNERS:  # bash -c '...', ssh host '...', bash <<< '...'
@@ -426,6 +459,128 @@ def _shell_reads_stdin(words):
     if not rest or os.path.basename(rest[0]) not in SHELLS:
         return False
     return "-c" not in rest[1:] and all(a.startswith("-") for a in rest[1:])
+
+
+# --- python and node (card 25af1415) ----------------------------------------------------------------
+
+def _is_interp(name):
+    return bool(PYTHON.match(name)) or name in NODES
+
+
+def _python_args(args):
+    """(code texts, reads its code from stdin, the script file) of a python command line: -c CODE, else stdin
+    (none or "-"); a module (-m) or a script file is no code text here."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "-":
+            return [], True, None
+        if a == "--":
+            return [], False, args[i] if i < len(args) else None
+        if not a.startswith("-"):
+            return [], False, a
+        if a.startswith("--"):
+            i += 1 if a == "--check-hash-based-pycs" else 0
+            continue
+        for k in range(1, len(a)):
+            if a[k] == "c":
+                return [a[k + 1:] or (args[i] if i < len(args) else "")], False, None
+            if a[k] == "m":
+                return [], False, None
+            if a[k] in "WX":
+                i += 0 if a[k + 1:] else 1
+                break
+    return [], True, None
+
+
+def _node_args(args):
+    """(code texts, reads its code from stdin, the script file) of a node command line: -e/--eval/-p/--print
+    CODE, else stdin."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a in ("-e", "--eval", "-p", "--print") or re.match(r"^-[A-Za-z]*[ep]$", a):
+            return [args[i] if i < len(args) else ""], False, None
+        if a.startswith(("--eval=", "--print=")):
+            return [a.split("=", 1)[1]], False, None
+        if a == "-":
+            return [], True, None
+        if a == "--":
+            return [], False, args[i] if i < len(args) else None
+        if not a.startswith("-"):
+            return [], False, a
+        if a in NODE_VALUE:
+            i += 1
+    return [], True, None
+
+
+def _interp_args(name, args):
+    """(code texts, reads its code from stdin, the script file) of a python or node command; a here-string is
+    code when stdin is."""
+    strings = [args[k + 1] for k in range(len(args) - 1) if args[k] == "<<<"]
+    rest = [a for k, a in enumerate(args) if a != "<<<" and (k == 0 or args[k - 1] != "<<<")]
+    codes, stdin, script = (_python_args if PYTHON.match(name) else _node_args)(rest)
+    return codes + (strings if stdin else []), stdin, script
+
+
+def _interp_command(words):
+    """(name, args) of a python or node command, also behind a wrapper (sudo, timeout, ...); None otherwise."""
+    rest = _strip_prefix([w for w in words if not w.startswith(REDIRECT)], {})
+    while rest and os.path.basename(rest[0]) in WRAPPERS:
+        nxt = [k for k, a in enumerate(rest[1:], 1) if _is_interp(os.path.basename(a))]
+        if not nxt:
+            return None
+        rest = rest[nxt[0]:]
+    if not rest or not _is_interp(os.path.basename(rest[0])):
+        return None
+    return os.path.basename(rest[0]), rest[1:]
+
+
+def _interp_reads_stdin(words):
+    """True for a python or node command that reads its code from stdin (python3, python3 -, node)."""
+    found = _interp_command(words)
+    return bool(found) and _interp_args(*found)[1]
+
+
+def _interp_script(words):
+    """The script file a python or node command runs (python3 x.py, node ./x.js), normalized; None otherwise."""
+    found = _interp_command(words)
+    script = _interp_args(*found)[2] if found else None
+    return os.path.normpath(script) if script else None
+
+
+def _written(cmds):
+    """The files the commands write by a redirection or tee, normalized: where a heredoc's code may land."""
+    out = set()
+    for words, _op in cmds:
+        out |= {os.path.normpath(w[len(REDIRECT):]) for w in words if w.startswith(REDIRECT) and len(w) > len(REDIRECT)}
+        if words and os.path.basename(words[0]) == "tee":
+            out |= {os.path.normpath(w) for w in words[1:] if not w.startswith(("-", REDIRECT))}
+    return out
+
+
+def _code_sends(code):
+    """[(method, chat)]: the Bot API sends in an interpreter's code text, by its text: the host and a sending
+    method both in it (a method in a Bot API URL, or a sending method name written out); the chats are the
+    chat_id values written in it, None for one that is no literal, [None] for none."""
+    if not code or HOST not in code.lower():
+        return []
+    methods = []
+    for m in CODE_URL.finditer(code):
+        if m.group(1) and SEND_METHOD.match(m.group(1)) and m.group(1) not in methods:
+            methods.append(m.group(1))
+    for m in CODE_METHOD.finditer(code):
+        if m.group(1).lower() not in [x.lower() for x in methods]:
+            methods.append(m.group(1))
+    if not methods:
+        return []
+    chats = []
+    for value in CODE_CHAT.findall(code):
+        if _chat(value) not in chats:
+            chats.append(_chat(value))
+    return [(m, c) for m in methods for c in chats or [None]]
 
 
 # --- curl and wget ------------------------------------------------------------------------------------
@@ -575,7 +730,8 @@ def _chats(opts, urls, cwd, wget):
 
 
 def _fallback(text):
-    """Line by line, when the lexer gave up: a fetcher word and a Bot API URL on one line = a send."""
+    """Line by line, when the lexer gave up: a fetcher word and a Bot API URL on one line = a send; and with an
+    interpreter named in the text, the code rule over the whole text."""
     out = []
     for line in text.replace("\\\n", " ").split("\n"):
         if HOST not in line.lower() or not re.search(r"(^|[\s;&|(`$'\"])(curl|wget)(\s|$)", line, re.I):
@@ -586,4 +742,6 @@ def _fallback(text):
             continue
         chats = [_chat(v) for v in CHAT_LINE.findall(line)]
         out += [(method, c) for c in chats] if chats and None not in chats else [(method, None)]
+    if re.search(r"(^|[\s;&|(`$'\"])(python[0-9.]*|nodejs|node)(\s|$)", text):
+        out += [found for found in _code_sends(text) if found not in out]
     return out
