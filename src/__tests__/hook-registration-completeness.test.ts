@@ -73,7 +73,7 @@ const EXEMPT: Record<string, string> = {
   'telegram_quiet_hours.py':
     'shared library: the per-chat quiet-hours window check, imported by telegram-reply-guard.py, telegram_progress.py, telegram_progress_clear.py and telegram_progress_watchdog.py; not itself a hook',
   'telegram_bash_send.py':
-    'shared library: finds the Bot API sends (curl, wget) written into a Bash command and their chats, imported by telegram-quiet-gate.py (card 23724bf8); not itself a hook',
+    'shared library: finds the Bot API sends written into a Bash command (curl, wget, and the code text given to python or node) and their chats, imported by telegram-quiet-gate.py (cards 23724bf8, 25af1415); not itself a hook',
   'memory-save.sh':
     'legacy: referenced only by a historical rebuild prompt, wired nowhere; kept pending a maintainer decision to remove it',
   'telegram-ack.py':
