@@ -31,9 +31,13 @@ from the call's cwd). A literal chat is "-?digits" or "@name"; anything else is 
 
 What does not count: the host named in text (grep, echo, a commit message, the body of a request to
 another host), a reading method (getMe, getUpdates, ...), and a heredoc that only writes a file
-(cat > x <<EOF). Not covered, by the scope of card 23724bf8 (curl and wget written into the command): a
-send made by an interpreter's own HTTP client (python, node, ...), by a script file the command runs
-(scripts/notify.sh is one, see the gate), and a host spelled so that the command text does not hold it.
+(cat > x <<EOF) which the same command does not run. A heredoc body IS read as commands when it is fed to
+a shell, when the same command also runs a script file (bash x.sh, sh x, source x, ./x, a path to a .sh:
+the body may be that script), and when its end line never comes (bash reads such a body to the end of the
+text; a "<<" misread inside an arithmetic expression is caught the same way). Not covered, by the scope of
+card 23724bf8 (curl and wget written into the command): a send made by an interpreter's own HTTP client
+(python, node, ...), by a script file the command runs but did not write (scripts/notify.sh is one, see the
+gate), and a host spelled so that the command text does not hold it.
 
 Never raises: text the lexer cannot read (an unbalanced quote) is judged line by line, and that fallback
 leans towards "send": a stopped send costs a retry, a missed one breaks the owner's rule. Pure: no
@@ -115,7 +119,9 @@ def _sends(text, cwd, depth):
     if depth > MAX_DEPTH:
         return _fallback(text)
     try:
-        cmds, subs = _lex(text)
+        cmds, subs, kept = _lex(text)
+        if kept and any(_runs_file(words) for words, _op in cmds):
+            subs += kept  # a heredoc may have written the script this command runs
         out = []
         for body in subs:
             out += _sends(body, cwd, depth + 1)
@@ -218,21 +224,23 @@ def _inner_double(s, subs):
 
 
 def _heredoc_body(text, i, delim, strip_tabs):
+    """(body, the index after its end line, whether the end line came)."""
     lines = []
     while i < len(text):
         k = text.find("\n", i)
         line = text[i:] if k < 0 else text[i:k]
         i = len(text) if k < 0 else k + 1
         if (line.lstrip("\t") if strip_tabs else line) == delim:
-            return "\n".join(lines), i
+            return "\n".join(lines), i, True
         lines.append(line)
-    return "\n".join(lines), len(text)
+    return "\n".join(lines), len(text), False
 
 
 def _lex(text):
-    """([(words, the operator after them)], [the command texts inside it]): the texts are the
-    substitutions and the heredoc bodies fed to a shell. Raises ValueError on an unbalanced quote."""
-    cmds, subs, cur, parts, line_words, pending = [], [], [], None, [], []
+    """([(words, the operator after them)], [the command texts inside it], [the other heredoc bodies]): the
+    command texts are the substitutions, the heredoc bodies fed to a shell and the bodies whose end line never
+    came. Raises ValueError on an unbalanced quote."""
+    cmds, subs, kept, cur, parts, line_words, pending = [], [], [], [], None, [], []
     redirect_next = False
     i, n = 0, len(text)
 
@@ -304,9 +312,8 @@ def _lex(text):
             i += 1
             fed = any(os.path.basename(w) in SHELLS or os.path.basename(w) == "ssh" for w in line_words)
             for delim, strip_tabs in pending:
-                body, i = _heredoc_body(text, i, delim, strip_tabs)
-                if fed:
-                    subs.append(body)
+                body, i, closed = _heredoc_body(text, i, delim, strip_tabs)
+                (subs if fed or not closed else kept).append(body)
             pending, line_words = [], []
         elif text.startswith("<<<", i):
             end_word()
@@ -342,7 +349,7 @@ def _lex(text):
             add(c)
             i += 1
     end_cmd("")
-    return cmds, subs
+    return cmds, subs, kept
 
 
 # --- commands -----------------------------------------------------------------------------------------
@@ -389,6 +396,23 @@ def _command(words, assigns, cwd, depth):
             if HOST in a.lower() and SPACE.search(a):
                 out += _sends(_expand(a, assigns), cwd, depth + 1)
     return out
+
+
+def _runs_file(words):
+    """True for a command that runs a script file: bash x.sh, sh -e x, source x, . x, ./x, a path to a .sh, also behind a wrapper."""
+    rest = _strip_prefix([w for w in words if not w.startswith(REDIRECT)], {})
+    for k, w in enumerate(rest):
+        name = os.path.basename(w)
+        if name in SHELLS:
+            args = rest[k + 1:]
+            return "-c" not in args and any(not a.startswith("-") for a in args)
+        if w in ("source", ".") and k + 1 < len(rest):
+            return True
+        if "/" in w and (w.startswith("./") or w.endswith(".sh")):
+            return True
+        if k == 0 and name not in WRAPPERS:
+            return False
+    return False
 
 
 def _shell_reads_stdin(words):
