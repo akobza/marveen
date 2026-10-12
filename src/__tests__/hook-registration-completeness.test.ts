@@ -70,6 +70,8 @@ const EXEMPT: Record<string, string> = {
     'shared library imported by outgoing-copy-gate.py (and the level-2 email approval gate, EMAILKAPU901 PR2); not itself a hook',
   'telegram_quiet_hours.py':
     'shared library: the per-chat quiet-hours window check, imported by telegram-reply-guard.py, telegram_progress.py, telegram_progress_clear.py and telegram_progress_watchdog.py; not itself a hook',
+  'telegram_bash_send.py':
+    'shared library: finds the Bot API sends (curl, wget) written into a Bash command and their chats, imported by telegram-quiet-gate.py (card 23724bf8); not itself a hook',
   'memory-save.sh':
     'legacy: referenced only by a historical rebuild prompt, wired nowhere; kept pending a maintainer decision to remove it',
   'telegram-ack.py':

@@ -1480,8 +1480,12 @@ export function ensureTelegramCopyGate(name: string): boolean {
 // quiet-hours.json (it resolves the root from its own file location), so a
 // sub-agent's bot is held for a protected person's chat as well, while its own
 // principal's chat, which no window names, is untouched.
+// Card 23724bf8: and on Bash, where the gate judges a Bot API send written into the
+// command (curl or wget); a command that does not name the Bot API host costs it one
+// substring test. The entry under the old three-tool matcher is replaced at the next
+// dashboard start by ensureTelegramQuietGate, which treats a stale matcher as unwired.
 export const TELEGRAM_QUIET_GATE_MATCHER =
-  'mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__react|mcp__plugin_telegram_telegram__edit_message'
+  'mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__react|mcp__plugin_telegram_telegram__edit_message|Bash'
 
 export function agentGetsTelegramQuietGate(name: string): boolean {
   return name !== MAIN_AGENT_ID
