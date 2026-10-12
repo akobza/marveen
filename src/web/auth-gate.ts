@@ -32,7 +32,7 @@ import type { RouteContext } from './routes/types.js'
 
 export type AuthResult =
   | { kind: 'token'; agent?: string }
-  | { kind: 'device'; device: string; deviceId: number; scope: DeviceKeyScope }
+  | { kind: 'device'; device: string; deviceId: number; scope: DeviceKeyScope; messageTo?: string; messageFrom?: string }
   | { kind: 'federation'; peer: string }
   | { kind: 'session'; user: string }
   | { kind: 'none' }
@@ -122,6 +122,13 @@ export function requiresAuth(path: string, method: string): boolean {
   return path.startsWith('/api/')
 }
 
+// MSGSENDKEY1012: a message-send key's bound sender and recipient ride along (into routeAuthOf too, where the
+// message route reads them), present only when the key has them, so every other device credential resolves to
+// exactly the shape it always had.
+function deviceBinding(dk: { messageTo?: string; messageFrom?: string }): { messageTo?: string; messageFrom?: string } {
+  return { ...(dk.messageTo !== undefined ? { messageTo: dk.messageTo } : {}), ...(dk.messageFrom !== undefined ? { messageFrom: dk.messageFrom } : {}) }
+}
+
 export function resolveAuth(
   req: http.IncomingMessage,
   url: URL,
@@ -143,7 +150,7 @@ export function resolveAuth(
   const bearerMatch = /^Bearer\s+(.+)$/.exec(req.headers.authorization ?? '')
   if (bearerMatch) {
     const dk = resolveDeviceKey(bearerMatch[1]!.trim())
-    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope }
+    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope, ...deviceBinding(dk) }
   }
 
   // 3. SSE pane stream ?token= (EventSource cannot set an Authorization header):
@@ -153,7 +160,7 @@ export function resolveAuth(
     const qtoken = url.searchParams.get('token') ?? ''
     if (checkBearerToken(`Bearer ${qtoken}`, dashboardToken)) return { kind: 'token' }
     const dk = resolveDeviceKey(qtoken)
-    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope }
+    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope, ...deviceBinding(dk) }
   }
 
   // 4. Scoped per-peer federation tokens: valid ONLY on the two wire endpoints,
@@ -187,7 +194,7 @@ export function resolveAuth(
 // route authorizes on is unit-testable; 'none' reaches no handler principal.
 export function routeAuthOf(auth: AuthResult): RouteContext['auth'] {
   return auth.kind === 'token' ? { kind: 'token' as const, agent: auth.agent }
-    : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId, scope: auth.scope }
+    : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId, scope: auth.scope, ...deviceBinding(auth) }
     : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
     : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
     : undefined

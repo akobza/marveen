@@ -162,6 +162,19 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
     }
+    // MSGSENDKEY1012: a 'message-send' key writes AS the one sender TO the one recipient it was minted for, nothing
+    // else (the gate in web.ts already keeps it off every other endpoint). Exact match on the stored forms, from.trim()
+    // and to.trim(), the values the row will carry: a near-miss that would only SANITISE to a bound id, a federated
+    // address, or a key whose row lacks either binding is a 403 before anything is written.
+    if (ctx.auth?.kind === 'device' && ctx.auth.scope === 'message-send') {
+      const boundTo = ctx.auth.messageTo ?? null
+      const boundFrom = ctx.auth.messageFrom ?? null
+      if (!boundTo || !boundFrom || to.trim() !== boundTo || from.trim() !== boundFrom) {
+        logger.warn({ from: from.trim(), to: to.trim(), device: ctx.auth.device, deviceId: ctx.auth.deviceId, boundFrom, boundTo }, 'Rejected /api/messages POST: message-send key outside its bound sender and recipient')
+        json(res, { error: 'this credential may only send as its bound sender to its bound recipient' }, 403)
+        return true
+      }
+    }
     // Card 795d1f48 (a): an URGENT row is typed into a BUSY pane by the router (e.g. the save signal a key rotation
     // sends before it restarts the agents), so a lost or an injected key could interrupt every agent. Who may ask for
     // one: a FULL device key whose id the install lists in MESSAGE_URGENT_DEVICE_IDS (mayMarkUrgent). Not the shared
@@ -413,6 +426,11 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // itself -- capped short so it stays a label, not a second content field.
     const trimmedOriginNote = origin_note?.trim().slice(0, 120) || null
     const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote, null, { urgent: urgent === true })
+    // MSGSENDKEY1012: name the narrow key (its name and id, never the secret) next to the row it wrote, so a misuse of
+    // a stolen key can be traced to the key from the log alone.
+    if (ctx.auth?.kind === 'device' && ctx.auth.scope === 'message-send') {
+      logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, device: ctx.auth.device, deviceId: ctx.auth.deviceId }, 'Agent message created by a message-send key')
+    }
     if (isVoiceMailbox) {
       markMessageDone(msg.id, VOICE_MAILBOX_RESULT)
       logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Voice-channel answer stored in the mailbox (no session delivery)')

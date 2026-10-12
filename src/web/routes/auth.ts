@@ -62,6 +62,7 @@ import {
 } from '../../db.js'
 import { notifySecurityEvent } from '../../notify.js'
 import type { RouteContext } from './types.js'
+import { isBindableRecipient, isBindableSender } from '../message-send-binding.js'
 
 const LOGIN_BODY_MAX_BYTES = 8 * 1024
 const USERNAME_RE = /^[a-zA-Z0-9._-]{1,64}$/
@@ -375,6 +376,28 @@ export async function tryHandleAuth(ctx: RouteContext): Promise<boolean> {
       json(res, { error: `Invalid scope (${DEVICE_KEY_SCOPES.join(' | ')})` }, 400)
       return true
     }
+    // MSGSENDKEY1012: a message-send key is bound to one sender and one recipient at mint time, and no other scope
+    // takes either. Both must be EXACT ids (message-send-binding.ts): a near-miss that only sanitises to one, a
+    // federated address, or a channel-framing id is refused here rather than stored.
+    let messageTo: string | undefined
+    let messageFrom: string | undefined
+    if (scope === 'message-send') {
+      const rawFrom = typeof body.message_from === 'string' ? body.message_from.trim() : ''
+      if (!isBindableSender(rawFrom)) {
+        json(res, { error: 'A message-send key needs message_from: exactly a registered fleet agent id or a SYSTEM_SENDER_IDS entry' }, 400)
+        return true
+      }
+      const rawTo = typeof body.message_to === 'string' ? body.message_to.trim() : ''
+      if (!isBindableRecipient(rawTo)) {
+        json(res, { error: 'A message-send key needs message_to: exactly a registered local fleet agent id' }, 400)
+        return true
+      }
+      messageFrom = rawFrom
+      messageTo = rawTo
+    } else if ((body.message_to !== undefined && body.message_to !== null) || (body.message_from !== undefined && body.message_from !== null)) {
+      json(res, { error: 'message_from and message_to are only valid with scope message-send' }, 400)
+      return true
+    }
     if (scope === 'operator' && (body.expires_in_days === 0 || body.expires_in_days === null)) {
       json(res, { error: 'An operator key must expire' }, 400)
       return true
@@ -391,10 +414,10 @@ export async function tryHandleAuth(ctx: RouteContext): Promise<boolean> {
       }
       expiresInDays = n
     }
-    const minted = createDeviceKey(name, { expiresInDays, scope: scope as DeviceKeyScope })
-    logger.info({ id: minted.id, name: minted.name, expiresAt: minted.expiresAt, scope: minted.scope }, 'device key minted')
+    const minted = createDeviceKey(name, { expiresInDays, scope: scope as DeviceKeyScope, messageTo, messageFrom })
+    logger.info({ id: minted.id, name: minted.name, expiresAt: minted.expiresAt, scope: minted.scope, messageFrom: minted.messageFrom, messageTo: minted.messageTo }, 'device key minted')
     // `key` is the one and only disclosure of the raw credential.
-    json(res, { ok: true, id: minted.id, name: minted.name, key: minted.key, created_at: minted.createdAt, expires_at: minted.expiresAt, scope: minted.scope }, 201)
+    json(res, { ok: true, id: minted.id, name: minted.name, key: minted.key, created_at: minted.createdAt, expires_at: minted.expiresAt, scope: minted.scope, message_from: minted.messageFrom, message_to: minted.messageTo }, 201)
     return true
   }
 

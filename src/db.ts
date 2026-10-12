@@ -1481,6 +1481,11 @@ export function initDatabase(dbPathOverride?: string): void {
   // DASHOPERATOR1005: what a key may reach. 'full' = every existing key and the
   // default, so this column changes nothing until an 'operator' key is minted.
   try { db.exec(`ALTER TABLE device_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'`) } catch { /* column already exists */ }
+  // MSGSENDKEY1012: the one recipient a 'message-send' key may write to. Null for
+  // every other key, so this column changes nothing until such a key is minted.
+  try { db.exec(`ALTER TABLE device_keys ADD COLUMN message_to TEXT`) } catch { /* column already exists */ }
+  // ... and the one sender it may write as (the same key binds both).
+  try { db.exec(`ALTER TABLE device_keys ADD COLUMN message_from TEXT`) } catch { /* column already exists */ }
 
   // --- OTel Distributed Tracing (card def5a189) ---
   // SQLite-native span store. No external OTel SDK: spans are written via

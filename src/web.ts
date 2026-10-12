@@ -9,6 +9,7 @@ import { watchEgressAllowlistBaseline, queueAllowlistReport } from './web/egress
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, routeAuthOf, type AuthResult } from './web/auth-gate.js'
 import { operatorGateDecision } from './web/operator-gate.js'
+import { messageSendGateDecision } from './web/message-send-gate.js'
 import { readOperatorAccess } from './web/operator-access.js'
 import { tryHandleOperatorAccess } from './web/routes/operator-access.js'
 import { tryHandleOperator } from './web/routes/operator.js'
@@ -187,6 +188,15 @@ export function startWebServer(port = 3420): http.Server {
         logger.warn({ path, method, device: auth.kind === 'device' ? auth.device : undefined, reason: operatorDenied }, 'operator gate: denied')
         res.writeHead(403, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Forbidden for this credential', reason: operatorDenied }))
+        return
+      }
+      // MSGSENDKEY1012: a message-send key reaches POST /api/messages only (its
+      // bound recipient is checked in the route), decided here like the operator key.
+      const messageSendDenied = messageSendGateDecision(auth, path, method)
+      if (messageSendDenied) {
+        logger.warn({ path, method, device: auth.kind === 'device' ? auth.device : undefined, reason: messageSendDenied }, 'message-send gate: denied')
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden for this credential', reason: messageSendDenied }))
         return
       }
     }

@@ -34,9 +34,14 @@ const KEY_PREFIX = 'mvdk_'
  * this field existed and stays the default. 'operator' is the IT operator's
  * key: the gate lets it reach /api/operator/* only (operator-gate.ts), and it
  * must expire -- an operator key without an end date cannot be minted.
+ * 'message-send' (MSGSENDKEY1012) is an out-of-process notifier's key: the gate
+ * lets it reach POST /api/messages only (message-send-gate.ts), and the route
+ * lets it write only AS the one sender TO the one recipient it was minted for
+ * (messageFrom, messageTo). A service that only ever posts one kind of message
+ * no longer has to hold the fleet's full token.
  */
-export type DeviceKeyScope = 'full' | 'operator'
-export const DEVICE_KEY_SCOPES: readonly DeviceKeyScope[] = ['full', 'operator']
+export type DeviceKeyScope = 'full' | 'operator' | 'message-send'
+export const DEVICE_KEY_SCOPES: readonly DeviceKeyScope[] = ['full', 'operator', 'message-send']
 export const OPERATOR_KEY_DEFAULT_EXPIRY_DAYS = 90
 /** An operator key lives at most a year (owner decision 2026-10-05; a full key keeps its own ceiling). */
 export const OPERATOR_KEY_MAX_EXPIRY_DAYS = 365
@@ -45,6 +50,10 @@ export interface DeviceKeyPrincipal {
   id: number
   name: string
   scope: DeviceKeyScope
+  /** The one recipient a 'message-send' key may write to. Present ONLY on such a key, so every other key's shape is unchanged. */
+  messageTo?: string
+  /** The one sender a 'message-send' key may write as. Present ONLY on such a key. */
+  messageFrom?: string
 }
 
 export interface DeviceKeyInfo {
@@ -57,6 +66,10 @@ export interface DeviceKeyInfo {
    *  for keys minted outside the pairing flow. */
   installId: string | null
   scope: DeviceKeyScope
+  /** The bound recipient of a 'message-send' key; absent on every other key. */
+  messageTo?: string
+  /** The bound sender of a 'message-send' key; absent on every other key. */
+  messageFrom?: string
 }
 
 export interface MintedDeviceKey extends DeviceKeyInfo {
@@ -70,12 +83,19 @@ interface CachedKey {
   lastUsedAt: number | null
   expiresAt: number | null
   scope: DeviceKeyScope
+  messageTo: string | null
+  messageFrom: string | null
 }
 
 // Fail closed: only the literal 'full' (the column default) is a full key. An
-// unexpected stored value reads as the narrowest scope, never the widest.
+// unexpected stored value reads as the narrowest scope, never the widest:
+// 'operator', as before. 'message-send' only from its own literal, and it
+// reaches nothing without its bound sender and recipient (the route refuses a
+// key that lacks either).
 function toScope(value: unknown): DeviceKeyScope {
-  return value === 'full' ? 'full' : 'operator'
+  if (value === 'full') return 'full'
+  if (value === 'message-send') return 'message-send'
+  return 'operator'
 }
 
 const cache = new Map<string, CachedKey>()
@@ -91,8 +111,20 @@ function nowSec(): number {
 // Mint a new key. The raw value exists only in the returned object; the row
 // stores its hash. expiresInDays is opt-in -- omitted means the key lives until
 // revoked.
-export function createDeviceKey(name: string, opts: { expiresInDays?: number; installId?: string; scope?: DeviceKeyScope } = {}): MintedDeviceKey {
+export function createDeviceKey(name: string, opts: { expiresInDays?: number; installId?: string; scope?: DeviceKeyScope; messageTo?: string; messageFrom?: string } = {}): MintedDeviceKey {
   const scope = opts.scope ?? 'full'
+  // MSGSENDKEY1012: the sender and the recipient are part of a message-send key, and only of it.
+  const messageTo = opts.messageTo === undefined ? null : opts.messageTo
+  const messageFrom = opts.messageFrom === undefined ? null : opts.messageFrom
+  if (scope === 'message-send' && !messageTo) {
+    throw new Error('a message-send key needs its recipient (messageTo)')
+  }
+  if (scope === 'message-send' && !messageFrom) {
+    throw new Error('a message-send key needs its sender (messageFrom)')
+  }
+  if (scope !== 'message-send' && (messageTo !== null || messageFrom !== null)) {
+    throw new Error('only a message-send key is bound to a sender and a recipient')
+  }
   if (scope === 'operator' && !(opts.expiresInDays && opts.expiresInDays > 0)) {
     throw new Error('an operator key must expire')
   }
@@ -105,11 +137,11 @@ export function createDeviceKey(name: string, opts: { expiresInDays?: number; in
   const expiresAt = opts.expiresInDays ? now + Math.floor(opts.expiresInDays * 24 * 60 * 60) : null
   const installId = opts.installId ?? null
   const info = getDb()
-    .prepare('INSERT INTO device_keys (key_hash, name, created_at, last_used_at, expires_at, install_id, scope) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(keyHash, name, now, null, expiresAt, installId, scope)
+    .prepare('INSERT INTO device_keys (key_hash, name, created_at, last_used_at, expires_at, install_id, scope, message_to, message_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(keyHash, name, now, null, expiresAt, installId, scope, messageTo, messageFrom)
   const id = Number(info.lastInsertRowid)
-  cache.set(keyHash, { id, name, lastUsedAt: null, expiresAt, scope })
-  return { id, name, createdAt: now, lastUsedAt: null, expiresAt, installId, scope, key: raw }
+  cache.set(keyHash, { id, name, lastUsedAt: null, expiresAt, scope, messageTo, messageFrom })
+  return { id, name, createdAt: now, lastUsedAt: null, expiresAt, installId, scope, ...binding(messageTo, messageFrom), key: raw }
 }
 
 function removeByHash(keyHash: string): void {
@@ -126,10 +158,10 @@ export function resolveDeviceKey(raw: string): DeviceKeyPrincipal | null {
   let entry = cache.get(keyHash)
   if (!entry) {
     const row = getDb()
-      .prepare('SELECT id, name, last_used_at, expires_at, scope FROM device_keys WHERE key_hash = ?')
-      .get(keyHash) as { id: number; name: string; last_used_at: number | null; expires_at: number | null; scope: string } | undefined
+      .prepare('SELECT id, name, last_used_at, expires_at, scope, message_to, message_from FROM device_keys WHERE key_hash = ?')
+      .get(keyHash) as { id: number; name: string; last_used_at: number | null; expires_at: number | null; scope: string; message_to: string | null; message_from: string | null } | undefined
     if (!row) return null
-    entry = { id: row.id, name: row.name, lastUsedAt: row.last_used_at, expiresAt: row.expires_at, scope: toScope(row.scope) }
+    entry = { id: row.id, name: row.name, lastUsedAt: row.last_used_at, expiresAt: row.expires_at, scope: toScope(row.scope), messageTo: row.message_to, messageFrom: row.message_from }
     cache.set(keyHash, entry)
   }
   const now = nowSec()
@@ -150,14 +182,19 @@ export function resolveDeviceKey(raw: string): DeviceKeyPrincipal | null {
       return null
     }
   }
-  return { id: entry.id, name: entry.name, scope: entry.scope }
+  return { id: entry.id, name: entry.name, scope: entry.scope, ...binding(entry.messageTo, entry.messageFrom) }
 }
 
-function rowToInfo(r: { id: number; name: string; created_at: number; last_used_at: number | null; expires_at: number | null; install_id: string | null; scope: string }): DeviceKeyInfo {
-  return { id: r.id, name: r.name, createdAt: r.created_at, lastUsedAt: r.last_used_at, expiresAt: r.expires_at, installId: r.install_id, scope: toScope(r.scope) }
+// The binding fields appear only when set, so a key without one keeps its old shape exactly.
+function binding(messageTo: string | null, messageFrom: string | null): { messageTo?: string; messageFrom?: string } {
+  return { ...(messageTo !== null ? { messageTo } : {}), ...(messageFrom !== null ? { messageFrom } : {}) }
 }
 
-const INFO_COLUMNS = 'id, name, created_at, last_used_at, expires_at, install_id, scope'
+function rowToInfo(r: { id: number; name: string; created_at: number; last_used_at: number | null; expires_at: number | null; install_id: string | null; scope: string; message_to: string | null; message_from: string | null }): DeviceKeyInfo {
+  return { id: r.id, name: r.name, createdAt: r.created_at, lastUsedAt: r.last_used_at, expiresAt: r.expires_at, installId: r.install_id, scope: toScope(r.scope), ...binding(r.message_to, r.message_from) }
+}
+
+const INFO_COLUMNS = 'id, name, created_at, last_used_at, expires_at, install_id, scope, message_to, message_from'
 
 export function listDeviceKeys(): DeviceKeyInfo[] {
   const rows = getDb()
