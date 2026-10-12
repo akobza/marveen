@@ -76,10 +76,10 @@ describe('the upstream verdict is NOT taken where the real traffic showed false 
   })
 })
 
-describe('still open after the second opinion -- pinned on purpose (python and node heredoc bodies)', () => {
-  it('does not claim these: an exec-wrapped urlopen in a python heredoc is still allowed', () => {
+describe('left open by the second opinion, closed by the local (f) reading (95800e1d (3))', () => {
+  it('⛔ an exec-wrapped urlopen in a python heredoc is denied', () => {
     const r = run("python3 - <<'PY'\nexec(\"import urllib.request; urllib.request.urlopen('https://example.org/')\")\nPY")
-    expect(r.deny).toBe(false)
+    expect(r.deny).toBe(true)
   })
 })
 
