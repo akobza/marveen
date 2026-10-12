@@ -28,6 +28,7 @@ import { resolveDeviceKey, type DeviceKeyScope } from './auth-device-keys.js'
 import { OPERATOR_COOKIE_NAME, resolveOperatorSession } from './operator-sessions.js'
 import { sanitizeAgentIdent } from '../prompt-safety.js'
 import { isKnownAgent } from './agent-config.js'
+import type { RouteContext } from './routes/types.js'
 
 export type AuthResult =
   | { kind: 'token'; agent?: string }
@@ -179,4 +180,15 @@ export function resolveAuth(
   }
 
   return { kind: 'none' }
+}
+
+// The principal as the route handlers see it (RouteContext.auth), built from
+// the resolved credential. Moved out of src/web.ts unchanged so the mapping a
+// route authorizes on is unit-testable; 'none' reaches no handler principal.
+export function routeAuthOf(auth: AuthResult): RouteContext['auth'] {
+  return auth.kind === 'token' ? { kind: 'token' as const, agent: auth.agent }
+    : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId, scope: auth.scope }
+    : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
+    : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
+    : undefined
 }

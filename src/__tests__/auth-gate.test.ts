@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest'
 import type http from 'node:http'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { initDatabase, createDashboardUser } from '../db.js'
-import { resolveAuth, requiresAuth, parseCookies, SESSION_COOKIE_NAME } from '../web/auth-gate.js'
+import { resolveAuth, requiresAuth, parseCookies, routeAuthOf, SESSION_COOKIE_NAME } from '../web/auth-gate.js'
 import { createSession, _clearSessionCacheForTest } from '../web/auth-sessions.js'
 import { MAIN_AGENT_ID } from '../config.js'
 
@@ -211,5 +213,24 @@ describe('self-asserted caller id (X-Agent-Id, card 29c8cf33)', () => {
     )
     expect(r.kind).toBe('session')
     expect((r as { agent?: string }).agent).toBeUndefined()
+  })
+})
+
+describe('routeAuthOf (the principal the route handlers authorize on)', () => {
+  it('maps every credential kind to exactly the shape web.ts used to build inline', () => {
+    expect(routeAuthOf({ kind: 'token' })).toStrictEqual({ kind: 'token', agent: undefined })
+    expect(routeAuthOf({ kind: 'token', agent: MAIN_AGENT_ID })).toStrictEqual({ kind: 'token', agent: MAIN_AGENT_ID })
+    expect(routeAuthOf({ kind: 'device', device: 'phone', deviceId: 3, scope: 'full' })).toStrictEqual({ kind: 'device', device: 'phone', deviceId: 3, scope: 'full' })
+    expect(routeAuthOf({ kind: 'device', device: 'kiosk', deviceId: 4, scope: 'operator' })).toStrictEqual({ kind: 'device', device: 'kiosk', deviceId: 4, scope: 'operator' })
+    expect(routeAuthOf({ kind: 'session', user: 'owner' })).toStrictEqual({ kind: 'session', user: 'owner' })
+    expect(routeAuthOf({ kind: 'federation', peer: 'peer-a' })).toStrictEqual({ kind: 'federation', peer: 'peer-a' })
+    expect(routeAuthOf({ kind: 'none' })).toBeUndefined()
+  })
+
+  it('web.ts hands the route chain this mapping, with no second inline copy', () => {
+    const SRC = readFileSync(join(__dirname, '../web.ts'), 'utf-8')
+    expect(SRC).toMatch(/^\s*const ctxAuth = routeAuthOf\(auth\)$/m)
+    expect(SRC).toContain('const routeCtx: RouteContext = { req, res, path, method, url, fedPeer: fedPeerForCtx, auth: ctxAuth }')
+    expect(SRC).not.toMatch(/kind: '(token|device|session|federation)' as const/)
   })
 })

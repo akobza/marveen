@@ -7,7 +7,7 @@ import { runLsof } from './lsof.js'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, STORE_DIR } from './config.js'
 import { watchEgressAllowlistBaseline, queueAllowlistReport } from './web/egress-allowlist-baseline.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
-import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
+import { resolveAuth, requiresAuth, isFederationWireEndpoint, routeAuthOf, type AuthResult } from './web/auth-gate.js'
 import { operatorGateDecision } from './web/operator-gate.js'
 import { readOperatorAccess } from './web/operator-access.js'
 import { tryHandleOperatorAccess } from './web/routes/operator-access.js'
@@ -191,12 +191,7 @@ export function startWebServer(port = 3420): http.Server {
       }
     }
     const fedPeerForCtx: string | null = auth.kind === 'federation' ? auth.peer : null
-    const ctxAuth =
-      auth.kind === 'token' ? { kind: 'token' as const, agent: auth.agent }
-      : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId, scope: auth.scope }
-      : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
-      : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
-      : undefined
+    const ctxAuth = routeAuthOf(auth)
 
     // The mobile-login QR needs a URL the phone can actually reach. When the
     // desktop opens the dashboard on localhost, window.location.origin is
