@@ -40,7 +40,7 @@ import {
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
 import { resolveMainConfigDecision, type MainConfigDecision } from './main-config-decision.js'
-import { runMainContinueRestart, type ContinueRestartResult } from './main-rotation-continue.js'
+import { runMainContinueRestart, continueSurvived, type ContinueRestartResult } from './main-rotation-continue.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence, reapForeignMainPollers } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
@@ -1474,9 +1474,21 @@ export function shouldEscalateAfterResume(f: { claudePid: number | null; pluginA
 // channel becomes reachable again. respawnMarveenSessionFresh() writes the
 // respawn stamp, so lastMainRespawnAt() suppresses the down-cascade's redundant
 // stage-4 hard restart during the ensuing cold boot.
+//
+// 962faa19: the guard's question is about ONE resumed process. When the plan
+// rotation's fresh fallback has already replaced it (the resumed session did not
+// survive), the guard would judge the new, still-booting session instead and could
+// tear it down; the rotation bumps this epoch, and a guard scheduled under an older
+// epoch stands down.
+let postResumeGuardEpoch = 0
 function schedulePostResumePluginGuard(provider: ChannelProviderType): void {
+  const epoch = postResumeGuardEpoch
   setTimeout(() => {
     try {
+      if (epoch !== postResumeGuardEpoch) {
+        logger.info({ provider }, 'Post-resume guard: the resumed session was already replaced by the rotation fresh fallback -- standing down')
+        return
+      }
       const claudePid = getClaudePidForSession(MAIN_CHANNELS_SESSION)
       const pluginAlive = claudePid != null && hasChannelPluginAlive(claudePid, provider)
       if (!shouldEscalateAfterResume({ claudePid, pluginAlive })) {
@@ -1608,11 +1620,19 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
 // 8c338dc4: the plan rotation's opt-in continue restart (POST /api/claude-plans/rotate with
 // "continue": true): resumeMarveenSession's --continue respawn instead of the fresh one above,
 // with the fresh one as the fallback. The steps and their order live in main-rotation-continue.ts.
+// 962faa19: the resume is followed by a survival read of the session (a --continue without a
+// conversation exits at once), and a fresh fallback retires the pending post-resume guard.
 export function restartMainForRotationContinue(): Promise<ContinueRestartResult> {
   return runMainContinueRestart({
     stampConsent: stampFableOverageConsentSharedRoots,
     resume: resumeMarveenSession,
+    survived: () => continueSurvived({
+      sessionExists: mainChannelsSessionExists,
+      claudePid: () => getClaudePidForSession(MAIN_CHANNELS_SESSION),
+      wait: delay,
+    }),
     fresh: hardRestartMarveenChannels,
+    standDownResumeGuard: () => { postResumeGuardEpoch++ },
     warn: (message) => logger.warn(message),
   })
 }

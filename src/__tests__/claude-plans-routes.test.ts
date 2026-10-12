@@ -5,7 +5,7 @@
 // atomic-write path. hardRestartMarveenChannels/restartAgentProcess are
 // mocked -- this test must NEVER touch a real tmux session or process.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mkdtempSync, rmSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { encodeClaudeProjectDir } from '../claude-project-dir.js'
@@ -580,6 +580,11 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
   const shared = join(tmpRoot, '.channels-config')
   const transcripts = join(shared, 'projects', encodeClaudeProjectDir(tmpRoot))
   const stateOnDisk = () => (existsSync(CLAUDE_PLANS_STATE_PATH) ? JSON.parse(readFileSync(CLAUDE_PLANS_STATE_PATH, 'utf-8')) : null)
+  // 962faa19: a prior conversation is a transcript (<session>.jsonl) in that dir, not the dir itself.
+  const priorConversation = () => {
+    mkdirSync(transcripts, { recursive: true })
+    writeFileSync(join(transcripts, 'conv-1.jsonl'), '{"type":"user"}\n')
+  }
 
   beforeEach(() => {
     if (existsSync(CLAUDE_PLANS_PATH)) rmSync(CLAUDE_PLANS_PATH)
@@ -609,7 +614,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('token plan to token plan with a prior conversation: the --continue restart AFTER the state write, no fresh restart, mode in the response', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     let planAtRestart: string | undefined
     restartMainForRotationContinue.mockImplementation(async () => {
       planAtRestart = stateOnDisk()?.activePlanByAgent?.['agent-a']
@@ -626,7 +631,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('continue: false is the plain rotation: the fresh restart, and the response has no mode', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: false })
     await tryHandleClaudePlans(ctx)
     expect(out.status).toBe(200)
@@ -637,7 +642,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('a continue that is not a JSON boolean ("true") is 400: nothing written, nothing restarted', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: 'true' })
     await tryHandleClaudePlans(ctx)
     expect(out.status).toBe(400)
@@ -650,7 +655,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
   it('to a plan with its own configDir: 409 config-dir-changes, nothing written, nothing restarted', async () => {
     await seedTokenPlans()
     await tryHandleClaudePlans(fakeCtx('POST', '/api/claude-plans', plan({ id: 'team', label: 'Team Seat', configDir: '/opt/claude-team' })).ctx)
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'team', continue: true })
     await tryHandleClaudePlans(ctx)
     expect(out.status).toBe(409)
@@ -670,9 +675,23 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
     expect(restartMainForRotationContinue).not.toHaveBeenCalled()
   })
 
+  it('the transcript dir holds only memory/ and an empty .jsonl (962faa19): 409 no-prior-session, nothing written, nothing restarted', async () => {
+    await seedTokenPlans()
+    mkdirSync(join(transcripts, 'memory'), { recursive: true })
+    writeFileSync(join(transcripts, 'memory', 'MEMORY.md'), '- a note\n')
+    writeFileSync(join(transcripts, 'empty.jsonl'), '')
+    const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: true })
+    await tryHandleClaudePlans(ctx)
+    expect(out.status).toBe(409)
+    expect(out.body.error).toContain('no-prior-session')
+    expect(stateOnDisk()).toBeNull()
+    expect(hardRestartMarveenChannels).not.toHaveBeenCalled()
+    expect(restartMainForRotationContinue).not.toHaveBeenCalled()
+  })
+
   it('no active plan and no fleet token (the main agent is on the shared ~/.claude): 409 config-dir-changes, nothing written', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     fleetTokenPresent = false
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: true })
     await tryHandleClaudePlans(ctx)
@@ -685,7 +704,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('an active token plan without the fleet token keeps the shared dir: the --continue restart', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     fleetTokenPresent = false
     activeRotatedTokenId = 'claude-plan-token-tok-a'
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: true })
@@ -697,7 +716,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('the resume failed and the fresh fallback worked: 200 with mode fresh-fallback, the fleet leg as usual', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     fleetEnabled = true
     restartMainForRotationContinue.mockResolvedValue({ ok: true, mode: 'fresh-fallback' })
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: true })
@@ -709,7 +728,7 @@ describe('POST /api/claude-plans/rotate with "continue" (8c338dc4)', () => {
 
   it('the continue restart failed altogether: 500 with its error, and no fleet leg', async () => {
     await seedTokenPlans()
-    mkdirSync(transcripts, { recursive: true })
+    priorConversation()
     fleetEnabled = true
     restartMainForRotationContinue.mockResolvedValue({ ok: false, mode: 'fresh-fallback', error: 'respawn-pane boom' })
     const { ctx, out } = fakeCtx('POST', '/api/claude-plans/rotate', { targetPlanId: 'tok-b', continue: true })
