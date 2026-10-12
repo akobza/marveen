@@ -51,11 +51,17 @@ type AgentSkill = {
 }
 
 // List the skill directories under `dir`, tagging each with where it came from
-// and whether it can be deleted from this agent's view.
+// and whether it can be deleted from this agent's view. A folder whose name
+// starts with a dot is no skill: the skill folders are git repos, and their
+// .git must not be listed (or offered for delete). The global Skills route
+// (skills.ts) skips the same names.
 function scanSkillDir(dir: string, source: 'agent' | 'global', deletable: boolean): AgentSkill[] {
   if (!existsSync(dir)) return []
   return readdirSync(dir)
-    .filter((f) => { try { return statSync(join(dir, f)).isDirectory() } catch { return false } })
+    .filter((f) => {
+      if (f.startsWith('.')) return false
+      try { return statSync(join(dir, f)).isDirectory() } catch { return false }
+    })
     .map((f) => ({
       name: f,
       hasSkillMd: existsSync(join(dir, f, 'SKILL.md')),
