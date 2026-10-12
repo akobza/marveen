@@ -8,9 +8,19 @@ reply tool itself sent whatever the model wrote. This gate stops it.
 
 What it gates: the Telegram reply, react and edit_message tools (download_attachment
 only reads), and a Bash command that calls the Bot API's sending methods itself with
-curl or wget (card 23724bf8; telegram_bash_send.py finds the calls and their chats).
+curl or wget (card 23724bf8), or in the code text it gives an interpreter: python or
+python3 -c, a heredoc, here-string or pipe into python, node -e/--eval (card 25af1415);
+telegram_bash_send.py finds the calls and their chats.
 The decision is telegram_quiet_hours.send_decision(), shared with
 telegram_fallback_send.py, so the manual Bot API fallback cannot slip past it.
+
+The limit of this machine gate (card 25af1415, stated here on purpose): it reads the
+COMMAND TEXT. Two cases are outside it, and the owner's rule holds them, not the gate:
+  - a script file the command runs but did not write in the same command (one written
+    by an earlier command, or one that never was in a command); scripts/notify.sh is
+    the deliberate one, see below;
+  - a Bot API host that the command text does not hold (built at run time, read from a
+    file or from the environment).
 
 The Bash branch (card 23724bf8), decided with the same send_decision(), no exception
 inside it: every send found in the command is judged by its chat, and one that holds
@@ -144,7 +154,7 @@ def _bash_refusal(held):
                       for what, chat, _why in held)
     text = (
         "CSENDES-IDO KAPU: TILTVA (Bash, Telegram Bot API: %s). Oka: %s. A csendes idoben semmilyen "
-        "Telegram-uzenet nem megy ki ebbe a chatbe, Bash-bol (curl, wget) sem. Ami most keletkezett, az a "
+        "Telegram-uzenet nem megy ki ebbe a chatbe, Bash-bol (curl, wget, python, node) sem. Ami most keletkezett, az a "
         "csendes ido utan EGY kotegelt uzenetben megy." % (named, held[0][2])
     )
     if any(chat is None for _what, chat, _why in held):
