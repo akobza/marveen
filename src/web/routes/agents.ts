@@ -256,6 +256,15 @@ itt írhatod meg.
 const remoteRunStateCache = new RemoteStatusCache<AgentRunState>(5000)
 const remotePaneCache = new RemoteStatusCache<string | null>(3000)
 
+// The Agents page polls /api/agents/activity every 3 s, and each poll captured
+// every running local pane: one tmux fork per pane, per open tab (card
+// ea6f9b07). Local captures are shared for a window just under the poll, so a
+// tab still gets a fresh capture on each of its polls and further tabs reuse
+// it. The capture is synchronous, so two concurrent requests cannot both fork:
+// the second one finds the first one's answer.
+export const ACTIVITY_PANE_TTL_MS = 2500
+const localActivityPaneCache = new RemoteStatusCache<string | null>(ACTIVITY_PANE_TTL_MS)
+
 // Resolve an agent's run state, cached for remote agents to avoid blocking on
 // ssh. `isRemote` is passed by the caller (it already read the remote config).
 function agentRunStateCached(name: string, isRemote: boolean): AgentRunState {
@@ -865,7 +874,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
     // Main agent runs in the --channels session, not agent-<name>.
     {
-      const mainPane = capturePane(MAIN_CHANNELS_SESSION)
+      const mainPane = localActivityPaneCache.getOrRefresh(MAIN_CHANNELS_SESSION, Date.now(), () => capturePane(MAIN_CHANNELS_SESSION), null)
       const running = mainPane !== null
       const mainPaneCommand = running ? paneCurrentCommand(MAIN_CHANNELS_SESSION) : null
       entries.push({
@@ -889,7 +898,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       if (running) {
         pane = host
           ? remotePaneCache.getOrRefresh(name, Date.now(), () => capturePane(agentSessionName(name), host), null)
-          : capturePane(agentSessionName(name))
+          : localActivityPaneCache.getOrRefresh(agentSessionName(name), Date.now(), () => capturePane(agentSessionName(name)), null)
       }
       const paneCommand = running && !host ? paneCurrentCommand(agentSessionName(name)) : null
       const state = runState === 'unreachable' ? 'unreachable' : paneActivityLabel(running, pane, paneCommand)

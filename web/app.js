@@ -3908,6 +3908,9 @@ let _workingAgentIds = new Set()
 // has no session to look at, so its card was not clickable).
 let _liveAgentIds = new Set()
 function startAgentsBusyPoll() {
+  // A hidden tab shows nothing, and every poll costs the server one tmux capture
+  // per running pane (card ea6f9b07): the poll runs only while the tab is shown.
+  if (document.hidden) return
   refreshAgentTerminalBusy()
   if (agentsBusyTimer) clearInterval(agentsBusyTimer)
   agentsBusyTimer = setInterval(refreshAgentTerminalBusy, 3000)
@@ -3915,6 +3918,11 @@ function startAgentsBusyPoll() {
 function stopAgentsBusyPoll() {
   if (agentsBusyTimer) { clearInterval(agentsBusyTimer); agentsBusyTimer = null }
 }
+// Hidden tab: no busy poll; shown again on the Agents page: poll again at once.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopAgentsBusyPoll()
+  else if (!document.getElementById('agentsPage').hidden) startAgentsBusyPoll()
+})
 async function refreshAgentTerminalBusy() {
   let entries
   try {
