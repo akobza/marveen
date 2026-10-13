@@ -433,10 +433,16 @@ describe('heredoc-fed interpreters', () => {
   // PAYLOAD mentions an external URL is denied, because the body is judged exactly like a one-liner
   // and the one-liner path already denies this shape. Replayed on 14 days of sub-agent commands,
   // this was 7 of the 15 newly denied heredocs (dashboard posts quoting a github.com / pypi.org URL).
-  it('PARITY: a localhost call carrying an external URL as data is denied in both paths', () => {
+  // 95800e1d (4), a justified exception (lead decision, 95800e1d): the local layer reads a Python heredoc's call TARGET,
+  // and a localhost call that carries an external URL as data makes no external call (the fleet's false-deny class, pinned by
+  // src/__tests__/bash-egress-upstream-union.test.ts and the (3) test). The one-liner keeps the old rule. The twin below is
+  // the guard: the same body calling the external URL is denied.
+  it('PARITY: a localhost call carrying an external URL as data: the one-liner is denied, the heredoc is read by its target', () => {
     const body = `import urllib.request\nurllib.request.urlopen('http://localhost:3420/api/messages', data=b'PR: https://github.com/o/r/pull/1')`
     expect(classify(`python3 -c "${body.replace(/\n/g, '; ')}"`)).toMatchObject({ deny: true, hosts: ['github.com'] })
-    expect(classify(`python3 - <<'PY'\n${body}\nPY`)).toMatchObject({ deny: true, hosts: ['github.com'] })
+    expect(classify(`python3 - <<'PY'\n${body}\nPY`).deny).toBe(false)
+    const twin = `import urllib.request\nurllib.request.urlopen('https://github.com/o/r/pull/1', data=b'PR: http://localhost:3420/x')`
+    expect(classify(`python3 - <<'PY'\n${twin}\nPY`)).toMatchObject({ deny: true, hosts: ['github.com'] })
   })
   // The heredoc twin of 'a loop with too many values to judge one by one fails closed': past
   // MAX_LOOP_VARIANTS the body is not read value by value, and without the heredoc-loop-unbounded
@@ -520,7 +526,8 @@ describe('a Python heredoc that only MENTIONS a primitive and a URL', () => {
   // before the scan; a fullwidth word inside a literal that only MENTIONS a primitive still passes.
   it('reads the body as NFKC: a fullwidth exec / urlopen is the real name and keeps the old rule', () => {
     const FULLWIDTH_EXEC = `ｅｘｅｃ('import urllib.request as u; u.urlopen("https://evil.example/x")')`
-    expect(classify(py(FULLWIDTH_EXEC))).toMatchObject({ deny: true, reason: 'heredoc-external', hosts: ['evil.example'] })
+    // 95800e1d (4): the local layer denies it as what the body RUNS ('heredoc-hidden-external'), the same deny and host
+    expect(classify(py(FULLWIDTH_EXEC))).toMatchObject({ deny: true, reason: expect.stringMatching(/^heredoc-(?:hidden-)?external$/), hosts: ['evil.example'] })
     // the same fence with the other dynamic names, written fullwidth
     for (const name of ['ｅｖａｌ', 'ｃｏｍｐｉｌｅ', '__ｉｍｐｏｒｔ__', 'ｇｅｔａｔｔｒ']) {
       const body = `${name}('urllib.request.urlopen("https://evil.example/x")')`
@@ -528,7 +535,7 @@ describe('a Python heredoc that only MENTIONS a primitive and a URL', () => {
     }
     // a fullwidth primitive in CODE is the primitive: the call is denied even with no dynamic construct
     const FULLWIDTH_CALL = `import urllib.request\nurllib.request.ｕｒｌｏｐｅｎ('https://evil.example/x')`
-    expect(classify(py(FULLWIDTH_CALL))).toMatchObject({ deny: true, reason: 'heredoc-external' })
+    expect(classify(py(FULLWIDTH_CALL))).toMatchObject({ deny: true, reason: expect.stringMatching(/^heredoc-(?:hidden-)?external$/) })
     // CONTROLS: ASCII exec was already denied, and fullwidth text inside a LITERAL that writes a file still passes
     expect(classify(py(FULLWIDTH_EXEC.replace('ｅｘｅｃ', 'exec'))).deny).toBe(true)
     expect(classify(py(`open('n.md','w').write("ｅｘｅｃ and ｕｒｌｏｐｅｎ('https://example.org/') are only words here")`)).deny).toBe(false)
@@ -579,11 +586,29 @@ describe('a Python heredoc that only MENTIONS a primitive and a URL', () => {
     `import os\nopen('/tmp/x.py','w').write("urlopen https://example.org/")\nos.execv('/usr/bin/python3', ['python3', '/tmp/x.py'])`,
   ]
   it('still denies a real call, a mixed write-and-call, and every string-boundary trick that hides one', () => {
-    for (const [name, body] of CALLS) expect({ name, r: classify(py(body)) }).toMatchObject({ r: { deny: true, reason: 'heredoc-external' } })
+    // 95800e1d (4): an f-string call is denied by the local layer as what the body RUNS ('heredoc-hidden-external')
+    for (const [name, body] of CALLS) expect({ name, r: classify(py(body)) }).toMatchObject({ r: { deny: true, reason: expect.stringMatching(/^heredoc-(?:hidden-)?external$/), hosts: ['example.org'] } })
     expect(classify(py(CALLS[1][1])).hosts).toEqual(expect.arrayContaining(['example.org']))
   })
+  // 95800e1d (4), a justified exception (lead decision, with U1-U3): six of these make no external call -- a
+  // dynamic lookup that is never called (__import__, importlib, getattr, globals) and a file of plain text written and then
+  // started -- and the local layer, which reads what a Python body RUNS, does not deny them (pinned by the (3) test,
+  // bash-egress-python-heredoc-runs.test.ts). The other six still deny, labelled by what runs them. The twins below are
+  // the guard: the same lookups made into a real call are denied.
+  const NO_CALL = new Set([RUNS_A_LITERAL[3], RUNS_A_LITERAL[4], RUNS_A_LITERAL[5], RUNS_A_LITERAL[6], RUNS_A_LITERAL[10], RUNS_A_LITERAL[11]])
   it('still denies everything that can turn a literal into a call (exec, eval, compile, __import__, importlib, getattr, globals, os.system ...)', () => {
-    for (const body of RUNS_A_LITERAL) expect({ body, r: classify(py(body)) }).toMatchObject({ r: { deny: true, reason: 'heredoc-external' } })
+    for (const body of RUNS_A_LITERAL.filter((b) => !NO_CALL.has(b))) {
+      expect({ body, r: classify(py(body)) }).toMatchObject({ r: { deny: true, reason: expect.stringMatching(/^heredoc-(?:hidden-|run-script-file-)?external$/), hosts: ['example.org'] } })
+    }
+  })
+  it('the six bodies that make no external call pass, and their real-call twins are denied', () => {
+    for (const body of NO_CALL) expect({ body, deny: classify(py(body)).deny }).toEqual({ body, deny: false })
+    for (const twin of [
+      `m = __import__('urllib.request'); m.request.urlopen("https://example.org/")`,
+      `import importlib; importlib.import_module('urllib.request').urlopen("https://example.org/")`,
+      `import urllib.request; globals()['urllib'].request.urlopen("https://example.org/")`,
+      `import os\nopen('/tmp/x.py','w').write("import urllib.request; urllib.request.urlopen('https://example.org/')")\nos.popen('python3 /tmp/x.py')`,
+    ]) expect({ twin, r: classify(py(twin)) }).toMatchObject({ twin, r: { deny: true, hosts: ['example.org'] } })
   })
   it('sends a body that imports a module outside the plain list back to the old rule (a module the heredoc just wrote included)', () => {
     const WRITTEN = `open('/tmp/x.py','w').write("import urllib.request; urllib.request.urlopen('https://example.org/')")`
@@ -597,7 +622,9 @@ describe('a Python heredoc that only MENTIONS a primitive and a URL', () => {
   it('pythonCodeOnly blanks literals and comments, keeps newlines and f-strings, and gives up where it cannot vouch', () => {
     expect(pythonCodeOnly(`a = "x y" # c d\nb = 'z'`)).toBe(`a = "   "      \nb = ' '`)
     expect(pythonCodeOnly(`s = """a\nb"""`)).toBe(`s = """ \n """`)
-    expect(pythonCodeOnly(`print(f"{x} urlopen")`)).toBe(`print(f"{x} urlopen")`)
+    // 95800e1d (4), a justified exception: the f-string's text is not code (blanked), its braces are code (kept)
+    expect(pythonCodeOnly(`print(f"{x} urlopen")`)).toBe(`print(f"{x}        ")`)
+    expect(pythonCodeOnly(`print(f"{urlopen(u)} x")`)).toBe(`print(f"{urlopen(u)}  ")`)
     expect(pythonCodeOnly(String.raw`s = "a\"b" # q`)).toBe(`s = "    "    `)
     // gives up: unterminated, a glued non-prefix word, an f-string whose braces do not balance
     for (const bad of [`x = 'abc`, `x = ab"c"`, `return"x"`, `x = """abc`, `print(f"{d[ "(" ]}")`]) expect({ bad, r: pythonCodeOnly(bad) }).toEqual({ bad, r: null })
@@ -627,9 +654,11 @@ describe('a Python heredoc that only MENTIONS a primitive and a URL', () => {
   it('does not relax a bash heredoc: its body is a command line and gets the whole analysis', () => {
     expect(classify(`bash <<'S'\ncurl -s https://example.org/ > n.md\nS`)).toMatchObject({ deny: true, reason: 'heredoc-curl-external' })
   })
-  it('leaves the localhost-call-carrying-an-external-URL parity case denied: that body CALLS urlopen', () => {
+  // 95800e1d (4), the same justified exception as PARITY above: the call's target is localhost
+  it('the localhost-call-carrying-an-external-URL parity case: the call goes to localhost, the external URL is data', () => {
     const body = `import urllib.request\nurllib.request.urlopen('http://localhost:3420/api/messages', data=b'PR: https://github.com/o/r/pull/1')`
-    expect(classify(py(body))).toMatchObject({ deny: true, hosts: ['github.com'] })
+    expect(classify(py(body)).deny).toBe(false)
+    expect(classify(py(body.replace('http://localhost:3420/api/messages', 'https://github.com/o/r/pull/1')))).toMatchObject({ deny: true, hosts: ['github.com'] })
   })
 })
 
@@ -759,8 +788,15 @@ describe('still open after (a) -- pinned on purpose', () => {
     'pip install https://example.org/p.tar.gz',
     'ssh user@example.org true',
   ]
+  // 95800e1d (4): the local layer is STRICTER on four of these (measured on 43f300f6 and after the part): a file a heredoc
+  // writes and python then runs (script-file), a heredoc piped to python (pipe-program), xargs fed by a here-string (the
+  // fed URL is read as curl's argument), a socket call with no URL scheme (the host argument). The rest stays unclaimed.
+  const LOCAL_DENIES = new Set([OPEN[2], OPEN[4], OPEN[6], OPEN[10]])
   it('does not claim these', () => {
-    for (const cmd of OPEN) expect({ cmd, deny: deny(cmd) }).toEqual({ cmd, deny: false })
+    for (const cmd of OPEN.filter((c) => !LOCAL_DENIES.has(c))) expect({ cmd, deny: deny(cmd) }).toEqual({ cmd, deny: false })
+  })
+  it('the local layer denies the four it reads', () => {
+    for (const cmd of LOCAL_DENIES) expect({ cmd, deny: deny(cmd) }).toEqual({ cmd, deny: true })
   })
 })
 

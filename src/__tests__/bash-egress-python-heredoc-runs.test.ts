@@ -107,8 +107,11 @@ describe('still open -- pinned on purpose', () => {
   it('a written file that is not code, then run, stays allowed', () => {
     expect(run(PY("import os\nopen('/tmp/x.py','w').write(\"urlopen https://example.org/\")\nos.popen('python3 /tmp/x.py')")).deny).toBe(false)
   })
-  it('a node body that only mentions a call in text it writes stays allowed', () => {
-    expect(run("node <<'JS'\nrequire('fs').writeFileSync('n.md', \"call fetch('https://example.org/') like this\")\nJS").deny).toBe(false)
+  // 95800e1d (4), lead decision: REVERSED, from allowed to denied. The upstream rule's one relaxation (#1669) is
+  // Python's; a node body is judged by the old rule (a network primitive and an external URL in it deny), as the upstream
+  // test pins ("relaxes ONLY Python"). Measured on the fleet's Bash corpus (543 563 commands): no command is affected.
+  it('a node body that only mentions a call in text it writes is denied (the old rule; only Python is relaxed)', () => {
+    expect(run("node <<'JS'\nrequire('fs').writeFileSync('n.md', \"call fetch('https://example.org/') like this\")\nJS").deny).toBe(true)
   })
 })
 
