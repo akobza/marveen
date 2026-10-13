@@ -359,8 +359,9 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
 // LIVETREEGIT1010: a production git work tree the fleet works on and the unix
 // user that owns it. With BOTH set, every agent CLAUDE.md gets a generated rule
-// (ensureLiveTreeGitSection in web/agent-scaffold.ts): every git command on that
-// tree, `git status` and `git diff` included, runs as the owner. Empty by
+// (ensureLiveTreeGitSection in web/agent-scaffold.ts): no git command on that
+// tree, `git status` and `git diff` included, runs as root -- a root shell runs
+// it as the owner, any other shell directly (LIVETREEGIT1013). Empty by
 // default -- distribution-safe, no install's path or user is baked in -- and
 // either one missing means no block.
 export const LIVE_GIT_TREE_PATH = (cfg('LIVE_GIT_TREE_PATH') ?? '').trim()

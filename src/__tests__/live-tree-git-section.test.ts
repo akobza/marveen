@@ -1,15 +1,21 @@
 // Functional test for ensureLiveTreeGitSection() -- mirrors
-// fleet-auth-section.test.ts. LIVETREEGIT1010: the rule "every git on the
-// production work tree runs as its owner" lived only in a skill that loads on a
+// fleet-auth-section.test.ts. LIVETREEGIT1010: the rule "no git on the
+// production work tree runs as root" lived only in a skill that loads on a
 // trigger; a root-run `git status` left the tree's .git/index owned by root and
 // stopped the owner's git twice. The block carries the rule into every agent
 // CLAUDE.md, with the tree and the owner from two install settings.
+// LIVETREEGIT1013: one text for two kinds of shell -- a root shell runs git as
+// the owner (runuser), a restricted shell that refuses that prefix runs it
+// directly -- told apart by the shell's measured identity, not by a name list.
 //
-// What is pinned: with BOTH settings the block (and its command line) is in the
-// file exactly once, idempotently; with either missing, or not of a usable
+// What is pinned: with BOTH settings the block is in the file exactly once,
+// idempotently, with each of its two command forms exactly once: the runuser
+// form under the root identity, the direct form under any other. The block is
+// the same for every agent. With either setting missing, or not of a usable
 // shape, it is in the file zero times -- and a block from an earlier
-// configuration is taken out again. The surrounding prose is not pinned beyond
-// the terms the rule is about.
+// configuration (the previous owner-only text included) is replaced or taken
+// out again. The surrounding prose is not pinned beyond the terms the rule is
+// about.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -60,6 +66,9 @@ const OWNER = 'deploy'
 const SET = { path: TREE, owner: OWNER }
 const UNSET = { path: '', owner: '' }
 const COMMAND = `runuser -u ${OWNER} -- git -C ${TREE} ...`
+// The direct form is pinned with its backticks: without them it is a substring
+// of the runuser form.
+const DIRECT_COMMAND = `\`git -C ${TREE} ...\``
 
 function setup(agentName: string, content: string) {
   const dir = join(tmpRoot, 'agents', agentName)
@@ -82,13 +91,14 @@ beforeEach(() => {
 })
 
 describe('ensureLiveTreeGitSection', () => {
-  it('with both settings: the block and its command line are in the file exactly once', () => {
+  it('with both settings: the block and each of its two command lines are in the file exactly once', () => {
     setup('agent-b', '# Agent B\n\nSome persona.\n')
     ensureLiveTreeGitSection('agent-b', SET)
     const out = read('agent-b')
     expect(count(out, MARKER_BEGIN)).toBe(1)
     expect(count(out, MARKER_END)).toBe(1)
     expect(count(out, COMMAND)).toBe(1)
+    expect(count(out, DIRECT_COMMAND)).toBe(1)
     expect(out).toContain('Some persona.')
   })
 
@@ -100,7 +110,8 @@ describe('ensureLiveTreeGitSection', () => {
     // decision took that exception out (git diff rewrites the index anyway).
     expect(body).not.toMatch(/rootként csak/i)
     expect(body).not.toMatch(/olvasó alak/i)
-    expect(count(body, TREE)).toBe(1)
+    // The tree is named in the two command forms and nowhere else.
+    expect(count(body, TREE)).toBe(2)
   })
 
   it('is idempotent: a second call changes nothing', () => {
@@ -129,6 +140,7 @@ describe('ensureLiveTreeGitSection', () => {
     const out = read('agent-e')
     expect(count(out, MARKER_BEGIN)).toBe(1)
     expect(count(out, 'runuser -u app -- git -C /srv/other ...')).toBe(1)
+    expect(count(out, '`git -C /srv/other ...`')).toBe(1)
     expect(out).not.toContain(TREE)
   })
 
@@ -224,6 +236,74 @@ describe('ensureLiveTreeGitSection', () => {
     ensureLiveTreeGitSection('agent-a', SET)
     const out = readFileSync(join(tmpRoot, 'CLAUDE.md'), 'utf-8')
     expect(count(out, COMMAND)).toBe(1)
+  })
+})
+
+// LIVETREEGIT1013: the same tree is reached from a root shell and from a
+// restricted shell that refuses the runuser / sudo -u / su prefix. One text
+// serves both, and the agent picks its form by the shell's measured identity:
+// a swapped pair would tell root to run git on the tree directly, the very
+// thing the rule forbids.
+describe('one text for both shells (LIVETREEGIT1013)', () => {
+  // The block's list items, each with its indented continuation lines.
+  const items = (body: string) => body.split('\n- ').slice(1)
+
+  it('the root identity gets the runuser form, any other identity the direct form', () => {
+    const all = items(buildLiveTreeGitBody(SET))
+    const rootItems = all.filter((i) => i.startsWith('`root`'))
+    const otherItems = all.filter((i) => !i.startsWith('`root`'))
+    expect(rootItems).toHaveLength(1)
+    expect(otherItems).toHaveLength(1)
+    expect(rootItems[0]).toContain(COMMAND)
+    expect(rootItems[0]).not.toContain(DIRECT_COMMAND)
+    expect(otherItems[0]).toContain(DIRECT_COMMAND)
+    expect(otherItems[0]).not.toContain(COMMAND)
+  })
+
+  it('the measured identity of the shell picks the form (no measurement, no git), and the refused prefixes are named', () => {
+    const body = buildLiveTreeGitBody(SET)
+    expect(count(body, '`id -un`')).toBe(1)
+    expect(body).toMatch(/nem mérhető, a fán nem fut git/)
+    for (const prefix of ['`runuser`', '`sudo -u`', '`su`']) expect(body).toContain(prefix)
+  })
+
+  it('the block is the same for every agent and names none of them', () => {
+    writeFileSync(join(tmpRoot, 'CLAUDE.md'), '# Main\n', 'utf-8')
+    setup('agent-m', '# Agent M\n')
+    setup('agent-n', '# Agent N\n\nOther persona.\n')
+    ensureLiveTreeGitSection('agent-a', SET)
+    ensureLiveTreeGitSection('agent-m', SET)
+    ensureLiveTreeGitSection('agent-n', SET)
+    const block = (s: string) => s.slice(s.indexOf(MARKER_BEGIN), s.indexOf(MARKER_END) + MARKER_END.length)
+    const main = block(readFileSync(join(tmpRoot, 'CLAUDE.md'), 'utf-8'))
+    expect(main).toContain(COMMAND)
+    expect(block(read('agent-m'))).toBe(main)
+    expect(block(read('agent-n'))).toBe(main)
+    for (const name of ['agent-a', 'agent-b', 'agent-m', 'agent-n']) expect(main).not.toContain(name)
+  })
+
+  it('a block of the previous, owner-only text is replaced on the next run', () => {
+    const previous = [
+      '## Élő git-fa: minden git csak a tulajdonosként (MEGSZEGHETETLEN)',
+      '',
+      'Az élő git-fán minden git-parancs, a sima `git status` és a `git diff` is, csak a fa',
+      'tulajdonosaként fut, ebben az alakban:',
+      '',
+      `\`${COMMAND}\``,
+      '',
+      'Rootként ezen a fán semmilyen git nem fut, a `--no-optional-locks` alak sem kivétel: a',
+      '`git diff` és a `git diff --stat` azzal is újraírja az indexet. Ok: a rootként futtatott',
+      'git a fa `.git/index`-ét root-tulajdonúvá írja, és utána a tulajdonos minden git-parancsa',
+      '(a kiadásé is) hibával elhal.',
+    ].join('\n')
+    setup('agent-p', `# Agent P\n\n${MARKER_BEGIN}\n${previous}\n${MARKER_END}\n`)
+    ensureLiveTreeGitSection('agent-p', SET)
+    const out = read('agent-p')
+    expect(out).not.toContain('minden git csak a tulajdonosként')
+    expect(count(out, MARKER_BEGIN)).toBe(1)
+    expect(count(out, COMMAND)).toBe(1)
+    expect(count(out, DIRECT_COMMAND)).toBe(1)
+    expect(count(out, '`id -un`')).toBe(1)
   })
 })
 

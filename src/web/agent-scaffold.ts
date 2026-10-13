@@ -3359,8 +3359,16 @@ export function ensureFleetAuthSection(name: string): void {
 // append-only sections above, because a stale path must not keep instructing
 // every agent.
 // No root exception: `git diff` and `git diff --stat` rewrite the index even
-// with --no-optional-locks (git 2.53.0), so every git on the tree runs as its
-// owner, `git status` and `git diff` included.
+// with --no-optional-locks (git 2.53.0), so no git on the tree runs as root,
+// `git status` and `git diff` included.
+// LIVETREEGIT1013: one text for two kinds of shell. The same tree is reached
+// from a shell that runs as root and from a restricted shell that runs as an
+// ordinary user and refuses the runuser / sudo -u / su prefix. The root shell
+// runs git as the owner (runuser); any other shell runs it directly, as
+// itself. The agent tells the two apart by the shell's measured identity
+// (`id -un`; no measurement, no git there), so the template carries no list
+// of agent names: a second, hand-kept list would drift from the one the shell
+// enforces.
 const LIVE_TREE_GIT_BEGIN = '<!-- BEGIN GENERATED: live-tree-git (auto-generated, do not edit by hand) -->'
 const LIVE_TREE_GIT_END = '<!-- END GENERATED: live-tree-git -->'
 const LIVE_TREE_GIT_BLOCK_RE = new RegExp(
@@ -3379,17 +3387,21 @@ export function liveTreeGitConfig(): LiveTreeGitConfig {
 
 export function buildLiveTreeGitBody(cfg: LiveTreeGitConfig): string {
   return [
-    '## Élő git-fa: minden git csak a tulajdonosként (MEGSZEGHETETLEN)',
+    '## Élő git-fa: rootként semmilyen git (MEGSZEGHETETLEN)',
     '',
-    'Az élő git-fán minden git-parancs, a sima `git status` és a `git diff` is, csak a fa',
-    'tulajdonosaként fut, ebben az alakban:',
+    'Az élő git-fán rootként semmilyen git nem fut, a sima `git status` és a `git diff` sem,',
+    'és a `--no-optional-locks` alak sem kivétel: a `git diff` és a `git diff --stat` azzal is',
+    'újraírja az indexet. Ok: a rootként futtatott git a fa `.git/index`-ét root-tulajdonúvá',
+    'írja, és utána a tulajdonos minden git-parancsa (a kiadásé is) hibával elhal.',
     '',
-    `\`runuser -u ${cfg.owner} -- git -C ${cfg.path} ...\``,
+    'Az alakot a héj MÉRT identitása dönti el, nem emlékezet és nem névlista: abban a',
+    'héjban, ahol a git futna, előbb `id -un`. Ha az identitás nem mérhető, a fán nem fut git.',
     '',
-    'Rootként ezen a fán semmilyen git nem fut, a `--no-optional-locks` alak sem kivétel: a',
-    '`git diff` és a `git diff --stat` azzal is újraírja az indexet. Ok: a rootként futtatott',
-    'git a fa `.git/index`-ét root-tulajdonúvá írja, és utána a tulajdonos minden git-parancsa',
-    '(a kiadásé is) hibával elhal.',
+    '- `root` (rootként futó héj): a git csak a fa tulajdonosaként fut, ebben az alakban:',
+    `  \`runuser -u ${cfg.owner} -- git -C ${cfg.path} ...\``,
+    '- bármely más felhasználó (például egy korlátozott héj): közvetlenül, ebben az alakban:',
+    `  \`git -C ${cfg.path} ...\``,
+    '  Ott a `runuser`, a `sudo -u` és a `su` előtag elutasított.',
   ].join('\n')
 }
 
