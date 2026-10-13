@@ -2,6 +2,7 @@ import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   listPendingTaskRetries, deletePendingTaskRetryById, listTaskRunHistory,
+  logScheduleWrite, getScheduleWriteLog, type ScheduleWriteOp,
 } from '../../db.js'
 import { MAIN_AGENT_ID, currentBotName } from '../../config.js'
 import { runAgent } from '../../agent.js'
@@ -46,6 +47,30 @@ export function summarizeScheduledTasks(tasks: Array<{ enabled?: boolean }>): { 
   const enabled = tasks.filter(t => t.enabled !== false).length
   return { total: tasks.length, enabled, disabled: tasks.length - enabled }
 }
+
+// ffc45c28 (b): every successful schedule write leaves a row in schedule_write_log (see db.ts). The agent is the
+// X-Agent-Id the caller CLAIMED, as the auth gate resolved it (ctx.auth.agent: roster-checked, not authenticated).
+// A failed log write never fails the request: the schedule change already happened, so the error is logged.
+const SCHEDULE_FIELDS = new Set([
+  'description', 'prompt', 'schedule', 'agent', 'enabled', 'type', 'skipIfBusy', 'forceSend', 'targetSession', 'once',
+])
+// The names of the fields an update sent, never their values; a name outside the known set is "(other)", so a
+// caller-chosen key cannot carry text into the log.
+function sentFieldNames(data: Record<string, unknown>): string[] {
+  return [...new Set(Object.keys(data).map(k => (SCHEDULE_FIELDS.has(k) ? k : '(other)')))]
+}
+function recordScheduleWrite(
+  ctx: RouteContext,
+  entry: { op: ScheduleWriteOp; taskName: string; fields?: string[]; enabled?: boolean },
+): void {
+  try {
+    logScheduleWrite({ ...entry, claimedAgent: ctx.auth?.agent ?? null, authKind: ctx.auth?.kind ?? null })
+  } catch (err) {
+    logger.warn({ err, name: entry.taskName, op: entry.op }, 'Schedule write log insert failed')
+  }
+}
+const WRITE_LOG_DEFAULT_LIMIT = 200
+const WRITE_LOG_MAX_LIMIT = 1000
 
 export async function tryHandleSchedules(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
@@ -131,6 +156,28 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     return true
   }
 
+  // The write log for a schedule audit: newest first; since = unix seconds; a malformed value is
+  // refused (400), never read as "everything".
+  if (path === '/api/schedules/write-log' && method === 'GET') {
+    const sinceRaw = ctx.url.searchParams.get('since')
+    const limitRaw = ctx.url.searchParams.get('limit')
+    let since: number | undefined
+    if (sinceRaw !== null) {
+      if (!/^\d+$/.test(sinceRaw)) { json(res, { error: 'since must be unix seconds' }, 400); return true }
+      since = Number(sinceRaw)
+    }
+    let limit = WRITE_LOG_DEFAULT_LIMIT
+    if (limitRaw !== null) {
+      if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1) { json(res, { error: 'limit must be a positive integer' }, 400); return true }
+      limit = Math.min(Number(limitRaw), WRITE_LOG_MAX_LIMIT)
+    }
+    json(res, {
+      note: 'claimed_agent is the X-Agent-Id the caller sent (self-asserted, one shared token: not authenticated)',
+      rows: getScheduleWriteLog({ since, limit }),
+    })
+    return true
+  }
+
   if (path === '/api/schedules' && method === 'POST') {
     let body: Buffer
     try {
@@ -173,6 +220,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       targetSession: data.targetSession || undefined,
       once: data.once,
     })
+    recordScheduleWrite(ctx, { op: 'create', taskName: name })
     logger.info({ name, schedule: data.schedule, once: data.once === true }, 'Scheduled task created')
     json(res, { ok: true, name })
     return true
@@ -213,6 +261,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
       return true
     }
     writeScheduledTask(name, data)
+    recordScheduleWrite(ctx, { op: 'update', taskName: name, fields: sentFieldNames(data) })
     logger.info({ name }, 'Scheduled task updated')
     json(res, { ok: true })
     return true
@@ -228,6 +277,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     // next restart/update. Harmless for a user-authored task (the seeders only
     // ever revisit shipped names); a later re-create with this name clears it.
     markDefaultTaskRemoved(name)
+    recordScheduleWrite(ctx, { op: 'delete', taskName: name })
     logger.info({ name }, 'Scheduled task deleted')
     json(res, { ok: true })
     return true
@@ -247,6 +297,7 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     const newEnabled = !(config.enabled !== false)
     config.enabled = newEnabled
     atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+    recordScheduleWrite(ctx, { op: 'toggle', taskName: name, enabled: newEnabled })
     logger.info({ name, enabled: newEnabled }, 'Scheduled task toggled')
     json(res, { ok: true, enabled: newEnabled })
     return true

@@ -1241,6 +1241,26 @@ export function initDatabase(dbPathOverride?: string): void {
   // Migration: add agent column to installs that created the table before this column existed.
   try { db.exec(`ALTER TABLE store_file_audit ADD COLUMN agent TEXT`) } catch { /* column already exists */ }
 
+  // --- Schedule Write Log (every successful /api/schedules write, card ffc45c28) ---
+  // The self-pace gate sees a sub-agent's schedule write only in the Bash command text; a write sent from inside
+  // a script reaches the API unseen. The decision (ffc45c28 (b)) keeps that limit and records every write here,
+  // so a schedule audit can compare the schedules it finds with who wrote them. claimed_agent is the
+  // X-Agent-Id the caller CLAIMED (one shared token: self-asserted, never authenticated). No values are stored:
+  // no prompt, no cron, no token; for an update only the names of the fields sent.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schedule_write_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      op TEXT NOT NULL,
+      task_name TEXT NOT NULL,
+      claimed_agent TEXT,
+      auth_kind TEXT,
+      fields TEXT,
+      enabled INTEGER,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_schedule_write_log_ts ON schedule_write_log(created_at)`)
+
   // --- CostOps (local cost ledger) ---
   // Read-mostly, FOCUS-inspired. cost_sources = provider/subscription origin,
   // cost_line_items = individual charge rows (estimate or provider-sourced).
@@ -5198,6 +5218,49 @@ export function logStoreFileEvent(
 
 export function getRecentStoreFileEvents(limit = 200): StoreFileAuditRow[] {
   return db.prepare('SELECT * FROM store_file_audit ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as StoreFileAuditRow[]
+}
+
+// --- Schedule Write Log ---
+
+export type ScheduleWriteOp = 'create' | 'update' | 'delete' | 'toggle'
+
+export interface ScheduleWriteLogRow {
+  id: number
+  op: ScheduleWriteOp
+  task_name: string
+  claimed_agent: string | null
+  auth_kind: string | null
+  fields: string | null
+  enabled: number | null
+  created_at: number
+}
+
+export function logScheduleWrite(entry: {
+  op: ScheduleWriteOp
+  taskName: string
+  claimedAgent: string | null
+  authKind: string | null
+  fields?: string[]
+  enabled?: boolean
+}): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    'INSERT INTO schedule_write_log (op, task_name, claimed_agent, auth_kind, fields, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    entry.op, entry.taskName, entry.claimedAgent, entry.authKind,
+    entry.fields ? JSON.stringify([...entry.fields].sort()) : null,
+    entry.enabled === undefined ? null : entry.enabled ? 1 : 0,
+    now,
+  )
+}
+
+export function getScheduleWriteLog(opts: { since?: number; limit: number }): ScheduleWriteLogRow[] {
+  // id DESC as a tiebreaker: created_at has 1-second resolution.
+  if (opts.since !== undefined) {
+    return db.prepare('SELECT * FROM schedule_write_log WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?')
+      .all(opts.since, opts.limit) as ScheduleWriteLogRow[]
+  }
+  return db.prepare('SELECT * FROM schedule_write_log ORDER BY created_at DESC, id DESC LIMIT ?').all(opts.limit) as ScheduleWriteLogRow[]
 }
 
 // --- Unified Audit Log Query ---
