@@ -46,8 +46,10 @@
 // scp, rsync, dig ...).
 // Closing those is direction (b): an allowlist / network-level gate, not this hook.
 //
-// Fail-open on unparseable input or an internal error (logged): a crashed gate must not silence the
-// fleet; that is today's behaviour, not a new hole. Every DENY is appended to the block log.
+// Fail-CLOSED on unparseable input (a9c7bee0): a command maskInertLiterals cannot resolve (an unterminated quote or
+// heredoc, or a quoted/heredoc region that could run a command) is DENIED, labelled by the branch, because a
+// prompt-injection can hide a live call in a shape the parser cannot vouch for. An internal error also denies (V3).
+// Every DENY is appended to the block log (the branch label and hosts only -- never the command text).
 // Fail-CLOSED on a dependency that does not load (HOOKDEPLOAD1008): that is not one input the gate
 // failed on, it is a gate that judges nothing, so every Bash call is denied (exit 2) with the module
 // named. The main agent does not run this hook (agentGetsBashEgressParser), so the one session that
@@ -61,10 +63,11 @@ import { homedir } from 'node:os'
 // a conflicted merge, a renamed export) failed the module link before any line of this file ran:
 // node exited 1, which PreToolUse treats as NON-blocking, so a denied curl went through.
 let maskInertLiterals = null
+let maskInertReason = null
 let MASK_LOAD_ERROR = null
 try {
-  ({ maskInertLiterals } = await import('../self-pace-gate.mjs'))
-  if (typeof maskInertLiterals !== 'function') throw new Error('missing export: maskInertLiterals')
+  ({ maskInertLiterals, maskInertReason } = await import('../self-pace-gate.mjs'))
+  if (typeof maskInertLiterals !== 'function' || typeof maskInertReason !== 'function') throw new Error('missing export: maskInertLiterals/maskInertReason')
 } catch (err) {
   MASK_LOAD_ERROR = err
 }
@@ -1153,9 +1156,55 @@ function blankRanges(text, ranges) {
   return out.join('')
 }
 
+// a9c7bee0 fix2 (test finding): blank SHELL comments (length-preserving) so an apostrophe or `<<` in a comment is not
+// read as an unterminated quote/heredoc. EGRESS-PATH ONLY -- maskInertLiterals and the self-pace gate are byte-identical.
+// a9c7bee0 (c): this runs BEFORE liftSubstitutions inside classify (a comment's quote otherwise desyncs the lifter), so it
+// skips over $()/backtick substitutions opaquely -- a comment INSIDE a substitution is that subshell's concern, blanked by
+// the inner's own recursive classify. A `#` starts a comment only at an unquoted word boundary (prev char is start,
+// whitespace, or ;&|()<newline>) and runs to end of line; a `#` mid-word (http://x#frag), inside a quote, a substitution,
+// or a heredoc body is not a comment.
+function blankShellComments(command) {
+  const s = String(command ?? '')
+  const out = s.split('')
+  const blank = (a, b) => { for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' ' }
+  const atBoundary = (idx) => idx === 0 || /\s/.test(s[idx - 1]) || ';&|()\n'.includes(s[idx - 1])
+  let i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (c === '\\' && i + 1 < s.length) { i += 2; continue }
+    const here = /^<<-?\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))/.exec(s.slice(i))
+    if (here && atBoundary(i)) {
+      const tag = here[1] ?? here[2] ?? here[3]
+      i += here[0].length
+      const nl = s.indexOf('\n', i)
+      if (nl === -1) continue
+      i = nl + 1
+      const endRx = new RegExp(`^[ \\t]*${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*$`, 'm')
+      const rel = endRx.exec(s.slice(i))
+      if (!rel) { i = s.length; continue }
+      i += rel.index + rel[0].length
+      continue
+    }
+    if (c === "'") { const e = s.indexOf("'", i + 1); if (e === -1) { i = s.length; continue } i = e + 1; continue }
+    if (c === '$' && s[i + 1] === "'") { let j = i + 2; while (j < s.length && s[j] !== "'") j += s[j] === '\\' ? 2 : 1; if (j >= s.length) { i = s.length; continue } i = j + 1; continue }
+    if (c === '$' && s[i + 1] === '(') { i = substEnd(s, i); continue }
+    if (c === '`') { i = backtickEnd(s, i); continue }
+    if (c === '"') { let j = i + 1; while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1; if (j >= s.length) { i = s.length; continue } i = j + 1; continue }
+    if (c === '#' && atBoundary(i)) { const nl = s.indexOf('\n', i); blank(i, nl === -1 ? s.length : nl); i = nl === -1 ? s.length : nl; continue }
+    i += 1
+  }
+  return out.join('')
+}
+
 export function classify(command, depth = 0, vendorHosts = new Set(), vendorDomains = new Set(), ctx = {}) {
   const norm = String(command ?? '').replace(/\\\r?\n/g, ' ')
-  const { stripped: orig, inners } = liftSubstitutions(norm)
+  // a9c7bee0 (c): blank shell COMMENTS before lifting. A comment's apostrophe or quote otherwise desyncs
+  // liftSubstitutions' quote tracking, leaving a real $(...) inside "..." unlifted -> an unparseable
+  // idezojel-behelyettesit (measured: 12 of 13 such top-level denials were a `# ... it's ...` comment before
+  // the substitution). blankShellComments skips $()/backtick opaquely, so a comment inside a substitution is
+  // left to the inner's recursive classify. Both are length-preserving, so offsets still align.
+  const { stripped: lifted, inners } = liftSubstitutions(blankShellComments(norm))
+  const orig = lifted
   const masked = maskInertLiterals(orig)
   const parsed = masked !== null && masked.length === orig.length
   const funcs = new Set([...(ctx.funcs ?? []), ...(parsed ? definedFunctions(masked) : [])])
@@ -1170,7 +1219,18 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
     // a substitution runs in a subshell of this text: it sees its functions and its variables
     for (const inner of inners) { const r = classify(inner, depth + 1, vendorHosts, vendorDomains, { ...ctx, funcs, env: realEnv }); if (r.deny) return r }
   }
-  if (!parsed) return { deny: false, reason: 'unparseable', hosts: [] }
+  if (!parsed) {
+    // a9c7bee0 (owner decision A; fix2 test finding): fail-closed on an unparseable command that maskInertLiterals cannot
+    // resolve. ONLY at depth 0 -- the Bash INPUT the agent submits, which is the injection surface. A recursively read
+    // body (a script file, a sourced file, a bash -c string) that the masker cannot resolve keeps the prior best-effort
+    // allow: valid scripts routinely trip the text masker (measured: 132 valid .sh, e.g. agent-msg.sh's nested $() in
+    // quotes), a file on disk is not the typed input, and bash runs it. Shell comments are blanked above, so an
+    // apostrophe or `<<` in a comment no longer counts as unterminated. The upstream second opinion shares
+    // maskInertLiterals, so it sees the same unparseable input and never needs to re-decide it.
+    if (depth !== 0) return { deny: false, reason: 'unparseable', hosts: [] }
+    const branch = maskInertReason(orig)
+    return { deny: true, reason: branch ? `unparseable-${branch}` : 'unparseable', hosts: [] }
+  }
   const env = { ...(ctx.env ?? {}), ...collectAssignments(orig, masked) }
   const loops = collectLoops(orig, masked, env)
   // absolute path -> the heredoc `cat > PATH` wrote earlier in this command (or, for a command line a Python heredoc
@@ -1405,6 +1465,13 @@ const GATE_MSG =
   'csomagolva. A localhost/127.0.0.1 hivasok (dashboard) es a helyi halozat ' +
   '(10/8, 172.16/12, 192.168/16, *.local) szabadok. Kulso tartalmat ' +
   'a quarantine-reader sub-ugynokon at kerj le; ha ez egy vendor-API hivas, kerd a fo-agenst.'
+// a9c7bee0: an unparseable command (maskInertLiterals could not resolve it) is denied fail-closed; this message names
+// the branch and the fix. No command text is shown or logged, only the branch label.
+const UNPARSEABLE_MSG =
+  'Ertelmezhetetlen Bash-parancs TILTVA (egress hard-gate, fail-closed): a kapu nem tudta lezarni az idezojelet vagy a ' +
+  'heredocot, ezert nem tudja atvizsgalni, mi megy ki. Javitas: zard le a hianyzo idezojelet (\', ", $\'...\') vagy a ' +
+  'heredocot (a nyito tag parja egy sajat sorban); hosszu szoveget idezett heredocbol (<<\'EOF\') elobb fajlba irj, majd ' +
+  'a parancs a fajlt hasznalja. Ha a parancs helyes es megis elakad, jelezd a fo ugynoknek.'
 function isInvokedDirectly() {
   try { return realpathSync(fileURLToPath(import.meta.url)) === (process.argv[1] ? realpathSync(process.argv[1]) : '') } catch { return false }
 }
@@ -1445,17 +1512,25 @@ if (isInvokedDirectly()) {
         `(${err?.message ?? err}) -- fail-closed: minden Bash-hivas tiltva, amig a fajl nem javul. A javitas a fo ugynoke.\n`)
       process.exit(2)
     }
+    // a9c7bee0 fix2: feed the upstream the command with SHELL COMMENTS blanked, the same as the local layer sees. The
+    // upstream file stays the pinned copy (the pin and the EXEMPT test hold); only the INPUT is comment-blanked here, so a
+    // `# ... <<` comment no longer makes the upstream read an unterminated heredoc and give up (unparseable). That keeps a
+    // real external call after such a comment (the K6 shape) denied via the upstream, instead of slipping through.
+    const upCmd = blankShellComments(String(payload?.tool_input?.command ?? '').replace(/\\\r?\n/g, ' '))
     let h = null
-    try { h = up.classify(payload?.tool_input?.command, 0, up.loadVendorHosts(), up.loadVendorDomains()) } catch (e) { internalErrorDenies('upstream', e) }
+    try { h = up.classify(upCmd, 0, up.loadVendorHosts(), up.loadVendorDomains()) } catch (e) { internalErrorDenies('upstream', e) }
     const again = (c) => up.classify(c, 0, up.loadVendorHosts(), up.loadVendorDomains())
-    if (upstreamVerdictApplies(payload?.tool_input?.command, h, again)) r = { deny: true, reason: `upstream-${h.reason}`, hosts: h.hosts }
+    if (upstreamVerdictApplies(upCmd, h, again)) r = { deny: true, reason: `upstream-${h.reason}`, hosts: h.hosts }
   }
   if (r.deny) {
     try {
       mkdirSync(dirname(BLOCK_LOG), { recursive: true })
       appendFileSync(BLOCK_LOG, JSON.stringify({ ts: new Date().toISOString(), cwd: process.cwd(), reason: r.reason, hosts: r.hosts }) + '\n')
     } catch { /* the deny still stands; a log failure must not turn it into an allow */ }
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: `${GATE_MSG} (hoszt: ${r.hosts.join(', ')})` } }))
+    const decisionReason = typeof r.reason === 'string' && r.reason.startsWith('unparseable')
+      ? `${UNPARSEABLE_MSG} (ag: ${r.reason})`
+      : `${GATE_MSG} (hoszt: ${r.hosts.join(', ')})`
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decisionReason } }))
   }
   process.exit(0)
 }

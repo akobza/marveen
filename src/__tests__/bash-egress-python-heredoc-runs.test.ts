@@ -140,12 +140,12 @@ describe('the upstream exception is per-heredoc, not whole-command', () => {
     const PY_DATA = `python3 - <<'PY'\nimport urllib.request, json\nurllib.request.urlopen(urllib.request.Request('http://localhost:3420/api/x', data=json.dumps({'u': '${X}'}).encode()))\nPY`
     expect(run(NODE_BENIGN + '\n' + PY_DATA).deny).toBe(false)
   })
-  // K6 in the verdict (`# node - <<` comment before a perl external heredoc) is NOT closed here: the upstream parser
-  // itself does not flag it (its heredoc scan is thrown by the `<<` in the comment line), so there is no upstream deny
-  // for the exception to narrow. It equals today's behaviour (the local layer does not parse perl heredocs either); it
-  // is one of the still-open perl shapes, not a regression. Pinned so a later upstream fix is a deliberate flip.
-  it('K6: a `# ... <<` comment before a perl external heredoc stays allowed (upstream does not flag it)', () => {
-    expect(run('# node - << csak megjegyzes\n' + PERL).deny).toBe(false)
+  // K6 (`# ... <<` comment before a perl external heredoc): the `<<` in the comment line makes maskInertLiterals read an
+  // unterminated heredoc, so the whole command is UNPARSEABLE. As of a9c7bee0 (owner decision A) the local layer
+  // fail-closes on unparseable, so K6 is now DENIED (reason unparseable-heredoc-lezaratlan) -- the deliberate flip this
+  // case was pinned for. It is denied before the upstream second opinion runs, which never saw it as a deny anyway.
+  it('K6: a `# ... <<` comment before a perl external heredoc is now DENIED (a9c7bee0, unparseable fail-closed)', () => {
+    expect(run('# node - << csak megjegyzes\n' + PERL).deny).toBe(true)
   })
 })
 
