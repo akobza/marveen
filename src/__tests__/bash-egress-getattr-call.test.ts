@@ -28,6 +28,9 @@ describe('a Python heredoc that resolves a network call by getattr', () => {
     `import os; getattr(os, 'getpid')(); u = '${EXT}'`,
     // the external URL is only carried as data to a localhost call resolved by getattr
     `import urllib.request as r; getattr(r, 'urlopen')('http://localhost:3420/x', data=b'ref: ${EXT}')`,
+    // the tester's precision control (f8e45d25 verdict): a non-network attribute resolved the same way and called with an
+    // external URL as plain text, so the RESOLVED name decides, not the call shape
+    `import logging\ngetattr(logging, 'info')('${EXT}')`,
   ]
   it('denies the external call however the name is resolved', () => {
     for (const body of DENY) expect({ body, r: classify(py(body)) }).toMatchObject({ body, r: { deny: true, hosts: ['pelda-f8e45d25.invalid'] } })
