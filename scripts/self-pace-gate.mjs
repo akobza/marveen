@@ -272,7 +272,10 @@ export function splitSegments(command) {
 // happened to reject the following bar. So the primitive is not "split more
 // carefully", it is "the inert text must not be there": mask it out, then let
 // the existing splitter and regexes run unchanged on what remains.
-export function maskInertLiterals(command) {
+// a9c7bee0: the shared core of maskInertLiterals. Returns { text } when the command parses, or
+// { reason } naming which branch made it inert-unresolvable. maskInertLiterals keeps its old result
+// (the text, or null); maskInertReason exposes the reason. The self-pace gate is unchanged.
+function maskInertCore(command) {
   const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
   let cur = ''
   let i = 0
@@ -296,15 +299,15 @@ export function maskInertLiterals(command) {
       i += here[0].length
       // the body starts after the rest of THIS line
       const nl = src.indexOf('\n', i)
-      if (nl === -1) return null // heredoc announced but no body -> cannot resolve
+      if (nl === -1) return { reason: 'heredoc-nincs-torzs' }
       cur += src.slice(i, nl + 1)
       i = nl + 1
       // find the terminator line (leading tabs allowed for <<-)
       const endRx = new RegExp(`^[ \\t]*${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*$`, 'm')
       const rel = endRx.exec(src.slice(i))
-      if (!rel) return null // unterminated heredoc
+      if (!rel) return { reason: 'heredoc-lezaratlan' }
       const body = src.slice(i, i + rel.index)
-      if (!quotedTag && /\$\(|`/.test(body)) return null // unquoted tag expands the body
+      if (!quotedTag && /\$\(|`/.test(body)) return { reason: 'heredoc-idezetlen-tag-behelyettesit' }
       cur += blank(body) + rel[0]
       i += rel.index + rel[0].length
       continue
@@ -312,29 +315,39 @@ export function maskInertLiterals(command) {
 
     if (c === "'") { // literal until the next ' -- a backslash is NOT special here
       const end = src.indexOf("'", i + 1)
-      if (end === -1) return null
+      if (end === -1) return { reason: 'aposztrof-lezaratlan' }
       cur += blank(src.slice(i, end + 1)); i = end + 1; continue
     }
 
     if (c === '$' && src[i + 1] === "'") { // ANSI-C: \' does escape
       let j = i + 2
       while (j < src.length && src[j] !== "'") { j += src[j] === '\\' ? 2 : 1 }
-      if (j >= src.length) return null
+      if (j >= src.length) return { reason: 'ansic-lezaratlan' }
       cur += blank(src.slice(i, j + 1)); i = j + 1; continue
     }
 
     if (c === '"') {
       let j = i + 1
       while (j < src.length && src[j] !== '"') { j += src[j] === '\\' ? 2 : 1 }
-      if (j >= src.length) return null
+      if (j >= src.length) return { reason: 'idezojel-lezaratlan' }
       const inner = src.slice(i + 1, j)
-      if (/\$\(|`/.test(inner)) return null // may run a command -> not inert
+      if (/\$\(|`/.test(inner)) return { reason: 'idezojel-behelyettesit' }
       cur += blank(src.slice(i, j + 1)); i = j + 1; continue
     }
 
     cur += c; i++
   }
-  return cur
+  return { text: cur }
+}
+export function maskInertLiterals(command) {
+  const r = maskInertCore(command)
+  return r.text !== undefined ? r.text : null
+}
+// a9c7bee0: which branch made a command inert-unresolvable (null in maskInertLiterals), or null when it parses.
+// Same core, so it cannot drift from maskInertLiterals.
+export function maskInertReason(command) {
+  const r = maskInertCore(command)
+  return r.reason !== undefined ? r.reason : null
 }
 
 // Blank out curl/HTTP DATA-PAYLOAD arguments before self-pace matching. A -d /
