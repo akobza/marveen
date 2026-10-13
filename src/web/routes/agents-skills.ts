@@ -157,9 +157,15 @@ export async function tryHandleAgentsSkills(ctx: RouteContext): Promise<boolean>
   const skillActionMatch = path.match(/^\/api\/agents\/([^/]+)\/skills\/([^/]+)$/)
   if (skillActionMatch && method === 'DELETE') {
     const name = sanitizeAgentName(decodeURIComponent(skillActionMatch[1]))
-    const skillName = sanitizeSkillName(decodeURIComponent(skillActionMatch[2]))
-    if (!name || !skillName) { json(res, { error: 'Invalid agent or skill name' }, 400); return true }
+    // The DELETE targets exactly the folder name the list shows (scanSkillDir lists a skill by its folder name). Run
+    // through sanitizeSkillName the name was rewritten: ".git" became "git" and targeted that skill, and a listed
+    // "v1.2-notes" or "My_Skill" could not be deleted at all. A name the list never shows (empty, a leading dot, a
+    // path separator) is not found; safeJoin below still keeps the target inside the skills folder.
+    const rawSkillName = decodeURIComponent(skillActionMatch[2])
+    if (!name || !rawSkillName) { json(res, { error: 'Invalid agent or skill name' }, 400); return true }
     if (!agentExistsFor(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (rawSkillName.startsWith('.') || /[/\\\0]/.test(rawSkillName)) { json(res, { error: 'Skill not found' }, 404); return true }
+    const skillName = rawSkillName
     let skillDir: string
     try {
       skillDir = safeJoin(skillsRootFor(name), skillName)
