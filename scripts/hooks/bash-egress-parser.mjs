@@ -785,6 +785,71 @@ export function pythonBodyPlan(body, depth = 0) {
       plan.written.push(...inner.written)
     }
   }
+  // f8e45d25: a dynamic attribute lookup that resolves a network primitive by NAME and calls the result. The destination
+  // reading (codeDestinations) looks for a known callee word, but here that word is a STRING the code mask has blanked, and
+  // the call is on the getattr result, not on a named callee: `getattr(m, 'urlopen')(url)`, the name built from pieces
+  // (`getattr(m, 'url' + 'open')(url)`), or the result bound first (`f = getattr(m, 'urlopen'); f(url)`). Read each as the
+  // static call `x.<name>(<the call's own args>)` and hand that to codeDestinations, so the URL in the call is found. The
+  // name is resolved from string literals (one, or a `+`-concatenation of them) and from names bound to a string literal
+  // above; a name that is not a network primitive makes codeDestinations find nothing, so this stays precise.
+  const litName = (seg) => {
+    // the string value of a segment that is one literal or a `+`-concatenation of literals (else null)
+    let out = ''
+    const re = /([rRbBuU]{0,2})(['"])/g
+    let last = 0
+    let mm
+    while ((mm = re.exec(seg))) {
+      // between pieces only blanks, `+` (concatenation) and an opening `(`; nothing else
+      if (!/^[\s+(]*$/.test(seg.slice(last, mm.index))) return null
+      const q = mm.index + mm[1].length
+      const quote = seg[q]
+      const close = seg.startsWith(quote.repeat(3), q) ? quote.repeat(3) : quote
+      const end = seg.indexOf(close, q + close.length)
+      if (end === -1) return null
+      out += /[rR]/.test(mm[1]) ? seg.slice(q + close.length, end) : pyUnescape(seg.slice(q + close.length, end))
+      last = end + close.length
+      re.lastIndex = last
+    }
+    return out && /^[\s)]*$/.test(seg.slice(last)) ? out : null
+  }
+  // the second argument of a getattr(...) call: its resolved name, or null. `goOpen` is the `(` of getattr.
+  const getattrName = (goOpen) => {
+    const goClose = pyClose(mask, goOpen)
+    if (goClose === -1) return null
+    const comma = mask.slice(goOpen + 1, goClose).indexOf(',')
+    if (comma === -1) return null
+    const from = goOpen + 1 + comma + 1
+    const seg = text.slice(from, goClose)
+    const mseg = mask.slice(from, goClose)
+    const direct = litName(seg)
+    if (direct !== null) return direct
+    const id = /^\s*([A-Za-z_]\w*)\s*$/.exec(mseg)
+    return id ? (bound.get(id[1]) ?? null) : null
+  }
+  const dynCall = (name, callOpen) => {
+    const callClose = pyClose(mask, callOpen)
+    if (callClose === -1) return
+    const snippet = `x.${name}${text.slice(callOpen, callClose + 1)}`
+    for (const h of codeDestinations(snippet, 'py')) hosts.add(h)
+  }
+  // a name bound to a getattr(...) result, called later: `f = getattr(m, 'urlopen')`
+  const dynBound = new Map()
+  for (const m of mask.matchAll(/(?:^|[\n;])[ \t]*([A-Za-z_]\w*)[ \t]*=(?!=)[ \t]*getattr\s*\(/g)) {
+    const name = getattrName(m.index + m[0].length - 1)
+    if (name) dynBound.set(m[1], name)
+  }
+  for (const m of mask.matchAll(/\bgetattr\s*\(/g)) {
+    const goOpen = m.index + m[0].length - 1
+    const goClose = pyClose(mask, goOpen)
+    if (goClose === -1) continue
+    const after = /^\s*\(/.exec(mask.slice(goClose + 1, goClose + 20))
+    if (!after) continue // the getattr result is not called here
+    const name = getattrName(goOpen)
+    if (name) dynCall(name, goClose + 1 + after[0].length - 1)
+  }
+  for (const [f, name] of dynBound) {
+    for (const m of mask.matchAll(new RegExp(`(?<![\\w.])${f}\\s*\\(`, 'g'))) dynCall(name, m.index + m[0].length - 1)
+  }
   // the command lines it starts
   const procAlias = new Set(['subprocess'])
   for (const m of mask.matchAll(/\bimport\s+[^\n;]*?\bsubprocess\s+as\s+([A-Za-z_]\w*)/g)) procAlias.add(m[1])
