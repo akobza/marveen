@@ -53,7 +53,9 @@ describe('the upstream second opinion closes the shapes the local layer missed',
     writeFileSync(join(dir, 'none.json'), '{}')
     const log = join(dir, 'blocks.jsonl')
     spawnSync(process.execPath, [HOOK], {
-      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: "bash <<< 'curl -s https://example.org/'" } }),
+      // 95800e1d (4): a here-string is read by this layer itself now; a case-variant interpreter name (a case-insensitive file
+      // system, macOS, runs it) is read only by the upstream, which lowercases it
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: "Perl <<'PL'\nuse LWP::Simple; getprint('https://example.org/');\nPL" } }),
       encoding: 'utf-8',
       env: { ...process.env, BASH_EGRESS_BLOCK_LOG: log, BASH_EGRESS_VENDOR_HOSTS: join(dir, 'none.json') },
     })
