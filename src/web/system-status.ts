@@ -243,6 +243,8 @@ export function formatQuota(q: QuotaSnapshot): { fiveHour: string; sevenDay: str
 // each cached version's server.ts is re-read for the marker, so a plugin
 // version that arrived after the start shows up too.
 export const PLUGIN_PATCH_MARKER = 'MARVEEN-PATCH(elsokor922-d4)'
+// One patch row; closedMarker/closedFallback only on a patch with a fail-closed fallback (fc8629d7).
+type PluginPatch = { name: string; marker: string; label: string; fallback: string; closedMarker?: string; closedFallback?: string }
 // The independent patches, each with what the owner loses without it.
 const PLUGIN_PATCHES = [
   { name: 'd4', marker: PLUGIN_PATCH_MARKER, label: '', fallback: 'a /status és a /help a plugin saját válasza' },
@@ -269,7 +271,7 @@ export function telegramPluginPatchStatus(stateFile = join(STORE_DIR, 'telegram-
   if (versions.length === 0) return `nincs Telegram plugin a cache-ben (${state.root})`
   const texts = new Map(versions.map(v => [v, readFileSync(join(base, v, 'server.ts'), 'utf-8')]))
   const lines: string[] = []
-  const expected = state.topics === 'on' ? [...PLUGIN_PATCHES, TOPICS_PLUGIN_PATCH] : PLUGIN_PATCHES
+  const expected: PluginPatch[] = state.topics === 'on' ? [...PLUGIN_PATCHES, TOPICS_PLUGIN_PATCH] : PLUGIN_PATCHES
   for (const p of expected) {
     const missing: string[] = []
     const missingVersions: string[] = []
