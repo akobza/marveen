@@ -291,7 +291,7 @@ describe('Telegram plugin-patch row', () => {
   })
 
   it('topics: not expected while the switch is off, measured like the others while it is on', () => {
-    const fixed = '// MARVEEN-PATCH(elsokor922-d4): x\n// MARVEEN-PATCH(elsokor922-fwd): y\n// MARVEEN-PATCH(cmd920-evid): z\n// MARVEEN-PATCH(c67f5f34-kbd): w\n// MARVEEN-PATCH(fc8629d7-perm): v'
+    const fixed = '// MARVEEN-PATCH(elsokor922-d4): x\n// MARVEEN-PATCH(elsokor922-fwd): y\n// MARVEEN-PATCH(cmd920-evid): z\n// MARVEEN-PATCH(c67f5f34-kbd): w\n// MARVEEN-PATCH(fc8629d7-perm): v\n// MARVEEN-PATCH(426fa59f-reply-v3): t'
     server('0.0.7', fixed)
     const withTopics = (topics: string, patches: Record<string, string>) =>
       writeFileSync(state, JSON.stringify({ at: 0, root: join(dir, 'cache'), topics, files: [{ version: '0.0.7', status: 'patched', patches }] }))

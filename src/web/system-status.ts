@@ -243,8 +243,9 @@ export function formatQuota(q: QuotaSnapshot): { fiveHour: string; sevenDay: str
 // each cached version's server.ts is re-read for the marker, so a plugin
 // version that arrived after the start shows up too.
 export const PLUGIN_PATCH_MARKER = 'MARVEEN-PATCH(elsokor922-d4)'
-// One patch row; closedMarker/closedFallback only on a patch with a fail-closed fallback (fc8629d7).
-type PluginPatch = { name: string; marker: string; label: string; fallback: string; closedMarker?: string; closedFallback?: string }
+// One patch row; closedMarker/closedFallback only on a patch with a fail-closed fallback (fc8629d7),
+// oldMarker/oldNote only on a patch that replaces an earlier version of itself (426fa59f).
+type PluginPatch = { name: string; marker: string; label: string; fallback: string; closedMarker?: string; closedFallback?: string; oldMarker?: string; oldNote?: string }
 // The independent patches, each with what the owner loses without it.
 const PLUGIN_PATCHES = [
   { name: 'd4', marker: PLUGIN_PATCH_MARKER, label: '', fallback: 'a /status és a /help a plugin saját válasza' },
