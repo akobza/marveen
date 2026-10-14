@@ -263,3 +263,18 @@ describe('scope: the email contract is unchanged', () => {
     expect(cases._comment).toContain('KANBANHOMOGLIF927')
   })
 })
+
+describe('the known limit is said in the block (card fbca08d6, decision of 2026-10-14)', () => {
+  // Next to Latin every Cyrillic letter counts, also one with no Latin twin (U+043B here), so real Cyrillic content
+  // glued to a Latin word stops too. The writer reads that this is the rule, not a misfire.
+  const CYR_EL = String.fromCodePoint(0x43b)
+  it('a kanban comment with a Cyrillic letter that has no Latin twin blocks, and the block names the known limit', () => {
+    const r = gate(heredoc(COMMENT, JSON.stringify({ author: 'agent-a', content: `hozzatete${CYR_EL}ed` })))
+    expect(r.code).toBe(2)
+    expect(r.err).toContain('Ismert hatar: latin szoban allo VALODI cirill betu is megall')
+  })
+  it('a Greek unit next to Latin passes the same gate', () => {
+    const r = gate(heredoc(COMMENT, JSON.stringify({ author: 'agent-a', content: `p95 = 10 ${String.fromCodePoint(0x3bc)}s` })))
+    expect(r.code).toBe(0)
+  })
+})
