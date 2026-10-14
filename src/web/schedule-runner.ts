@@ -9,8 +9,10 @@ import {
   type GapGuardDeps,
 } from './heartbeat-direct-digest.js'
 import { verifyHeartbeatKanban, HEARTBEAT_KANBAN_WINDOW_SEC } from './heartbeat-kanban-verify.js'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
+import { freshSessionName, launchFreshSession, killFreshSession, listFreshSessions } from './fresh-session.js'
+import { tryResolveFromPath } from '../platform.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
 import { decideDesktopGate, readDesktopLock, recordDesktopSkip } from './desktop-lock.js'
@@ -192,6 +194,11 @@ export interface TaskInflightEntry {
   // `undefined` inside the list means the shared ~/.claude default.
   workingDir: string
   configDirs: ReadonlyArray<string | undefined>
+  // cc457550: set when the round runs in a FRESH session of its own (freshSession: true). The main session writes into
+  // the same project directory, so sawTurn then reads THIS session's own transcript (--session-id) instead of the
+  // newest one there, and a closing decision stops the session.
+  freshSession?: boolean
+  freshTranscript?: string
   // Per-task stuck threshold, resolved at injection time from the task config
   // (see resolveStuckTimeoutMs). Captured on the entry rather than looked up
   // during the sweep so an edit to the schedule mid-run cannot move the
@@ -1409,9 +1416,11 @@ function mcpMissingReason(taskName: string, agentName: string): string {
 // copy of this derivation would drift, and a janitor aimed at the wrong session
 // is worse than no janitor at all.
 export function resolveTaskTarget(
-  task: Pick<ScheduledTask, 'targetSession'>,
+  task: Pick<ScheduledTask, 'targetSession'> & Partial<Pick<ScheduledTask, 'name' | 'freshSession'>>,
   agentName: string,
 ): { session: string; host: string | null } {
+  // cc457550: a fresh-session task never targets the agent's long-running session; its own is local.
+  if (task.freshSession && task.name) return { session: freshSessionName(task.name, agentName), host: null }
   const isMainAgent = agentName === MAIN_AGENT_ID
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
@@ -1424,6 +1433,69 @@ export function resolveTaskTarget(
   // targetSession override and the main channels agent stay local (host=null).
   const host = (task.targetSession || isMainAgent) ? null : readAgentRemoteHost(agentName)
   return { session, host }
+}
+
+// cc457550: fresh sessions this runner launched and has not delivered into yet (session -> launch time, transcript).
+// A sched-* session that is alive but NOT in here (and not tracked in flight) is a leftover -- a dashboard restart lost
+// its tracking, or it outlived its round -- and is never delivered into: a fresh round never reuses a session.
+const freshLaunches = new Map<string, { launchedAt: number; transcriptPath: string }>()
+// How long a launched session may take to reach its prompt. Past it the launch is called failed (stopped, 'missing'),
+// never relaunched in the same attempt: a session parked on a dialog would otherwise relaunch every tick.
+const FRESH_BOOT_TIMEOUT_MS = 5 * 60_000
+
+function freshTmuxBin(): string {
+  return tryResolveFromPath('tmux') ?? 'tmux'
+}
+
+function freshTranscriptMtime(path: string): number | null {
+  try { return statSync(path).mtimeMs } catch { return null }
+}
+
+/** cc457550: the round is over (done, abandoned or lost): its session stops. A lost round's retry launches a new one. */
+function stopFreshRound(entry: Pick<TaskInflightEntry, 'freshSession' | 'session' | 'taskName'>, why: string): void {
+  if (!entry.freshSession) return
+  const stopped = killFreshSession(freshTmuxBin(), entry.session, PROJECT_ROOT)
+  logger.info({ task: entry.taskName, session: entry.session, why, stopped }, 'Fresh scheduled session stopped at the end of its round')
+}
+
+export async function prepareFreshSession(
+  task: Pick<ScheduledTask, 'name'>,
+  agentName: string,
+  session: string,
+  now: number,
+): Promise<'ready' | 'starting' | 'busy' | 'missing'> {
+  if (taskInflightMap.get(`${task.name}@${agentName}`)?.freshSession) return 'busy' // the previous round still runs
+  const launched = freshLaunches.get(session)
+  const exists = sessionExistsOnHost(null, session)
+  if (exists && launched) {
+    if (now - launched.launchedAt <= FRESH_BOOT_TIMEOUT_MS) return 'ready'
+    killFreshSession(freshTmuxBin(), session, PROJECT_ROOT)
+    freshLaunches.delete(session)
+    logger.warn({ task: task.name, session, bootMs: now - launched.launchedAt }, 'Fresh scheduled session never reached its prompt in time -- stopped, this occurrence is not delivered')
+    return 'missing'
+  }
+  if (exists) {
+    killFreshSession(freshTmuxBin(), session, PROJECT_ROOT)
+    logger.warn({ task: task.name, session }, 'Fresh scheduled session: a leftover sched- session stopped before the new launch')
+  }
+  freshLaunches.delete(session)
+  // Loaded on the fresh path only: the long-running path (and every test that mocks it) never pulls channel-monitor in.
+  const { readConfiguredMainModel } = await import('./channel-monitor.js')
+  const res = launchFreshSession(task.name, agentName, {
+    installDir: PROJECT_ROOT,
+    claudeBin: tryResolveFromPath('claude'),
+    nodeBin: process.execPath,
+    tmuxBin: freshTmuxBin(),
+    channelProvider: CHANNEL_PROVIDER,
+    model: () => readConfiguredMainModel(PROJECT_ROOT),
+  })
+  if (!res.ok) {
+    logger.warn({ task: task.name, session, error: res.error }, 'Fresh scheduled session: launch failed, nothing started')
+    return 'missing'
+  }
+  freshLaunches.set(session, { launchedAt: now, transcriptPath: res.transcriptPath })
+  logger.info({ task: task.name, agent: agentName, session, sessionId: res.sessionId }, 'Fresh scheduled session launched; will deliver on retry')
+  return 'starting'
 }
 
 async function attemptFireTask(
@@ -1447,6 +1519,13 @@ async function attemptFireTask(
   // report false while the restart is only half done (see restart-lock.ts).
   // 'busy' is the honest answer: the normal retry path delivers once it is over.
   if (isRestartInFlight(agentName)) return 'busy'
+
+  // cc457550: a fresh-session task gets a session of its own per occurrence; the first attempt launches it and the
+  // ordinary retry delivers once it is ready, through the same readiness / send / task_runs path as any task.
+  if (task.freshSession) {
+    const prep = await prepareFreshSession(task, agentName, session, now)
+    if (prep !== 'ready') return prep
+  }
 
   if (!sessionExistsOnHost(host, session)) {
     // The main channels session is service-managed (systemd/launchd via
@@ -1807,9 +1886,12 @@ async function attemptFireTask(
       taskType: task.type,
       // Local agents only: a remote agent's transcript is on its own host.
       ...(host == null ? { sentText: paneOneLine(fullPrompt), typedAt } : {}),
+      ...(task.freshSession ? { freshSession: true, freshTranscript: freshLaunches.get(session)?.transcriptPath } : {}),
       deliveryPending: true,
     }
     taskInflightMap.set(`${task.name}@${agentName}`, inflightEntry)
+    // cc457550: delivered -- from here the sweep owns the fresh session (and stops it on the closing decision).
+    if (task.freshSession) freshLaunches.delete(session)
     // Every exit of the resubmit chain below ends the delivery phase, after
     // which an idle pane without a turn is judged by the sweep again.
     const endDelivery = (): void => { inflightEntry.deliveryPending = false }
@@ -2463,6 +2545,16 @@ export function startScheduleRunner(): NodeJS.Timeout {
   } catch (err) {
     logger.warn({ err }, 'task-run restart reconcile failed (non-fatal)')
   }
+  // cc457550: the same restart orphans every fresh round's session (their tracking was in that map too). A sched-*
+  // session nobody watches would never stop, so each one is stopped here; its run was just closed as interrupted.
+  try {
+    for (const s of listFreshSessions(freshTmuxBin(), PROJECT_ROOT)) {
+      const stopped = killFreshSession(freshTmuxBin(), s, PROJECT_ROOT)
+      logger.info({ session: s, stopped }, 'Fresh scheduled session orphaned by a restart -- stopped')
+    }
+  } catch (err) {
+    logger.warn({ err }, 'fresh-session restart sweep failed (non-fatal)')
+  }
 
   // Sleep/wake detection for the downtime-aware alert suppression above
   // (idempotent; the channel monitor starts it too, whichever runs first wins).
@@ -2568,7 +2660,10 @@ export function startScheduleRunner(): NodeJS.Timeout {
         if (state === 'busy') {
           entry.sawTurn = true
         } else {
-          lastMtimeSeen = readTranscriptMtimeAcrossConfigDirs(entry.workingDir, entry.configDirs)
+          // cc457550: a fresh round's evidence is its OWN transcript; the main session writes into the same directory.
+          lastMtimeSeen = entry.freshTranscript
+            ? freshTranscriptMtime(entry.freshTranscript)
+            : readTranscriptMtimeAcrossConfigDirs(entry.workingDir, entry.configDirs)
           if (lastMtimeSeen != null && lastMtimeSeen > entry.injectedAt) entry.sawTurn = true
         }
       }
@@ -2632,6 +2727,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
           )
         }
         taskInflightMap.delete(key)
+        stopFreshRound(entry, decision)
       } else if (decision === 'alert') {
         sendTaskInflightMainAgentNotice(entry, now - entry.injectedAt)
         entry.alerted = true
@@ -2713,6 +2809,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
           insertPendingTaskRetryIfNew(entry.taskName, entry.agentName, now, 'lost-injection')
         }
         taskInflightMap.delete(key)
+        stopFreshRound(entry, 'lost')
       }
     }
 

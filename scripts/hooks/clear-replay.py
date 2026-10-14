@@ -22,6 +22,10 @@ import ledger_lib  # noqa: E402
 
 
 def main():
+    # cc457550: a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) has no pre-/clear state of its own; replaying the long-running session's would hand it someone else's.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:

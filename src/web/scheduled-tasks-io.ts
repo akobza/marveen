@@ -102,6 +102,10 @@ export interface ScheduledTask {
   // `agent-<name>` or MAIN_CHANNELS_SESSION. Enables dedicated
   // scheduler-only sessions in the future.
   targetSession?: string
+  // cc457550 (a9c75fd8): run each occurrence in a FRESH session of its own instead of injecting it into the
+  // agent's long-running one, whose context the round would otherwise grow (the main agent's scheduled rounds ran in a
+  // 450-630k context). Only a literal true turns it on; the way back is deleting the key from task-config.json.
+  freshSession?: boolean
   // type='command' only: raw shell command run via `bash -lc`, no LLM/tmux.
   command?: string
   // type='command' only: command timeout in ms (default 10000).
@@ -235,7 +239,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
   const skillContent = hasSkill ? readFileOr(skillPath, '') : ''
   const { name, description, body } = parseSkillMdFrontmatter(skillContent)
 
-  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; requiresDesktop?: boolean; forceSend?: boolean; targetSession?: string; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; requires?: { mcp_servers?: unknown }; injectMetrics?: unknown; sendDigestDirect?: unknown; telegramChatId?: string; channelProvider?: unknown; once?: unknown; onceDisabledAt?: unknown } = {}
+  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; requiresDesktop?: boolean; forceSend?: boolean; targetSession?: string; freshSession?: unknown; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; requires?: { mcp_servers?: unknown }; injectMetrics?: unknown; sendDigestDirect?: unknown; telegramChatId?: string; channelProvider?: unknown; once?: unknown; onceDisabledAt?: unknown } = {}
   try {
     config = JSON.parse(readFileOr(configPath, '{}'))
   } catch { /* use defaults */ }
@@ -253,6 +257,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
     requiresDesktop: config.requiresDesktop === true,
     forceSend: config.forceSend === true,
     targetSession: config.targetSession || undefined,
+    freshSession: config.freshSession === true,
     command: config.command,
     timeoutMs: config.timeoutMs,
     failThreshold: config.failThreshold,
