@@ -834,6 +834,15 @@ except Exception as _mixed_exc:  # noqa: BLE001 -- deliberate fail-closed stub
 
 _char_script = char_script   # the name this file used before the extraction
 
+# The known limit of the rule, said in every block it causes (card fbca08d6, decision of 2026-10-14): next to Latin EVERY
+# Cyrillic letter counts, not only a lookalike, because the corruption measured in our Hungarian text includes Cyrillic
+# letters with no Latin twin. So real Cyrillic content glued to a Latin word stops too; the writer should know that this
+# is the rule and not a misfire.
+MIXED_SCRIPT_LIMIT = (
+    "Ismert hatar: latin szoban allo VALODI cirill betu is megall (a cirillnel minden betu szamit, mert a mert hibak "
+    "kozott nem-hasonmas cirill is van); a tisztan cirill szo, a gorog mertekegyseg-jel es a nem latin iras atmegy."
+)
+
 
 EM_DASH = "—"
 
@@ -1451,7 +1460,8 @@ def audit(text: str):
         more = f" (+{len(mixed) - 5} tovabbi)" if len(mixed) > 5 else ""
         problems.append(
             f"VEGYES IRASRENDSZERU SZO (homoglifa), {len(mixed)} db: {shown}{more}. "
-            "Latin szoba keveredett nem-latin betu: olvasva lathatatlan, de a keresest/grepet neman eltori."
+            "Latin szoba keveredett nem-latin betu: olvasva lathatatlan, de a keresest/grepet neman eltori. "
+            + MIXED_SCRIPT_LIMIT
         )
     tok_pos = accent_check_tokens(prose)
     words = [w for w, _ in tok_pos]
@@ -1784,6 +1794,7 @@ def homoglyph_write_gate(cmd: str) -> None:
         f"KIMENO-SZOVEG KAPU ({head}): TILTVA -- VEGYES IRASRENDSZERU SZO (homoglifa), "
         f"{len(found)} db: {shown}{more}.\n"
         f"{why}Javitsd a szoveget es kuldd ujra. (Itt CSAK a homoglifa fut, ekezet- es copy-szabaly nem.)\n"
+        f"{MIXED_SCRIPT_LIMIT}\n"
         f"{note}"
     )
     sys.exit(2)
