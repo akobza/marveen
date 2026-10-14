@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { initDatabase, getDb, getHeartbeatKanbanLive } from '../db.js'
-import { MAIN_AGENT_ID } from '../config.js'
-import { tryHandleMessages } from '../web/routes/messages.js'
+import { MAIN_AGENT_ID, HEARTBEAT_AGENT_ID } from '../config.js'
+import { tryHandleMessages, resetHeartbeatRefusalNoteForTest } from '../web/routes/messages.js'
 import { parseKanbanClaims, verifyHeartbeatKanban, HEARTBEAT_KANBAN_WINDOW_SEC } from '../web/heartbeat-kanban-verify.js'
 import type { RouteContext } from '../web/routes/types.js'
+import { renderHeartbeatMetricsBlock } from '../web/heartbeat-metrics-inject.js'
 
 // HBFABRIC1003 (measured 2026-10-03, EGRESSPHANTOM1003): the 17:00 digest named a
 // card that never existed (EGRESSFP1003) and counts off by one (414/696 against a
@@ -30,8 +31,8 @@ function fakeCtx(body: unknown): { ctx: RouteContext; res: { statusCode: number;
   return { ctx: { req, res, path, method: 'POST', url: new URL(`http://localhost${path}`), fedPeer: null }, res: state }
 }
 
-async function post(content: string): Promise<{ statusCode: number; json: Record<string, unknown> }> {
-  const { ctx, res } = fakeCtx({ from: MAIN_AGENT_ID, to: MAIN_AGENT_ID, content })
+async function post(content: string, from: string = MAIN_AGENT_ID): Promise<{ statusCode: number; json: Record<string, unknown> }> {
+  const { ctx, res } = fakeCtx({ from, to: MAIN_AGENT_ID, content })
   expect(await tryHandleMessages(ctx)).toBe(true)
   return { statusCode: res.statusCode, json: res.body ? JSON.parse(res.body) : {} }
 }
@@ -208,3 +209,65 @@ describe('the tolerance is the movement the board really had', () => {
     getDb().prepare("DELETE FROM kanban_cards WHERE id = 'MOVED-HBF'").run()
   })
 })
+
+describe('a refused heartbeat digest is reported to the main agent (Geri, #1684 verify)', () => {
+  const notes = () =>
+    (getDb().prepare("SELECT content FROM agent_messages WHERE from_agent = 'system' AND to_agent = ? AND content LIKE '[HB-KAPU]%'")
+      .all(MAIN_AGENT_ID) as Array<{ content: string }>)
+
+  it('the heartbeat sender: 422, and ONE system note naming the differences; a retry inside the gap adds none', async () => {
+    resetHeartbeatRefusalNoteForTest()
+    const before = notes().length
+    const bad = digest(REAL.replace('W1-HBF, W2-HBF', 'EGRESSFP1003, W1-HBF'), 'hb-refused-marker-a1')
+    expect((await post(bad, HEARTBEAT_AGENT_ID)).statusCode).toBe(422)
+    expect(notes().length).toBe(before + 1)
+    expect(notes()[notes().length - 1].content).toContain('waiting: card EGRESSFP1003 does not exist')
+    expect((await post(bad, HEARTBEAT_AGENT_ID)).statusCode).toBe(422)
+    expect(notes().length).toBe(before + 1)
+    expect(rows('hb-refused-marker-a1')).toBe(0)
+  })
+
+  it('another sender\'s refused digest is not reported (only the heartbeat\'s missing hour matters)', async () => {
+    resetHeartbeatRefusalNoteForTest()
+    const before = notes().length
+    expect((await post(digest(REAL.replace('- planned: 4', '- planned: 9'), 'main-refused-marker-b2'))).statusCode).toBe(422)
+    expect(notes().length).toBe(before)
+  })
+})
+
+// FORMAT PIN (Marveen, after Geri measured the old digest formats: 21 pre-09-11
+// digests gave 0 recognised lines -- the gate would have skipped silently -- and
+// words like "etc" read as ids). The gate reads what the metrics renderer writes;
+// if the renderer's Kanban format drifts, THIS fails, not the gate in production.
+describe('format pin: the metrics block the heartbeat copies is what the gate parses', () => {
+  const RAW = [
+    'HB_METRICS_V1 ts=2026-10-03 17:00',
+    'COUNTS urgent=2 in_progress=1 waiting=371 planned=545 new_hot_memories_1h=0 db_size_mb=474.4 waiting_shown=2',
+    'URGENT CARDA CARDA (URGENT): first urgent title',
+    'URGENT CARDB CARDB: second one',
+    'WAITING CARDC CARDC: a waiting card',
+    'WAITING CARDD CARDD: another waiting card',
+    'CALENDAR_EVENTS n=0 window=2h',
+    'TOKEN_PRUNE state=ok retention_days=90 lag_hours=0.27 tolerance_hours=48',
+    'SCHEDULES enabled=34',
+    'TASK_RUNS_1H total=41 fired=12 skipped=29',
+  ].join('\n')
+
+  it('a digest built from the rendered block yields exactly the four numeric claims and only real ids', () => {
+    const block = renderHeartbeatMetricsBlock(RAW)
+    const digestText = '## Heartbeat 2026-10-03 17:00 (Europe/Budapest)\nmerve: 2026-10-03 17:00\n\n' + block
+    expect(parseKanbanClaims(digestText)).toEqual([
+      { key: 'urgent', count: 2, ids: ['CARDA', 'CARDB'] },
+      { key: 'in_progress', count: 1, ids: [] },
+      { key: 'waiting', count: 371, ids: ['CARDC', 'CARDD'] },
+      { key: 'planned', count: 545, ids: [] },
+    ])
+  })
+
+  it('an instrument failure renders no claim, so the gate lets the honest report through', () => {
+    const block = renderHeartbeatMetricsBlock('HB_METRICS_V1 ts=2026-10-03 17:00\nERROR summary: missing/null fields: db_size_mb\nSCHEDULES enabled=1')
+    const digestText = '## Heartbeat 2026-10-03 17:00\n' + block
+    expect(parseKanbanClaims(digestText).filter((c) => c.count !== null || c.ids.length > 0)).toEqual([])
+  })
+})
+

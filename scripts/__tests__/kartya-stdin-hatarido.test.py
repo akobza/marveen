@@ -40,6 +40,13 @@ def fresh_db(path, hatarido_oszlop=True):
       CREATE TABLE agent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL,
         to_agent TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
         result TEXT, created_at INTEGER NOT NULL, delivered_at INTEGER, completed_at INTEGER);
+      -- KARTYAEVENTS1010 ota a DB-uti mozgatas esemenysort kovetel; a db.ts DDL-je szo szerint (initDatabase).
+      CREATE TABLE kanban_card_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT NOT NULL, from_status TEXT, to_status TEXT NOT NULL, actor TEXT,
+        created_at INTEGER NOT NULL);
+      CREATE TABLE kanban_card_field_events (id INTEGER PRIMARY KEY
+        AUTOINCREMENT, card_id TEXT NOT NULL, field TEXT NOT NULL, old_value TEXT, new_value TEXT,
+        actor TEXT, created_at INTEGER NOT NULL);
     ''')
     now = int(time.time())
     db.execute("INSERT INTO kanban_cards (id,title,assignee,status,priority,created_at,updated_at)"

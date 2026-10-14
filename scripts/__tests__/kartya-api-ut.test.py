@@ -6,8 +6,9 @@ lepteti a kartya updated_at-jet es a #hex8 hivatkozast #sorszamra irhatja; a PUT
 statusz-valtasnal EGY kanban_card_events sort ir az actorral; ismeretlen mezore 400, rossz
 tokenre 401. AMIT A SUITE ROGZIT: (1) mozgatasonkent pontosan egy esemeny-sor a felado actorral,
 a teljes sor csak a kert oszlopban valtozik; (2) rossz tokenre HANGOS bukas a komment-, a
-mozgato- es a leiras-agon, iras nelkul, a dry-runban is; (3) a DB-ut negativ kontrollja: 0
-esemeny-sor, kimondva a kimeneten es a --help-ben; (4) a szerver #hivatkozas-atirasa FIGYELEM,
+mozgato- es a leiras-agon, iras nelkul, a dry-runban is; (3) a DB-ut 2026-10-10 ota (KARTYAEVENTS1010)
+ugyanigy EGY esemeny-sort ir az actorral, visszaolvasva kimondja, es a --help ezt mondja, nem a
+korabbi hianyat; (4) a szerver #hivatkozas-atirasa FIGYELEM,
 a valodi tartalom-serules es a mas tarolo HIBA; (5) minden iras az API-n at ment.
 
 Futtatas:  python3 scripts/__tests__/kartya-api-ut.test.py
@@ -245,13 +246,18 @@ def main():
     check('3 jo token dry-runban zold, API-ut kiirva, semmi nem irodott',
           rc == 0 and 'DRY-RUN OK' in out and 'API-ut' in out and allapot('TOKEN1003') == elotte, out)
 
-    # 4. NEGATIV KONTROLL: a DB-uton a mozgatas esemeny-sor nelkul megy, es ezt kimondja
+    # 4. A DB-ut 2026-10-10 ota (KARTYAEVENTS1010) a szerver esemeny-szabalyat tukrozi: a mozgatas ott is
+    # EGY esemeny-sort ir az actorral. A korabbi negativ kontroll (0 sor, FIGYELEM) ezzel a develop-ra
+    # fesult agon hamis lett; itt a DB-ut sajat, mert alakja all, es a --help sem mondhatja a hianyat.
     rc, out = futtat(port, ['--id', 'DBUT1003', '--author', 'alfa', '--comment-file', cf, '--status', 'done'], api=False)
     check('4 DB-ut: rc=0, a statusz atment', rc == 0 and sor('DBUT1003')['status'] == 'done', out)
-    check('4 DB-ut: 0 esemeny-sor', q("SELECT COUNT(*) FROM kanban_card_events WHERE card_id='DBUT1003'")[0][0] == 0)
-    check('4 DB-ut: a kimenet kimondja', 'FIGYELEM (DB-ut)' in out and 'kanban_card_events' in out, out)
+    ev = q("SELECT from_status, to_status, actor FROM kanban_card_events WHERE card_id='DBUT1003'")
+    check('4 DB-ut: pontosan egy esemeny-sor, actor alfa', ev == [('planned', 'done', 'alfa')], str(ev))
+    check('4 DB-ut: a kimenet visszaolvasva mondja ki, FIGYELEM nelkul',
+          'ESEMENYSOR OK' in out and 'FIGYELEM (DB-ut)' not in out, out)
     rc, out = futtat(port, ['--help'], api=False)
-    check('4 a --help kimondja a DB-ut esemeny-hianyat', rc == 0 and 'kanban_card_events sor NELKUL' in out, out[:300])
+    check('4 a --help a DB-uti esemeny-sort mondja, nem a hianyat',
+          rc == 0 and 'kanban_card_events sort ir az actorral' in out and 'sor NELKUL' not in out, out[:300])
 
     # 5. a szerver #hex8 -> #sorszam atirasa FIGYELEM; a valodi serules es a mas tarolo HIBA
     rc, out = futtat(port, ['--id', 'HIVAT1003', '--author', 'alfa', '--comment-file', fajl('Lasd #abcdef12 kartyat.')])

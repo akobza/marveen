@@ -195,19 +195,28 @@ UPDATE_PIDFILE_TMP="$UPDATE_PIDFILE.$$.tmp"
 # leaked; leave the dashboard's pidfile alone so the lock does not
 # disappear on a write error.
 trap 'rc=$?; write_result "$rc"; rm -f "$UPDATE_PIDFILE_TMP"' EXIT
+# Wall-clock epoch in ms for the pidfile's second line. date +%s%3N is
+# GNU-only: on BSD (macOS) %3N is no conversion at all, and uutils
+# coreutils (the Rust date, 0.8.0) ignores the width and prints the full
+# nanoseconds, 19 digits, which checkNoConcurrentUpdate read as a start
+# far in the future, so a stale pidfile never aged out (card 48612d05).
+# Only an exactly 13-digit value is taken as ms (good until the year
+# 2286); anything else falls back to seconds * 1000. One-second
+# granularity is plenty for an hour-level age cutoff, and the fallback
+# never prints an empty line, which the helper would read as a legacy
+# pidfile without age info (alive-probe only, no age cutoff).
+update_pidfile_epoch_ms() {
+  local ms
+  ms=$(date +%s%3N 2>/dev/null) || ms=""
+  if [[ "$ms" =~ ^[0-9]{13}$ ]]; then
+    printf '%s\n' "$ms"
+  else
+    printf '%s\n' "$(( $(date +%s) * 1000 ))"
+  fi
+}
 {
   echo "$$"
-  # Portable wall-clock epoch in ms. date +%s%3N is GNU-only; on BSD
-  # (macOS) we fall back to seconds * 1000. One-second granularity is
-  # plenty for an hour-level age cutoff.
-  # Require one-or-more digits; `*` would accept an empty line and
-  # write "<pid>\n\n", which the helper would read as a legacy pidfile
-  # without age info (alive-probe only, no age cutoff).
-  if date +%s%3N 2>/dev/null | grep -q '^[0-9][0-9]*$'; then
-    date +%s%3N
-  else
-    echo $(( $(date +%s) * 1000 ))
-  fi
+  update_pidfile_epoch_ms
 } > "$UPDATE_PIDFILE_TMP"
 mv "$UPDATE_PIDFILE_TMP" "$UPDATE_PIDFILE"
 # Only after mv succeeds do we own the lock; extend the trap to remove
@@ -728,7 +737,8 @@ install_keepalive_probe_launchd() {
   _ka_installer="$INSTALL_DIR/scripts/install-channel-keepalive-probe.sh"
   [ -x "$_ka_installer" ] || return 0
   command -v launchctl >/dev/null 2>&1 || return 0
-  _ka_label="$(sed -n 's/^LABEL="\(.*\)"$/\1/p' "$_ka_installer" | head -1)"
+  # #1873: the installer resolves its own com.<SERVICE_ID>.* label.
+  _ka_label="$("$_ka_installer" --print-label 2>/dev/null | head -1)"
   [ -n "$_ka_label" ] || _ka_label="com.marveen.channel-keepalive-probe"
   if [ -f "$HOME/Library/LaunchAgents/${_ka_label}.plist" ]; then
     return 0
@@ -737,6 +747,41 @@ install_keepalive_probe_launchd() {
     echo -e "  Keepalive-szonda telepitve (3 percenkent, hamis respawn ellen): ${_ka_label}"
   else
     echo -e "  FIGYELEM: a keepalive-szonda telepitese nem sikerult -- inditsd kezzel: scripts/install-channel-keepalive-probe.sh --load"
+  fi
+  return 0
+}
+
+# The stuck-modal guard's launchd twin on Macs that are already installed
+# (MODELCONFIRM1005), the same way and for the same reason as the probe above:
+# install-macos.sh only reaches NEW installs. Measured 2026-10-05 on the Mac
+# mini: the CLI's "Switch model?" dialog held the main session for half an hour
+# and launchctl had no job of any modal guard. The guard's default mode is
+# log-only (STUCK_MODAL_MODE, see stuck-modal-guard.sh): it detects and logs,
+# recovery is opt-in. #1694 review:
+#   - keyed on the job being LOADED, not on the plist existing: a plist left by
+#     a failed `launchctl load` is retried (and reported) on every run instead of
+#     going quiet forever;
+#   - STUCK_MODAL_MODE=off in .env is the opt-out, and it survives updates: no
+#     install, no load.
+# Idempotent: with the job loaded this writes nothing and prints nothing; the
+# label is read from the installer.
+install_stuck_modal_guard_launchd() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  _sm_installer="$INSTALL_DIR/scripts/install-stuck-modal-guard.sh"
+  [ -x "$_sm_installer" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  _sm_mode="$(grep -E '^STUCK_MODAL_MODE=' "$INSTALL_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'\r ' | tr '[:upper:]' '[:lower:]')"
+  [ "$_sm_mode" = "off" ] && return 0
+  # #1873: the installer resolves its own com.<SERVICE_ID>.* label.
+  _sm_label="$("$_sm_installer" --print-label 2>/dev/null | head -1)"
+  [ -n "$_sm_label" ] || _sm_label="com.marveen.stuck-modal-guard"
+  if launchctl list "$_sm_label" >/dev/null 2>&1; then
+    return 0
+  fi
+  if "$_sm_installer" --load >/dev/null 2>&1; then
+    echo -e "  Beragadt-ablak or telepitve (percenkent; alapbol csak naploz, STUCK_MODAL_MODE): ${_sm_label}"
+  else
+    echo -e "  FIGYELEM: a beragadt-ablak or telepitese nem sikerult -- inditsd kezzel: scripts/install-stuck-modal-guard.sh --load"
   fi
   return 0
 }
@@ -917,14 +962,32 @@ strip_legacy_notifier_telegram_env() {
   return 0
 }
 
+# Shell rc secret scrub (Linux only, SECSZIVEKKIADAS1008). Installers before
+# #1785 wrote the Claude token / API key as `export ...=` lines into ~/.bashrc
+# and ~/.zshrc; nothing on the update path removed them, and a re-run of the
+# installer never reached its own cleanup on an install that already has auth.
+# The functions live in scripts/lib/rc-secrets.sh (identical to the installer's
+# copy, kept equal by a test). Idempotent: no export line, no change. Like every
+# repair here it lands on the update.sh run AFTER the one that pulls it (no
+# re-exec). A failure never stops the update: it is reported, and retried next run.
+scrub_rc_secrets() {
+  [ "$(uname -s 2>/dev/null)" = "Linux" ] || return 0
+  [ -f "$INSTALL_DIR/scripts/lib/rc-secrets.sh" ] || return 0
+  ( . "$INSTALL_DIR/scripts/lib/rc-secrets.sh" && scrub_secret_exports_from_rc ) \
+    || echo -e "  ${ORANGE}FIGYELEM:${NC} a shell rc fajlok titok-takaritasa nem sikerult, a kovetkezo frissites ujraprobalja."
+  return 0
+}
+
 run_unit_maintenance() {
   repair_morning_timer "$@"
   migrate_channels_restart "$@"
   install_keepalive_probe_timer "$@"
   install_keepalive_probe_launchd "$@"
+  install_stuck_modal_guard_launchd "$@"
   install_main_inbox_observer_unit "$@"
   strip_legacy_notifier_telegram_env "$@"
   park_morning_timer "$@"
+  scrub_rc_secrets
   return 0
 }
 run_unit_maintenance

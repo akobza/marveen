@@ -167,6 +167,16 @@ export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 // not change that; the token remains the actual boundary.
 export const SYSTEM_SENDER_IDS = env['SYSTEM_SENDER_IDS'] ?? ''
 
+// Card 795d1f48 (a): the enrolled device keys that may send an URGENT row over POST /api/messages (a row the router
+// types into a BUSY pane), by their numeric ids (GET /api/auth/device-keys lists them). Install-specific, so .env, and
+// empty by default: with no id, no HTTP caller may set urgent; the in-process writers are not affected. A device key
+// alone is not enough because the shared dashboard token can mint one; and the list is deliberately not in the
+// settings registry, so the dashboard's settings page does not edit it. Device key ids are AUTOINCREMENT: a revoked
+// key's id is never handed out again. Comma-separated:
+//   MESSAGE_URGENT_DEVICE_IDS=7
+// Read at module load -- a change needs a dashboard restart.
+export const MESSAGE_URGENT_DEVICE_IDS = env['MESSAGE_URGENT_DEVICE_IDS'] ?? ''
+
 // Pure parse rule for SYSTEM_SENDER_IDS, so the default (unset => empty set) is
 // provable without a live .env. Entries are normalized with the SAME function
 // the route matches on, keeping this guard symmetric with the coordinator and
@@ -178,6 +188,18 @@ export function parseSystemSenderIds(raw: string | undefined, normalize: (s: str
       .split(',')
       .map(s => normalize(s.trim()))
       .filter(Boolean)
+  )
+}
+
+// Pure parse rule for MESSAGE_URGENT_DEVICE_IDS: positive integers only. Anything else is dropped, never read
+// generously: a typo or an empty value means nobody.
+export function parseDeviceKeyIds(raw: string | undefined): Set<number> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => /^[1-9][0-9]{0,14}$/.test(s))
+      .map(Number)
   )
 }
 
@@ -296,6 +318,25 @@ export function systemdStatusUnits(serviceId: string): string[] {
 export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
+
+// How long a fired scheduled task may stay busy before the watchdog calls it
+// stuck (default 45 minutes; `stuckAfterMinutes` still overrides it per task).
+//
+// A key rather than a literal for the same reason as DEFAULT_AGENT_MODEL: this
+// number is an OPERATOR judgement, not an engineering constant. Whether "still
+// running after N minutes" means trouble depends on what the install's tasks
+// do, and an install that raises it has to keep raising it after every update
+// if the only way to say so is patching src/. That is not hypothetical -- one
+// install set 10 minutes because 5 produced false "possible hang" alerts, and
+// lost the setting to an update, silently: alerts simply got eager again.
+// .env survives updates, src/ does not.
+export const TASK_STALL_TIMEOUT_MS = (() => {
+  const parsed = parseInt(env['TASK_STALL_TIMEOUT_MS'] ?? '', 10)
+  // A malformed or absurd value must not disable the watchdog outright, so an
+  // out-of-range setting falls back to the default instead of being clamped
+  // into silence.
+  return Number.isFinite(parsed) && parsed >= 60_000 ? parsed : 2_700_000
+})()
 
 // Kanban card aging visual thresholds (hours since last update) and colours.
 // Override per-install via .env; defaults match the design spec (24/72/168h).
