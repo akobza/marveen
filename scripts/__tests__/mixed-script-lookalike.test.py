@@ -12,7 +12,9 @@ outgoing-copy hook, and scripts/lib/homoglyph.py, the checker scripts/agent-msg.
      to Latin (KELVIN SIGN, ANGSTROM SIGN, ROMAN NUMERAL ONE, fullwidth Latin);
   2. no longer a finding: the unit forms above, and Latin next to CJK;
   3. unchanged: a Russian quote, a standalone Greek symbol, Hungarian accents, the micro sign and a superscript.
-Every text is built from code points, so this file carries no lookalike itself.
+Every text is built from code points, so this file carries no lookalike itself. HOMOGLYPHLOOKALIKE1014b adds the seven
+lookalikes the tester measured after the first list (Greek eta, epsilon, small omega, a mid-word mu; Armenian o, Cherokee
+A, Coptic o) to case 1, and a word-initial mu (the unit prefix) to case 2.
 
 Run:  python3 scripts/__tests__/mixed-script-lookalike.test.py
 Exit 0 = all pass; non-zero = a failure (message on stderr).
@@ -52,9 +54,19 @@ FINDING = [
     ('ANGSTROM SIGN inside a Latin word', f'{c(0x212B)}ngstrom'),
     ('ROMAN NUMERAL ONE inside a Latin word', f'verz{c(0x2160)}o'),
     ('fullwidth Latin capital A inside a Latin word', f'{c(0xFF21)}PI'),
+    # HOMOGLYPHLOOKALIKE1014b: the seven lookalikes the tester measured after the first list
+    ('Greek small eta (reads as n) inside a Latin word', f'e{c(0x3B7)}gedely'),
+    ('Greek small epsilon (reads as e) inside a Latin word', f'k{c(0x3B5)}sz'),
+    ('Greek small epsilon with tonos (reads as e-acute) inside a Hungarian word', f'k{c(0x3AD)}rdes'),
+    ('Greek small omega (reads as w) inside a Latin word', f'{c(0x3C9)}ebhook'),
+    ('Greek small mu INSIDE a Latin word (reads as u)', f'h{c(0x3BC)}z'),
+    ('Armenian small oh (reads as o) inside a Latin word', f'h{c(0x585)}oks'),
+    ('Cherokee GO (reads as A) at the head of a Latin word', f'{c(0x13AA)}PI'),
+    ('Coptic small o (reads as o) inside a Latin word', f'kart{c(0x2C9F)}n'),
 ]
 PASSES = [
     ('a unit written with GREEK SMALL LETTER MU', f'p95 = 10 {c(0x3BC)}s'),
+    ('a mu that STARTS a word is the unit prefix (47 uF)', f'47 {c(0x3BC)}F kondenzator'),
     ('Delta t with the Greek capital', f'{c(0x394)}t = 5 s'),
     ('kilo-ohm written with GREEK CAPITAL OMEGA', f'50 k{c(0x3A9)}'),
     ('kilo-ohm written with the OHM SIGN', f'50 k{c(0x2126)}'),

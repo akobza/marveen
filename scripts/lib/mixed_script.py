@@ -91,13 +91,19 @@ _char_script = char_script
 #   - the Greek letters in GREEK_LOOKALIKE (an explicit list, like
 #     SCRIPT_NEUTRAL above: a capital that IS a Latin capital in shape, and the
 #     lowercase omicron, rho, nu, iota, kappa, alpha, gamma, upsilon, chi, lunate
-#     sigma and yot with their accented forms, which read as Hungarian ó, í, ú,
-#     ü). Mu, Delta, Omega, lambda, pi, sigma, omega, beta, eta, tau are notation;
+#     sigma, yot, eta, epsilon and omega with their accented forms, which read as
+#     Hungarian ó, í, ú, ü, é). Delta, capital Omega, lambda, pi, sigma, beta, tau
+#     are notation, and so is a mu that STARTS a word (the unit prefix of "10 us");
+#     a mu INSIDE a word reads as u and is a finding (MIDWORD_LOOKALIKE);
 #   - a compatibility form that NFKC folds to Latin letters: KELVIN SIGN,
 #     ANGSTROM SIGN, the Roman numerals, fullwidth and mathematical Latin.
-# Other scripts (CJK, Armenian, Arabic, ...) next to Latin pass. A Greek or
-# other-script lookalike not on the list passes too: the list is the limit of
+# Other scripts next to Latin pass (CJK, Arabic, ...), except the measured
+# lookalikes in OTHER_LOOKALIKE (Armenian o, Cherokee A, Coptic o). A Greek or
+# other-script lookalike not on a list passes too: the lists are the limit of
 # this rule, and a new lookalike is added here, with a case in the tests.
+# HOMOGLYPHLOOKALIKE1014b (same day, after the tester measured seven lookalikes
+# the first lists missed): Greek eta, epsilon, small omega, a mid-word mu;
+# Armenian o, Cherokee A, Coptic o.
 GREEK_LOOKALIKE = frozenset(chr(cp) for cp in (
     # capitals shaped like Latin capitals (A B E Z H I K M N O P T Y X, C, J, M, Y)
     0x0391, 0x0392, 0x0395, 0x0396, 0x0397, 0x0399, 0x039A, 0x039C, 0x039D, 0x039F,
@@ -105,21 +111,32 @@ GREEK_LOOKALIKE = frozenset(chr(cp) for cp in (
     # the same capitals with tonos or dialytika (read as accented Latin capitals)
     0x0386, 0x0388, 0x0389, 0x038A, 0x038C, 0x038E, 0x03AA, 0x03AB,
     # lowercase: alpha a, gamma y, iota i, kappa k, nu v, omicron o, rho p,
-    # upsilon u, chi x, lunate sigma c, yot j
+    # upsilon u, chi x, lunate sigma c, yot j, eta n, epsilon e, omega w
     0x03B1, 0x03B3, 0x03B9, 0x03BA, 0x03BD, 0x03BF, 0x03C1, 0x03C5, 0x03C7, 0x03F2, 0x03F3,
-    # their accented forms (read as á, í, i-diaeresis, ó, ú, ü, ű)
-    0x03AC, 0x03AF, 0x03CA, 0x0390, 0x03CC, 0x03CD, 0x03CB, 0x03B0,
+    0x03B7, 0x03B5, 0x03C9,
+    # their accented forms (read as á, í, i-diaeresis, ó, ú, ü, ű, and é for epsilon)
+    0x03AC, 0x03AF, 0x03CA, 0x0390, 0x03CC, 0x03CD, 0x03CB, 0x03B0, 0x03AE, 0x03AD, 0x03CE,
 ))
+
+# Lookalikes in other scripts, measured (Armenian small oh o, Cherokee GO A,
+# Coptic small o): every other letter of those scripts next to Latin passes.
+OTHER_LOOKALIKE = frozenset(chr(cp) for cp in (0x0585, 0x13AA, 0x2C9F))
+
+# A lookalike only INSIDE a word: GREEK SMALL LETTER MU reads as u there, while at
+# the start of a word it is the unit prefix ("10 us", "47 uF"), which stays notation.
+MIDWORD_LOOKALIKE = frozenset([chr(0x03BC)])
 
 
 def is_disguise(ch: str) -> bool:
     """True for a character that can pass for a Latin letter inside a Latin
-    word: a Cyrillic letter, a GREEK_LOOKALIKE, or a compatibility form whose
-    NFKC folding is Latin letters (KELVIN SIGN -> K, ROMAN NUMERAL ONE -> I)."""
+    word: a Cyrillic letter, a GREEK_LOOKALIKE or OTHER_LOOKALIKE, or a
+    compatibility form whose NFKC folding is Latin letters (KELVIN SIGN -> K,
+    ROMAN NUMERAL ONE -> I). MIDWORD_LOOKALIKE is decided by the caller, which
+    knows the position."""
     script = char_script(ch)
     if script in ("LATIN", "NEUTRAL"):
         return False
-    if script == "CYRILLIC" or ch in GREEK_LOOKALIKE:
+    if script == "CYRILLIC" or ch in GREEK_LOOKALIKE or ch in OTHER_LOOKALIKE:
         return True
     folded = unicodedata.normalize("NFKC", ch)
     return folded != ch and folded.isalpha() and all(char_script(c) == "LATIN" for c in folded)
@@ -127,13 +144,15 @@ def is_disguise(ch: str) -> bool:
 
 def mixed_script_words(text: str):
     """Return [(word, bad_char, "NAME (U+XXXX)"), ...] for words mixing LATIN
-    with a character that can pass for a Latin letter (is_disguise). Pure
-    non-Latin words (foreign quotes) and Latin next to notation pass."""
+    with a character that can pass for a Latin letter (is_disguise, or a
+    MIDWORD_LOOKALIKE after the first letter). Pure non-Latin words (foreign
+    quotes) and Latin next to notation pass."""
     out = []
     for word in UWORD.findall(text):
         scripts = {char_script(ch) for ch in word} - {"NEUTRAL"}
         if "LATIN" in scripts and len(scripts) > 1:
-            bad = next((ch for ch in word if is_disguise(ch)), None)
+            bad = next((ch for i, ch in enumerate(word)
+                        if is_disguise(ch) or (i > 0 and ch in MIDWORD_LOOKALIKE)), None)
             if bad is None:
                 continue
             try:
