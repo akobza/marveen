@@ -15,7 +15,7 @@ import { sanitizeScheduleName, safeJoin } from '../sanitize.js'
 import { listAgentNames } from '../agent-config.js'
 import { readFileOr, readJsonObjectForWrite } from '../agent-config.js'
 import {
-  SCHEDULED_TASKS_DIR, MAX_SCHEDULED_TASK_PROMPT_LEN,
+  SCHEDULED_TASKS_DIR, MAX_SCHEDULED_TASK_PROMPT_LEN, SCHEDULED_TASK_WRITE_FIELDS,
   listScheduledTasks, writeScheduledTask, markDefaultTaskRemoved,
 } from '../scheduled-tasks-io.js'
 import { runScheduledTaskNow } from '../schedule-runner.js'
@@ -51,9 +51,9 @@ export function summarizeScheduledTasks(tasks: Array<{ enabled?: boolean }>): { 
 // ffc45c28 (b): every successful schedule write leaves a row in schedule_write_log (see db.ts). The agent is the
 // X-Agent-Id the caller CLAIMED, as the auth gate resolved it (ctx.auth.agent: roster-checked, not authenticated).
 // A failed log write never fails the request: the schedule change already happened, so the error is logged.
-const SCHEDULE_FIELDS = new Set([
-  'description', 'prompt', 'schedule', 'agent', 'enabled', 'type', 'skipIfBusy', 'forceSend', 'targetSession', 'once',
-])
+// (b2): the known names are the fields the writer persists (one list, scheduled-tasks-io.ts), not this route's body
+// type: the update hands its whole body to writeScheduledTask, which keeps ten more (telegramChatId, command, ...).
+const SCHEDULE_FIELDS = new Set<string>(SCHEDULED_TASK_WRITE_FIELDS)
 // The names of the fields an update sent, never their values; a name outside the known set is "(other)", so a
 // caller-chosen key cannot carry text into the log.
 function sentFieldNames(data: Record<string, unknown>): string[] {
