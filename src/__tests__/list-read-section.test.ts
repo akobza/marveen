@@ -70,7 +70,9 @@ describe('list-read section: what it says (c4e47223)', () => {
   it('the recipe measures the curl exit code and the HTTP code separately, body to a per-run temp file', () => {
     // #1819 review: a fixed /tmp path collides between two reads and can follow a planted link.
     expect(body).toMatch(/f=\$\(mktemp\); code=\$\(curl -sS -o "\$f" -w '%\{http_code\}'/)
-    expect(body).not.toMatch(/\/tmp\//)
+    // The token path is built from the stubbed PROJECT_ROOT (a mkdtemp dir): mask it, or the check
+    // depends on TMPDIR and is red under the Linux default /tmp.
+    expect(body.split(tmpRoot).join('<root>')).not.toMatch(/\/tmp\//)
     expect(body).toMatch(/\); rc=\$\?/)
     expect(body).toMatch(/Authorization: Bearer \$\(cat /)
     expect(body).toMatch(/rm -f "\$f"/)
