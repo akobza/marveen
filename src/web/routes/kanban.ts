@@ -22,6 +22,7 @@ import {
   type TokenPruneLag,
 } from '../../db.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
+import { detectHomoglyphs, formatHomoglyphWarning } from '../../homoglyph.js'
 import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, STORE_DIR, WEB_HOST, WEB_PORT, KANBAN_LABEL_COLORS, DB_FILENAME } from '../../config.js'
 import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
@@ -885,9 +886,22 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const normalizedContent = normalizeKanbanRefs(content, getKanbanSeqByIdPrefix)
     // `automated: true`: a bulk/machine writer marks its own comment, so the
     // stuck detector never reads it as a work-trace (KANBANSTUCKURES916).
-    json(res, automated === true
+    const comment = automated === true
       ? addKanbanComment(cardId, author, normalizedContent, { automated: true })
-      : addKanbanComment(cardId, author, normalizedContent))
+      : addKanbanComment(cardId, author, normalizedContent)
+    // Warn-only homoglyph check (card f3007079), the same field and shape as the
+    // daily log, the memories and the agent messages. The comment is already
+    // stored and cannot be edited afterwards, so the answer is the writer's one
+    // chance to see the lookalike and post a corrected follow-up. The AFTER
+    // INSERT trigger keeps logging the finding as before.
+    const homoglyphs = detectHomoglyphs(normalizedContent)
+    if (homoglyphs.length > 0) {
+      const warning = formatHomoglyphWarning(homoglyphs)
+      logger.warn({ card: cardId, id: comment.id, author }, `kanban comment saved with ${warning}`)
+      json(res, { ...comment, homoglyph_warning: warning })
+      return true
+    }
+    json(res, comment)
     return true
   }
 
