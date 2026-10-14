@@ -1,15 +1,15 @@
 // Excerpt of claude-plugins-official/telegram 0.0.7 server.ts (Apache-2.0,
-// (c) Anthropic), verbatim blocks: the /start, /help, /status handlers and
-// the polling loop's onStart setMyCommands. Test input for
-// scripts/patch-telegram-plugin.py (ELSOKOR922 spec D-4); the declarations
-// and the loop's closing lines below only make the excerpt parse on its own.
-// Before them, also verbatim: the MCP server with its capabilities and the
-// permission_request relay (server.ts lines 391-452), and the inline-button
-// handler for permission requests (lines 709-766), the input of the
-// permission-approver patch (fc8629d7).
-// At the end, also verbatim: the MCP tool list and the tool-call handler
-// (server.ts lines 454-526 and 528-650), the input of the reply-keyboard
-// patch (c67f5f34).
+// (c) Anthropic), verbatim blocks: the /start, /help, /status handlers, the
+// polling loop's onStart setMyCommands, handleInbound, and (at the end) the
+// server instructions, the MCP tool list and the tool-call handler (server.ts
+// lines 391-418, 454-526 and 528-650). Test input for
+// scripts/patch-telegram-plugin.py (ELSOKOR922 spec D-4, the reply-keyboard
+// patch (c67f5f34) and the topics patch); the declarations and the loop's
+// closing lines only make the excerpt parse on its own.
+// Right after the server instructions, also verbatim: the permission_request
+// relay (server.ts lines 419-452) and the inline-button handler for
+// permission requests (lines 709-766), the input of the permission-approver
+// patch (fc8629d7).
 declare const bot: any
 declare function dmCommandGate(ctx: any): any
 let botUsername = ''
@@ -171,6 +171,7 @@ async function handleInbound(
   })
 }
 
+// --- Server instructions (verbatim, 0.0.7): an anchor of the topics patch.
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
