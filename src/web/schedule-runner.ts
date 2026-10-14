@@ -1447,15 +1447,46 @@ function freshTmuxBin(): string {
   return tryResolveFromPath('tmux') ?? 'tmux'
 }
 
-function freshTranscriptMtime(path: string): number | null {
+// Exported for the tests only (856bc199): the sweep's fresh branches below are module-level functions so that each one
+// is held by a behaviour test (prepare-fresh-session.test.ts), not only by the source contract.
+export function freshTranscriptMtime(path: string): number | null {
   try { return statSync(path).mtimeMs } catch { return null }
 }
 
 /** cc457550: the round is over (done, abandoned or lost): its session stops. A lost round's retry launches a new one. */
-function stopFreshRound(entry: Pick<TaskInflightEntry, 'freshSession' | 'session' | 'taskName'>, why: string): void {
+export function stopFreshRound(entry: Pick<TaskInflightEntry, 'freshSession' | 'session' | 'taskName'>, why: string): void {
   if (!entry.freshSession) return
   const stopped = killFreshSession(freshTmuxBin(), entry.session, PROJECT_ROOT)
   logger.info({ task: entry.taskName, session: entry.session, why, stopped }, 'Fresh scheduled session stopped at the end of its round')
+}
+
+/** cc457550: the in-flight entry's fresh fields -- the round's OWN transcript comes from its launch record. */
+export function freshInflightFields(
+  task: Pick<ScheduledTask, 'freshSession'>,
+  session: string,
+): Pick<TaskInflightEntry, 'freshSession' | 'freshTranscript'> {
+  return task.freshSession ? { freshSession: true, freshTranscript: freshLaunches.get(session)?.transcriptPath } : {}
+}
+
+/** cc457550: delivered -- from here the sweep owns the fresh session (and stops it on the closing decision). */
+export function handFreshSessionToSweep(task: Pick<ScheduledTask, 'freshSession'>, session: string): void {
+  if (task.freshSession) freshLaunches.delete(session)
+}
+
+/** cc457550: a dashboard restart orphans every fresh round's session (their tracking was in the in-flight map too). A
+ *  sched-* session nobody watches would never stop, so each one of THIS install is stopped; its run was just closed as
+ *  interrupted. */
+export function stopOrphanedFreshSessions(): void {
+  for (const s of listFreshSessions(freshTmuxBin(), PROJECT_ROOT)) {
+    const stopped = killFreshSession(freshTmuxBin(), s, PROJECT_ROOT)
+    logger.info({ session: s, stopped }, 'Fresh scheduled session orphaned by a restart -- stopped')
+  }
+}
+
+// The in-flight map is module-private; a test registers an entry here to reach the branches that read it
+// (prepareFreshSession's 'busy'). Product code never calls it.
+export function _setTaskInflightEntryForTest(entry: TaskInflightEntry): void {
+  taskInflightMap.set(`${entry.taskName}@${entry.agentName}`, entry)
 }
 
 export async function prepareFreshSession(
@@ -1886,12 +1917,11 @@ async function attemptFireTask(
       taskType: task.type,
       // Local agents only: a remote agent's transcript is on its own host.
       ...(host == null ? { sentText: paneOneLine(fullPrompt), typedAt } : {}),
-      ...(task.freshSession ? { freshSession: true, freshTranscript: freshLaunches.get(session)?.transcriptPath } : {}),
+      ...freshInflightFields(task, session),
       deliveryPending: true,
     }
     taskInflightMap.set(`${task.name}@${agentName}`, inflightEntry)
-    // cc457550: delivered -- from here the sweep owns the fresh session (and stops it on the closing decision).
-    if (task.freshSession) freshLaunches.delete(session)
+    handFreshSessionToSweep(task, session)
     // Every exit of the resubmit chain below ends the delivery phase, after
     // which an idle pane without a turn is judged by the sweep again.
     const endDelivery = (): void => { inflightEntry.deliveryPending = false }
@@ -2545,13 +2575,9 @@ export function startScheduleRunner(): NodeJS.Timeout {
   } catch (err) {
     logger.warn({ err }, 'task-run restart reconcile failed (non-fatal)')
   }
-  // cc457550: the same restart orphans every fresh round's session (their tracking was in that map too). A sched-*
-  // session nobody watches would never stop, so each one is stopped here; its run was just closed as interrupted.
+  // cc457550: the same restart orphans every fresh round's session (their tracking was in that map too).
   try {
-    for (const s of listFreshSessions(freshTmuxBin(), PROJECT_ROOT)) {
-      const stopped = killFreshSession(freshTmuxBin(), s, PROJECT_ROOT)
-      logger.info({ session: s, stopped }, 'Fresh scheduled session orphaned by a restart -- stopped')
-    }
+    stopOrphanedFreshSessions()
   } catch (err) {
     logger.warn({ err }, 'fresh-session restart sweep failed (non-fatal)')
   }

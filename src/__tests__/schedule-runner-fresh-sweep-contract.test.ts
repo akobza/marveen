@@ -11,6 +11,9 @@ import { join } from 'node:path'
 //     claude process behind;
 //   - the restart sweep must stop orphaned sched-* sessions -- and only this install's (the tmux server is shared).
 // Source contract, in the style of schedule-runner-main-agent-missing.test.ts.
+// 856bc199: what each branch DOES (stopFreshRound, stopOrphanedFreshSessions, freshTranscriptMtime, freshInflightFields,
+// handFreshSessionToSweep) is held by behaviour in prepare-fresh-session.test.ts; this file pins WHERE the loop and the
+// delivery call them, which a behaviour test cannot reach without a live tmux.
 
 const SRC = readFileSync(join(__dirname, '../web/schedule-runner.ts'), 'utf-8')
 
@@ -32,10 +35,20 @@ describe('schedule-runner: the fresh-session branches of the sweeps', () => {
   })
 
   it('the restart sweep stops only this install\'s orphaned sched-* sessions', () => {
+    // what it stops is held by behaviour (prepare-fresh-session.test.ts); that the restart runs it, here
     const start = SRC.indexOf('export function startScheduleRunner')
     const body = SRC.slice(start, start + 2500)
-    expect(body).toMatch(/listFreshSessions\(freshTmuxBin\(\), PROJECT_ROOT\)/)
-    expect(body).toMatch(/killFreshSession\(freshTmuxBin\(\), s, PROJECT_ROOT\)/)
+    expect(body).toMatch(/try \{\n\s+stopOrphanedFreshSessions\(\)\n\s+\} catch/)
+    const at = SRC.indexOf('export function stopOrphanedFreshSessions')
+    expect(at).toBeGreaterThan(0)
+    const fn = SRC.slice(at, at + 400)
+    expect(fn).toMatch(/listFreshSessions\(freshTmuxBin\(\), PROJECT_ROOT\)/)
+    expect(fn).toMatch(/killFreshSession\(freshTmuxBin\(\), s, PROJECT_ROOT\)/)
+  })
+
+  it('the delivery records the fresh fields in the entry and hands the session to the sweep right after registering it', () => {
+    // 856bc199: both helpers are held by behaviour; this pins that attemptFireTask calls them where it registers the round
+    expect(SRC).toMatch(/\.\.\.freshInflightFields\(task, session\),\n\s+deliveryPending: true,\n\s+\}\n\s+taskInflightMap\.set\(`\$\{task\.name\}@\$\{agentName\}`, inflightEntry\)\n\s+handFreshSessionToSweep\(task, session\)\n/)
   })
 
   it('every kill in the runner is scoped to PROJECT_ROOT', () => {
