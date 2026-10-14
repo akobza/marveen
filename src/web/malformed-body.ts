@@ -13,3 +13,21 @@
 export function isMalformedBodyError(err: unknown): boolean {
   return err instanceof SyntaxError && /JSON/i.test(String(err.message))
 }
+
+/**
+ * 218d76b8: a malformed percent-encoding in the request's URL (DELETE
+ * /api/agents/demo/skills/%E0%A4%A) makes a route's decodeURIComponent throw URIError, and the
+ * top-level catch answered 500 "Szerver hiba" for the caller's own mistake, logged as an error.
+ *
+ * It is a CLIENT error only when the raw URL itself does not decode: a URIError on a well-formed
+ * URL (our own encodeURIComponent on a lone surrogate, say) is our bug and stays a 500.
+ */
+export function isMalformedUrlError(err: unknown, rawUrl: string): boolean {
+  if (!(err instanceof URIError)) return false
+  try {
+    decodeURIComponent(rawUrl)
+    return false
+  } catch {
+    return true
+  }
+}
