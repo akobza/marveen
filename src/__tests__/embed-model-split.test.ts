@@ -24,12 +24,12 @@ beforeEach(() => clearMemoryCache())
 afterEach(() => vi.unstubAllGlobals())
 
 function stubEmbedding(vec: number[]) {
-  vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ embedding: vec }) })))
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ embedding: vec }) })))
 }
 
 describe('generateEmbedding: model/endpoint come from config, not a literal', () => {
   it('calls the configured EMBED_URL with the configured EMBED_MODEL', async () => {
-    const fetchMock = vi.fn(async () => ({ json: async () => ({ embedding: [1, 2, 3] }) }))
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ embedding: [1, 2, 3] }) }))
     vi.stubGlobal('fetch', fetchMock)
     await generateEmbedding('teszt')
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { body: string }]
