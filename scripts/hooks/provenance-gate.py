@@ -69,23 +69,34 @@ from datetime import datetime
 # prompt, so a quote of a tag or a pasted copy of one next to a bare request
 # silenced the gate although nothing had stamped that input. Each envelope now
 # counts only where its producer puts it, the way the self-task notice and the
-# cross-session block (c95f08ac) are checked. Measured 2026-10-15 on the 49 878
+# cross-session block (c95f08ac) are checked. Measured 2026-10-15 on the 49 898
 # distinct prompts carrying one of the old markers in the fleet's transcripts
 # of the last 10 days (the queued prompt, after taking the harness's pasted-
 # content frame off):
 #   - a delivery STARTS with its notice title or with its own opening tag, and
-#     ENDS with that envelope's closing tag; only the agent worker's fixed
-#     OUTPUT INSTRUCTIONS block (src/web/agent-worker.ts buildWorkerPrompt) may
-#     follow it;
+#     ENDS with the first closing tag after its own opening tag (3a9c25cb). The
+#     notice names the tag as an example (source="..."), which neither opens
+#     nor closes the delivery. A <channel> body keeps its tag text, so there the
+#     first closing tag that a valid continuation follows ends it, as before;
 #   - a busy session gets its queued deliveries concatenated (1 463 such joins
 #     measured), so the prompt may be a run of deliveries with only whitespace
-#     between them, each in its own frame;
+#     between them, each in its own frame. The agent worker's caller lists its
+#     records with a "- " bullet before each (src/memory.ts), and the worker's
+#     fixed OUTPUT INSTRUCTIONS block (src/web/agent-worker.ts
+#     buildWorkerPrompt) may end the run;
+#   - the harness pastes two queued deliveries of one burst as two blocks with
+#     the same id. A delivery typed into a busy pane can also arrive with its
+#     first attempt cut off and sent again, or with the tail the harness took as
+#     a paste typed once more. Such a piece counts only as a byte-exact copy of
+#     the start of the delivery after it or of the end of the one before it, so
+#     it adds no text of its own;
 #   - a hand-delivered "[Uzenet @...]" line counts when it starts the prompt.
-# 49 866 of the 49 878 pass. The 12 that now go to the ordinary gate, in 10
-# days: 6 paste frames the c5d83ffe rule does not take apart, 4 deliveries with
-# a stray character before the notice, 1 message cut off before its closing
-# tag, 1 hand-made header. What this cannot see: a prompt typed as exactly such
-# a frame passes, as it always did; the gate is given the text only.
+# 49 887 of the 49 898 pass. The 11 that go to the ordinary gate, in 10 days:
+# 4 deliveries with a stray character before the notice, 3 with a few typed
+# characters after the closing tag, 2 cut off before the closing tag, 1 cut in
+# the middle with its own opening tag lost, 1 hand-made header. What this cannot
+# see: a prompt typed as exactly such a frame passes, as it always did; the
+# gate is given the text only.
 # A local rules file may still add plain substring markers
 # (extra_provenance_markers): that is the operator's own decision.
 ENVELOPE_FRAMES = (
@@ -113,16 +124,94 @@ WORKER_TRAILER_RX = re.compile(
 )
 
 
+# A delivery's own opening tag; the notice's example, source="...", is not one.
+OWN_OPENING_TAG = {
+    "</trusted-peer>": re.compile(r'<trusted-peer source="(?!\.\.\.")'),
+    "</untrusted>": re.compile(r'<untrusted source="(?!\.\.\.")'),
+    "</scheduled-task>": re.compile(r'<scheduled-task source="(?!\.\.\.")'),
+}
+NOTICE_TITLE_RX = re.compile(r"(?:TEAM MEMBER|SECURITY|SCHEDULED TASK|INBOUND MESSAGE) NOTICE --")
+LIST_BULLET_RX = re.compile(r"\s*-[ \t]+")
+# Two pasted blocks of one queued burst: the first closed and the second opened
+# with the same id, three line breaks apart.
+SAME_BURST_PASTE_RX = re.compile(r'\n</pasted_content id="([0-9a-f]{4})">\n\n\n<pasted_content id="\1">\n')
+BLANK_REST_RX = re.compile(r"\s*\Z")
+WHITESPACE_RX = re.compile(r"\s*")
+REPEATED_TAIL_TRIES = 64
+
+
 def envelope_frame_text(prompt):
     """The prompt as the envelope check reads it: the harness's pasted-content
-    frame taken off (c5d83ffe's unwrap_pasted, unchanged; a block that opens
-    the prompt comes without the blank line before it, so that one is read as
-    if the line were there), leading whitespace dropped."""
-    text = prompt or ""
+    frame taken off (c5d83ffe's unwrap_pasted, unchanged; two blocks of one
+    queued burst are read as one, and a block that opens the prompt comes
+    without the blank line before it, so that one is read as if the line were
+    there), leading whitespace dropped."""
+    text = SAME_BURST_PASTE_RX.sub("\n", prompt or "")
     unwrapped = unwrap_pasted(text)
     if unwrapped is None and text.startswith("<pasted_content id="):
         unwrapped = unwrap_pasted("\n\n" + text)
     return (text if unwrapped is None else unwrapped).lstrip()
+
+
+def _envelope_head(text, pos):
+    """(the opening text, the closing tag) of a delivery starting at pos, or None."""
+    for rx, close in ENVELOPE_FRAMES:
+        m = rx.match(text, pos)
+        if m:
+            return m.group(0), close
+    return None
+
+
+def _after_delivery(text, pos):
+    """What follows a delivery that ends at pos: True when only whitespace or
+    the worker's OUTPUT INSTRUCTIONS block does, the start of the next delivery
+    when whitespace or a list bullet leads to one, None for anything else."""
+    if BLANK_REST_RX.match(text, pos) or WORKER_TRAILER_RX.match(text, pos):
+        return True
+    start = WHITESPACE_RX.match(text, pos).end()
+    if _envelope_head(text, start):
+        return start
+    bullet = LIST_BULLET_RX.match(text, pos)
+    if bullet and _envelope_head(text, bullet.end()):
+        return bullet.end()
+    return None
+
+
+def _delivery_end(text, pos, close):
+    """Where the delivery opening at pos ends, or None."""
+    own_rx = OWN_OPENING_TAG.get(close)
+    if own_rx is not None:
+        own = own_rx.search(text, pos)
+        if own is None:
+            return None
+        notice = NOTICE_TITLE_RX.search(text, pos + 1)
+        if notice is not None and notice.start() < own.start():
+            return None
+        end = text.find(close, own.end())
+        return None if end < 0 else end + len(close)
+    end = text.find(close, pos)
+    while end >= 0:
+        if _after_delivery(text, end + len(close)) is not None:
+            return end + len(close)
+        end = text.find(close, end + len(close))
+    return None
+
+
+def _repeated_tail_end(text, pos, delivery):
+    """Where the longest byte-exact copy of the end of `delivery` that starts at
+    pos ends, or None."""
+    probe = text[pos:pos + 32]
+    k = delivery.find(probe, max(0, len(delivery) - (len(text) - pos))) if len(probe) == 32 else -1
+    tries = 0
+    while 0 <= k <= len(delivery) - 32 and tries < REPEATED_TAIL_TRIES:
+        tries += 1
+        if text.startswith(delivery[k:], pos):
+            return pos + len(delivery) - k
+        k = delivery.find(probe, k + 1)
+    for n in range(min(31, len(delivery), len(text) - pos), 0, -1):
+        if text.startswith(delivery[-n:], pos):
+            return pos + n
+    return None
 
 
 def has_envelope_frame(prompt):
@@ -132,23 +221,34 @@ def has_envelope_frame(prompt):
         return True
     pos = 0
     while True:
-        close = next((c for rx, c in ENVELOPE_FRAMES if rx.match(text, pos)), None)
-        if close is None:
+        head = _envelope_head(text, pos)
+        if head is None:
             return False
-        nxt = None
-        end = text.find(close, pos)
-        while end >= 0:
-            after = end + len(close)
-            if not text[after:].strip() or WORKER_TRAILER_RX.match(text, after):
+        opening, close = head
+        # a first attempt cut off and sent again: what stands before the next
+        # same opening is the start of what follows it
+        again = text.find(opening, pos + 1)
+        if again > pos and text.startswith(text[pos:again].rstrip(), again):
+            pos = again
+            continue
+        end = _delivery_end(text, pos, close)
+        if end is None:
+            return False
+        delivery = text[pos:end]
+        while True:
+            nxt = _after_delivery(text, end)
+            if nxt is True:
                 return True
-            start = len(text) - len(text[after:].lstrip())
-            if any(rx.match(text, start) for rx, _ in ENVELOPE_FRAMES):
-                nxt = start
+            if nxt is not None:
+                pos = nxt
                 break
-            end = text.find(close, after)
-        if nxt is None:
-            return False
-        pos = nxt
+            # the tail of the same delivery typed once more
+            tail = None
+            if close in OWN_OPENING_TAG:
+                tail = _repeated_tail_end(text, WHITESPACE_RX.match(text, end).end(), delivery)
+            if tail is None or tail <= end:
+                return False
+            end = tail
 
 # --- the harness's cross-session envelope (c95f08ac) ----------------------
 # A message one Claude Code session sends another reaches the receiving hook as
