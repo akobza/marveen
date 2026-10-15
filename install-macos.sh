@@ -37,6 +37,20 @@ INSTALL_STEP="init"
 # shellcheck source=install-lang.sh
 source "$(dirname "$0")/install-lang.sh"
 
+# #1874: the managed-settings.json writes below are machine-wide (org-policy layer)
+# and need root. Say what is written and why, ONCE, before the first of them asks
+# for a password. The text lives in install-lang.sh; the function stays here, so a
+# standalone run that fetched an older install-lang.sh still has it (an unknown
+# _t key just prints nothing).
+managed_settings_notice() {
+  if [ -n "${MANAGED_NOTICE_SHOWN:-}" ]; then
+    return 0
+  fi
+  MANAGED_NOTICE_SHOWN=1
+  echo -e "  ${ORANGE}i${NC} $(_t managed.notice_what)"
+  echo -e "    $(_t managed.notice_sudo)"
+}
+
 # Error-translation layer (NPMPERM1 kor): minden stderr egy log-fajlba is
 # megy, hogy hibanal a trap ne csak sorszamot mondjon, hanem le tudja
 # forditani az upstream hibat (explain_install_error, install-lang.sh).
@@ -510,6 +524,7 @@ elif [ "$CHANNEL_PROVIDER" = "discord" ]; then
   # MERGE when the file already exists -- never create it here.
   MANAGED_FILE="/Library/Application Support/ClaudeCode/managed-settings.json"
   if [ -f "$MANAGED_FILE" ]; then
+    managed_settings_notice
     HAS_DISCORD=$(sudo python3 -c "
 import json, sys
 try:
@@ -582,6 +597,7 @@ else
   DISCORD_ENTRY='{"plugin":"discord","marketplace":"claude-plugins-official"}'
   REQUIRED_JSON="{\"allowedChannelPlugins\":[$SLACK_ENTRY,$TELEGRAM_ENTRY,$TEAMS_ENTRY,$DISCORD_ENTRY]}"
 
+  managed_settings_notice
   if [ -f "$MANAGED_FILE" ]; then
     # Gate on ALL required plugins being present (not just slack) -- otherwise an
     # install that already has slack/telegram but not teams skips the merge and
@@ -687,6 +703,7 @@ fi
 # no-op on a personal org). Idempotent + preserves existing managed keys.
 CHANNELS_GATE_STATE="manual"
 if [ -f "$INSTALL_DIR/scripts/ensure-managed-channels-enabled.sh" ]; then
+  managed_settings_notice
   echo -e "  Managed-settings channel-kapu ellenorzese..."
   # ORGGATESILENT806: the gate script must never fail the install (exit 0 on
   # every path -- a personal org is a legitimate no-op), but its OUTCOME must
