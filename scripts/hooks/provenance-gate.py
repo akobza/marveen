@@ -58,28 +58,102 @@ import sqlite3
 from datetime import datetime
 
 # --- provenance envelopes -------------------------------------------------
-# Substring markers, matched against the RAW prompt. Presence of any one means
-# the input arrived through a delivery path that stamped its origin, so the
-# gate stays out of the way. src/prompt-safety.ts is the producing side; note
-# that <channel> appears with source="telegram" (channel-coordinator) and with
-# source="plugin:telegram:telegram" (native plugin), hence the loose prefix.
-PROVENANCE_MARKERS = (
-    "<channel ",
-    "<scheduled-task ",
-    "<trusted-peer ",
-    "<untrusted ",
-    # Inter-agent delivery prefixes (src/web/agent-message-wrap.ts). Redundant
-    # with the tags above in normal operation; kept so a prefix-only variant
-    # does not read as bare.
-    "[Uzenet @",
-    "[Uzenet a tavoli @",
-    "[Üzenet @",
+# Presence of an envelope means the input arrived through a delivery path that
+# stamped its origin, so the gate stays out of the way. src/prompt-safety.ts is
+# the producing side (wrapUntrusted / wrapTrustedPeer / wrapScheduledTask /
+# wrapChannelInbound and their notices), src/web/agent-message-wrap.ts puts the
+# notice and the "[Uzenet @" line in front of a bus delivery; <channel> also
+# arrives straight from the native plugin (source="plugin:telegram:telegram").
+#
+# d2d59a89: these used to be SUBSTRING markers matched anywhere in the raw
+# prompt, so a quote of a tag or a pasted copy of one next to a bare request
+# silenced the gate although nothing had stamped that input. Each envelope now
+# counts only where its producer puts it, the way the self-task notice and the
+# cross-session block (c95f08ac) are checked. Measured 2026-10-15 on the 49 878
+# distinct prompts carrying one of the old markers in the fleet's transcripts
+# of the last 10 days (the queued prompt, after taking the harness's pasted-
+# content frame off):
+#   - a delivery STARTS with its notice title or with its own opening tag, and
+#     ENDS with that envelope's closing tag; only the agent worker's fixed
+#     OUTPUT INSTRUCTIONS block (src/web/agent-worker.ts buildWorkerPrompt) may
+#     follow it;
+#   - a busy session gets its queued deliveries concatenated (1 463 such joins
+#     measured), so the prompt may be a run of deliveries with only whitespace
+#     between them, each in its own frame;
+#   - a hand-delivered "[Uzenet @...]" line counts when it starts the prompt.
+# 49 866 of the 49 878 pass. The 12 that now go to the ordinary gate, in 10
+# days: 6 paste frames the c5d83ffe rule does not take apart, 4 deliveries with
+# a stray character before the notice, 1 message cut off before its closing
+# tag, 1 hand-made header. What this cannot see: a prompt typed as exactly such
+# a frame passes, as it always did; the gate is given the text only.
+# A local rules file may still add plain substring markers
+# (extra_provenance_markers): that is the operator's own decision.
+ENVELOPE_FRAMES = (
+    # (how a delivery opens, the closing tag that must end it)
+    (re.compile(r"TEAM MEMBER NOTICE --"), "</trusted-peer>"),
+    (re.compile(r"SECURITY NOTICE --"), "</untrusted>"),
+    (re.compile(r"SCHEDULED TASK NOTICE --"), "</scheduled-task>"),
+    (re.compile(r"INBOUND MESSAGE NOTICE --"), "</channel>"),
+    (re.compile(r'<trusted-peer source="'), "</trusted-peer>"),
+    (re.compile(r'<untrusted source="'), "</untrusted>"),
+    (re.compile(r'<scheduled-task source="'), "</scheduled-task>"),
+    (re.compile(r'<channel source="'), "</channel>"),
 )
+# A hand-delivered line: the bus prefixes (src/web/agent-message-wrap.ts) at
+# the very start of the prompt.
+DELIVERY_PREFIX_RX = re.compile(r"\[(?:Uzenet @|Uzenet a tavoli @|Üzenet @)")
+# The fixed block the agent worker appends after the caller's prompt, with its
+# two file paths (src/web/agent-worker.ts buildWorkerPrompt), in either shape.
+WORKER_TRAILER_RX = re.compile(
+    r"\s*---\s*OUTPUT INSTRUCTIONS \(delivery mechanism, not part of the task\):\s*"
+    r"1\. Write your COMPLETE response -- and nothing else, no commentary, no code fences around it"
+    r" unless the task itself asks -- to this exact file using the Write tool:\s*\S+\s*"
+    r"2\. Then write the single word done to:\s*\S+\s*"
+    r"Do not print the response in the chat\. Those two files are your only output\.\s*\Z"
+)
+
+
+def envelope_frame_text(prompt):
+    """The prompt as the envelope check reads it: the harness's pasted-content
+    frame taken off (c5d83ffe's unwrap_pasted, unchanged; a block that opens
+    the prompt comes without the blank line before it, so that one is read as
+    if the line were there), leading whitespace dropped."""
+    text = prompt or ""
+    unwrapped = unwrap_pasted(text)
+    if unwrapped is None and text.startswith("<pasted_content id="):
+        unwrapped = unwrap_pasted("\n\n" + text)
+    return (text if unwrapped is None else unwrapped).lstrip()
+
+
+def has_envelope_frame(prompt):
+    """True only for a prompt that is a run of deliveries, each in its producer's frame."""
+    text = envelope_frame_text(prompt)
+    if DELIVERY_PREFIX_RX.match(text):
+        return True
+    pos = 0
+    while True:
+        close = next((c for rx, c in ENVELOPE_FRAMES if rx.match(text, pos)), None)
+        if close is None:
+            return False
+        nxt = None
+        end = text.find(close, pos)
+        while end >= 0:
+            after = end + len(close)
+            if not text[after:].strip() or WORKER_TRAILER_RX.match(text, after):
+                return True
+            start = len(text) - len(text[after:].lstrip())
+            if any(rx.match(text, start) for rx, _ in ENVELOPE_FRAMES):
+                nxt = start
+                break
+            end = text.find(close, after)
+        if nxt is None:
+            return False
+        pos = nxt
 
 # --- the harness's cross-session envelope (c95f08ac) ----------------------
 # A message one Claude Code session sends another reaches the receiving hook as
 # a <cross-session-message> block. An incident rule (486481cf) makes
-# this an official signalling path, and the substring markers above do not know
+# this an official signalling path, and the envelope frames above do not know
 # it: store/provenance-flagged.log holds 497 flags of this shape between
 # 2026-09-08 and 2026-10-15, every one of them a real peer message.
 # Measured 2026-10-15 on all 1028 distinct queued cross-session prompts in the
@@ -132,7 +206,7 @@ def is_cross_session_message(prompt):
 # one agent, and on that day every false positive the gate produced was this
 # one shape.
 #
-# WHY THIS IS NOT ADDED TO PROVENANCE_MARKERS. Silencing the gate on this path
+# WHY THIS IS NOT ADDED TO THE ENVELOPE FRAMES. Silencing the gate on this path
 # would be the cheap fix and the wrong one: what arrives here is a SUBAGENT'S
 # OUTPUT, and a subagent routinely reads untrusted material. The live example
 # that settled it (krisztianmarveenja, same day) is a working chain, not a
@@ -655,13 +729,12 @@ def compile_patterns(rules):
 
 
 def has_provenance(prompt, rules):
-    if is_cross_session_message(prompt):
+    if is_cross_session_message(prompt) or has_envelope_frame(prompt):
         return True
-    markers = list(PROVENANCE_MARKERS)
     extra = rules.get("extra_provenance_markers")
-    if isinstance(extra, list):
-        markers.extend(str(m) for m in extra)
-    return any(marker in prompt for marker in markers)
+    if not isinstance(extra, list):
+        return False
+    return any(str(marker) in prompt for marker in extra)
 
 
 def is_exempt(prompt, rules):
