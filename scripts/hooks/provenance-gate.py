@@ -76,6 +76,53 @@ PROVENANCE_MARKERS = (
     "[Üzenet @",
 )
 
+# --- the harness's cross-session envelope (c95f08ac) ----------------------
+# A message one Claude Code session sends another reaches the receiving hook as
+# a <cross-session-message> block. An incident rule (486481cf) makes
+# this an official signalling path, and the substring markers above do not know
+# it: store/provenance-flagged.log holds 497 flags of this shape between
+# 2026-09-08 and 2026-10-15, every one of them a real peer message.
+# Measured 2026-10-15 on all 1028 distinct queued cross-session prompts in the
+# fleet's transcripts of the last 10 days, the frame never varied:
+#   '<cross-session-message from="uds:/run/user/N/cc-socks/N.sock"'
+#       [' hop-chain="..."'] ' from-name="..." from-mode="..."' '>' "\n"
+#   + body + "\n" + "</cross-session-message>"
+# with the tag at index 0 and nothing after the closing tag (the harness puts
+# its "Another Claude session sent a message" preamble and its closing advice
+# into the model's view, not into the hook's prompt). The transcript record
+# carries the harness's own proof (origin.kind "peer", the verified peer pid),
+# but the hook payload carries the prompt text only. So the test is STRUCTURAL,
+# for the reason is_self_task_notice() gives: as a substring the tag would let a
+# quote, a pasted copy (c5d83ffe) or a forged block with an instruction after it
+# silence the gate. All of these must hold:
+#   1. the block starts the prompt, in the measured attribute order, from a
+#      uds socket -- a quote, a paste or leading prose cannot qualify;
+#   2. exactly one opening and one closing tag -- no second block, and a body
+#      that quotes the tag falls back to the ordinary gate (1 of the 1028);
+#   3. nothing follows the closing tag but whitespace -- an appended
+#      instruction cannot ride along.
+# Anything else, including a sender scheme not measured here, falls through to
+# the ordinary gate, which is the safe side. What this cannot see: a bare prompt
+# typed as exactly this frame passes, as a typed copy of any marker above does;
+# telling the two apart needs the harness's origin, which the hook is not given.
+CROSS_SESSION_OPEN = "<cross-session-message"
+CROSS_SESSION_CLOSE = "</cross-session-message>"
+CROSS_SESSION_RX = re.compile(
+    r'\A<cross-session-message from="uds:/run/user/\d+/cc-socks/\d+\.sock"'
+    r'(?: hop-chain="[^"\n]*")? from-name="[^"\n]*" from-mode="[A-Za-z]+">\n'
+    r".*\n</cross-session-message>\s*\Z",
+    re.S,
+)
+
+
+def is_cross_session_message(prompt):
+    """True only for a prompt that IS one harness cross-session delivery."""
+    if not prompt:
+        return False
+    if prompt.count(CROSS_SESSION_OPEN) != 1 or prompt.count(CROSS_SESSION_CLOSE) != 1:
+        return False
+    return CROSS_SESSION_RX.match(prompt) is not None
+
 # --- the agent's own background-task result -------------------------------
 # A `<task-notification>` block is the harness reporting a background task
 # THIS agent started; it names the task id it was given at launch. It carries
@@ -608,6 +655,8 @@ def compile_patterns(rules):
 
 
 def has_provenance(prompt, rules):
+    if is_cross_session_message(prompt):
+        return True
     markers = list(PROVENANCE_MARKERS)
     extra = rules.get("extra_provenance_markers")
     if isinstance(extra, list):
