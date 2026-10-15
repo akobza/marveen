@@ -89,6 +89,7 @@ import {
   saturationRefusesDispatch,
 } from './agent-process.js'
 import { isRestartInFlight } from './restart-lock.js'
+import { mainRespawnHold } from './main-respawn-hold.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { runCommandTask } from './command-task.js'
 import { trackDetachedGroup } from './detached-groups.js'
@@ -1432,7 +1433,7 @@ async function attemptFireTask(
   now: number,
   preCheckPrefix?: string,
   lateCatchUpMs?: number,
-): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
+): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run' | 'respawning'> {
   const { session, host } = resolveTaskTarget(task, agentName)
   // resolveTaskTarget() computes this internally but does not expose it (it
   // only returns {session, host}) -- recompute the same cheap check here
@@ -1482,6 +1483,21 @@ async function attemptFireTask(
     }
     logger.info({ task: task.name, agent: agentName, session }, 'Schedule target session missing, auto-started agent; will deliver on retry')
     return 'starting'
+  }
+
+  // #1954: the main session is being respawned in-process (or has just been),
+  // so the pane is either the old claude about to be replaced or a new one
+  // still booting, and a prompt typed now loses its head (measured 2026-10-11
+  // 16:40 and 18:45: fired 1.5 s after the recovery started, 'head-lost').
+  // Readiness cannot see this, so ask the respawn mark. Applies to forceSend
+  // too: its contract is to land, and a damaged delivery does not land. The
+  // caller queues the retry and never drops it on skipIfBusy.
+  if (session === MAIN_CHANNELS_SESSION) {
+    const respawnHold = mainRespawnHold(now)
+    if (respawnHold) {
+      logger.warn({ task: task.name, agent: agentName, session, respawnHold }, 'Schedule target is the main session and it is respawning, will retry')
+      return 'respawning'
+    }
   }
 
   // When forceSend is true, skip the busy-state check entirely and inject
@@ -2015,7 +2031,7 @@ export async function runScheduledTaskNow(
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run') {
+    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run' || result === 'respawning') {
       const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
       insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
     }
@@ -3048,6 +3064,11 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // pre-check exists to eliminate. The retry row keeps the task alive
           // until the server returns, and the alert names the dead server.
           insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
+        } else if (result === 'respawning') {
+          // #1954: exempt from skipIfBusy like 'first-run'. The hold lasts
+          // under two minutes, so the retry lands within a tick or two; a
+          // dropped tick would make the respawn itself cost a scheduled run.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'respawning')
         } else if (result === 'first-run') {
           // Also exempt from skipIfBusy: a session parked on a first-run
           // dialog (fresh install) never frees up between ticks the way a

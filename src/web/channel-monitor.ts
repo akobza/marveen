@@ -79,6 +79,7 @@ import { getDesiredAgents } from './agent-desired-state.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
 import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
 import { exactTmuxTarget } from '../tmux-target.js'
+import { beginMainRespawn } from './main-respawn-hold.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -1032,68 +1033,75 @@ export function relaunchGoneMainSession(
 // is called here too, so the two paths cannot drift on the parts that matter.
 export function respawnMainSessionFresh(): void {
   const provider = getProvider(getMainAgentProvider())
-  // Same rationale as the resume path: respawn-pane -k kills the parent claude
-  // but leaves grandchild pollers alive, and two pollers on one bot token race
-  // for getUpdates (409). Reap BEFORE respawning, never after.
+  // #1954: mark the respawn for the schedule-runner from the START, not the
+  // end (see main-respawn-hold.ts); the finally clears it on every exit.
+  const endRespawn = beginMainRespawn()
   try {
-    reapChannelOrphans(provider.type, PROJECT_ROOT, { tmuxPath: tmuxBin() })
-  } catch (err) {
-    logger.warn({ err }, 'respawnMainSessionFresh: pre-respawn reap failed (continuing)')
-  }
-  try {
-    reapDetachedChannelClaudes({ tmuxPath: tmuxBin() })
-  } catch (err) {
-    logger.warn({ err }, 'respawnMainSessionFresh: detached-claude reap failed (continuing)')
-  }
-  ensureSharedClaudeOnboarded()
+    // Same rationale as the resume path: respawn-pane -k kills the parent claude
+    // but leaves grandchild pollers alive, and two pollers on one bot token race
+    // for getUpdates (409). Reap BEFORE respawning, never after.
+    try {
+      reapChannelOrphans(provider.type, PROJECT_ROOT, { tmuxPath: tmuxBin() })
+    } catch (err) {
+      logger.warn({ err }, 'respawnMainSessionFresh: pre-respawn reap failed (continuing)')
+    }
+    try {
+      reapDetachedChannelClaudes({ tmuxPath: tmuxBin() })
+    } catch (err) {
+      logger.warn({ err }, 'respawnMainSessionFresh: detached-claude reap failed (continuing)')
+    }
+    ensureSharedClaudeOnboarded()
 
-  const claudeCmd = buildMainSessionRespawnCmd({
-    claudePath: claudeBin(),
-    pluginId: provider.pluginId,
-    extraPluginIds: readExtraChannelPluginIds(),
-    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
-    channelStateEnv: mainChannelStateEnv(provider.type),
-    model: readConfiguredMainModel(),
-    // The main session always starts a new conversation -- this is the whole
-    // point of the nightly restart (drop the accumulated context).
-    continueSession: false,
-    config: resolveMainConfigDecision(),
-  })
-  // c5296a52: the two reaps above kill the pane's claude, and channels.sh starts the session
-  // WITHOUT remain-on-exit -- so the pane and the session can already be gone by the time we get
-  // here. `respawn-pane -k` then throws "can't find pane", the caller only logs it, lastRestart
-  // stays unset, and the slot stays DUE: every idle tick tries again (176 'restart failed' lines
-  // between 03:00Z and 08:01Z on 2026-09-18, one attempt every 6-7 minutes).
-  //
-  // When the session is gone we do NOT hand-roll a tmux new-session here: createMainChannelsSession()
-  // already runs channels.sh -- the same path the guard uses -- with the first-run dialog handling,
-  // the /rename and the plugin bring-up. A second, bespoke launch command is exactly how the two
-  // paths drift apart. 'grace' means a launch is already in flight and the session is booting;
-  // that is a success for our purposes (something IS coming up), not a failure to retry.
-  if (mainChannelsSessionExists()) {
-    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
-  } else {
-    // A fresh session starts its own claude: the respawn-specific follow-ups below
-    // (identity, plugin unlock) are channels.sh's job on this path, not ours.
-    relaunchGoneMainSession(createMainChannelsSession, writeRespawnStamp)
-    return
-  }
-  // Stamp IMMEDIATELY after the respawn, before the scheduling follow-ups.
-  // The stamp is a coordination contract, not bookkeeping: five watchers read
-  // lastMainRespawnAt() / store/.channel-last-respawn and suppress themselves
-  // during the grace window -- including the systemd-timer channel-watchdog,
-  // a separate process that can ONLY see the file. Without it, the ~35-90s
-  // cold-boot window while plugins unlock looks to them like a dead session,
-  // and they can respawn on top of one that is still coming up.
-  writeRespawnStamp()
+    const claudeCmd = buildMainSessionRespawnCmd({
+      claudePath: claudeBin(),
+      pluginId: provider.pluginId,
+      extraPluginIds: readExtraChannelPluginIds(),
+      extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
+      channelStateEnv: mainChannelStateEnv(provider.type),
+      model: readConfiguredMainModel(),
+      // The main session always starts a new conversation -- this is the whole
+      // point of the nightly restart (drop the accumulated context).
+      continueSession: false,
+      config: resolveMainConfigDecision(),
+    })
+    // c5296a52: the two reaps above kill the pane's claude, and channels.sh starts the session
+    // WITHOUT remain-on-exit -- so the pane and the session can already be gone by the time we get
+    // here. `respawn-pane -k` then throws "can't find pane", the caller only logs it, lastRestart
+    // stays unset, and the slot stays DUE: every idle tick tries again (176 'restart failed' lines
+    // between 03:00Z and 08:01Z on 2026-09-18, one attempt every 6-7 minutes).
+    //
+    // When the session is gone we do NOT hand-roll a tmux new-session here: createMainChannelsSession()
+    // already runs channels.sh -- the same path the guard uses -- with the first-run dialog handling,
+    // the /rename and the plugin bring-up. A second, bespoke launch command is exactly how the two
+    // paths drift apart. 'grace' means a launch is already in flight and the session is booting;
+    // that is a success for our purposes (something IS coming up), not a failure to retry.
+    if (mainChannelsSessionExists()) {
+      execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
+    } else {
+      // A fresh session starts its own claude: the respawn-specific follow-ups below
+      // (identity, plugin unlock) are channels.sh's job on this path, not ours.
+      relaunchGoneMainSession(createMainChannelsSession, writeRespawnStamp)
+      return
+    }
+    // Stamp IMMEDIATELY after the respawn, before the scheduling follow-ups.
+    // The stamp is a coordination contract, not bookkeeping: five watchers read
+    // lastMainRespawnAt() / store/.channel-last-respawn and suppress themselves
+    // during the grace window -- including the systemd-timer channel-watchdog,
+    // a separate process that can ONLY see the file. Without it, the ~35-90s
+    // cold-boot window while plugins unlock looks to them like a dead session,
+    // and they can respawn on top of one that is still coming up.
+    writeRespawnStamp()
 
-  logger.warn({ provider: provider.type }, 'Main session respawned FRESH (scheduled auto-restart)')
-  // The respawned claude is a brand-new process: it has neither the /rename
-  // identity nor a guaranteed-loaded channel plugin. Both follow-ups mirror the
-  // resume path; skipping them is how a restarted session comes back nameless
-  // or with the plugin stuck in `◯ disabled`.
-  void scheduleIdentitySetup(MAIN_CHANNELS_SESSION, BOT_NAME)
-  schedulePluginUnlockAfterRespawn(MAIN_CHANNELS_SESSION, provider.type)
+    logger.warn({ provider: provider.type }, 'Main session respawned FRESH (scheduled auto-restart)')
+    // The respawned claude is a brand-new process: it has neither the /rename
+    // identity nor a guaranteed-loaded channel plugin. Both follow-ups mirror the
+    // resume path; skipping them is how a restarted session comes back nameless
+    // or with the plugin stuck in `◯ disabled`.
+    void scheduleIdentitySetup(MAIN_CHANNELS_SESSION, BOT_NAME)
+    schedulePluginUnlockAfterRespawn(MAIN_CHANNELS_SESSION, provider.type)
+  } finally {
+    endRespawn()
+  }
 }
 
 // Exported so the stuck-tool-call-watcher recovers a wedged main session via
@@ -1105,6 +1113,9 @@ export function respawnMainSessionFresh(): void {
 // doom-loop that the launchctl path (channels.sh env-grep reap) never cleaned.
 export async function resumeMarveenSession(): Promise<boolean> {
   const provider = getProvider(getMainAgentProvider())
+  // #1954: mark the respawn for the schedule-runner from the START, not the
+  // end (see main-respawn-hold.ts); the finally clears it on every exit.
+  const endRespawn = beginMainRespawn()
   try {
     // Reap any orphan bun/node poller BEFORE we respawn. tmux respawn-pane -k
     // kills the parent claude process but leaves grandchild pollers running -
@@ -1209,6 +1220,8 @@ export async function resumeMarveenSession(): Promise<boolean> {
   } catch (err) {
     logger.error({ err }, 'Marveen session respawn failed')
     return false
+  } finally {
+    endRespawn()
   }
 }
 
@@ -1414,6 +1427,9 @@ export function createMainChannelsSession(): MainSessionCreateResult {
 // from the stage-3 resume (which keeps --continue) by clearing session state.
 function respawnMarveenSessionFresh(): boolean {
   const provider = getProvider(getMainAgentProvider())
+  // #1954: mark the respawn for the schedule-runner from the START, not the
+  // end (see main-respawn-hold.ts); the finally clears it on every exit.
+  const endRespawn = beginMainRespawn()
   try {
     // Same first-run-picker guard as resumeMarveenSession.
     ensureSharedClaudeOnboarded()
@@ -1464,6 +1480,8 @@ function respawnMarveenSessionFresh(): boolean {
     }
     logger.error({ err }, 'Fresh session respawn failed')
     return false
+  } finally {
+    endRespawn()
   }
 }
 
