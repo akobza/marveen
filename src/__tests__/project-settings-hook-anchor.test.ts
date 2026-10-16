@@ -78,8 +78,9 @@ const EXPECTED: Record<string, string[]> = {
     'email-approval-gate.py @ .*draft_email.*',
     'channel-image-resize.sh @ Read', 'egress-gate.mjs @ WebFetch', 'memory-frontmatter-gate.py @ Write|Edit|MultiEdit',
     'memory-frontmatter-bash-gate.py @ Bash',
-    // card 20e178fc: the quiet-hours send gate on the Telegram reply / react / edit_message tools
-    'telegram-quiet-gate.py @ mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__react|mcp__plugin_telegram_telegram__edit_message',
+    // card 20e178fc: the quiet-hours send gate on the Telegram reply / react / edit_message tools;
+    // card 23724bf8: and on Bash, for a Bot API send written into a command
+    'telegram-quiet-gate.py @ mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__react|mcp__plugin_telegram_telegram__edit_message|Bash',
   ],
   Stop: ['marveen-commands.py', 'telegram-reply-guard.py', 'telegram_progress_clear.py', 'slack_progress_clear.py'],
   StopFailure: ['ledger-turn-failure.py'],
