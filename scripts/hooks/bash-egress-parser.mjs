@@ -1360,6 +1360,32 @@ function blankShellComments(command) {
   return out.join('')
 }
 
+// f3667105: bash's BUILT-IN network pseudo-devices. `/dev/tcp/HOST/PORT` and `/dev/udp/HOST/PORT` are not real device
+// files -- bash opens a socket to HOST:PORT whenever one is a REDIRECTION target (any fd, any redirect operator:
+// `exec 3<>/dev/tcp/h/p`, `cat </dev/tcp/h/p`, `echo >/dev/udp/h/p`). No external client binary is involved, so the
+// command-name and named-client readings miss it entirely (measured live 2026-10-16). Source: bash(1),
+// REDIRECTION. This reads the redirect TARGETS of a span's live text: a target under /dev/tcp/ or /dev/udp/ is a
+// network destination, its host is the third path segment, judged exactly like a client's (local/private/vendor pass,
+// external denies). A host that is not a plain literal (a variable survived expansion, a substitution, a glob, or it is
+// empty) is not statically decidable -> fail closed (the a9c7bee0 rule, which the lead's brief names for this card).
+// A `/dev/tcp/...` word that is NOT a redirect target is a plain path string (the kernel has no such file): not matched.
+// The redirect operator is the anchor, so a quoted or commented mention (already blanked in the live text) is not one.
+const NET_DEV_REDIRECT = /(?:\d+)?(?:<>|>>|&>>?|>\||>|<)\s*(\/dev\/(?:tcp|udp)\/\S*)/gi
+// Whether any /dev/tcp|udp redirect is present at all (used to fail an unbounded loop closed).
+const DEV_NET_REDIRECT_PRESENT = /(?:\d+)?(?:<>|>>|&>>?|>\||>|<)\s*\/dev\/(?:tcp|udp)\//i
+export function redirectNetDevices(text) {
+  const hosts = []
+  let nonLiteral = false
+  NET_DEV_REDIRECT.lastIndex = 0
+  let m
+  while ((m = NET_DEV_REDIRECT.exec(text))) {
+    const host = (m[1].split('/')[3] ?? '').toLowerCase()
+    if (!host || /[$`*?[\]{}()~]/.test(host)) { nonLiteral = true; continue }
+    if (!isLocalHost(host)) hosts.push(host)
+  }
+  return { hosts: [...new Set(hosts)], nonLiteral }
+}
+
 export function classify(command, depth = 0, vendorHosts = new Set(), vendorDomains = new Set(), ctx = {}) {
   const norm = String(command ?? '').replace(/\\\r?\n/g, ' ')
   // a9c7bee0 (c): blank shell COMMENTS before lifting. A comment's apostrophe or quote otherwise desyncs
@@ -1557,6 +1583,23 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
           }
         }
       }
+    }
+    // f3667105: a /dev/tcp or /dev/udp redirect target is a network destination, independent of the command word (a bare
+    // `exec 3<>/dev/tcp/...` has none). Structure comes from the MASKED span: an operator or target inside quotes is inert
+    // (`echo ">/dev/tcp/x/y"` is data, not a redirect), exactly as the rest of this function reads structure. The host is
+    // then expanded with this command's assignments and loop values. An unbounded loop with such a redirect fails closed.
+    const rdMasked = masked.slice(a, b)
+    const rdVariants = loopVariants(rdMasked, env, loops)
+    // An unbounded loop (null), or one whose values are not static (a command substitution leaves an empty value set),
+    // in a span that holds a redirect: the host cannot be enumerated -> fail closed.
+    if ((rdVariants === null || rdVariants.length === 0) && DEV_NET_REDIRECT_PRESENT.test(expand(rdMasked, env))) {
+      return { deny: true, reason: 'dev-net-redirect-loop-unbounded', hosts: [] }
+    }
+    for (const rt of rdVariants ?? []) {
+      const rd = redirectNetDevices(rt)
+      if (rd.nonLiteral) return { deny: true, reason: 'dev-net-redirect-nonliteral', hosts: [] }
+      const rdHosts = rd.hosts.filter((h) => !vendorHosts.has(h) && !hostInDomains(h, vendorDomains))
+      if (rdHosts.length) return { deny: true, reason: 'dev-net-redirect-external', hosts: rdHosts }
     }
     for (const text of [plain, ...(variants ?? [])]) {
       const tw = shellWords(text)
