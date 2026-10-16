@@ -255,7 +255,10 @@ check(decide({"tool_name": "Bash", "tool_input": "not an object"})[0] and decide
 no_cfg = state(None)
 allow, text, err = decide(bash(SEND_ANY), d=no_cfg)
 check(allow and err == "", "config missing WITHOUT the marker: an unknown chat goes at night, no defect (an install without quiet hours)")
-seen_dir = os.path.join(temp("quiet-bash-seen-"), "store")
+seen_root = temp("quiet-bash-seen-")
+with open(os.path.join(seen_root, ".env"), "w", encoding="utf-8") as f:
+    f.write("SCHEDULER_TZ=Europe/Budapest\n")  # the fallback hours run in the install's zone (ISSUE1895): pin it
+seen_dir = os.path.join(seen_root, "store")
 os.makedirs(seen_dir)
 seen = os.path.join(seen_dir, "quiet-hours.seen")
 open(seen, "w").close()

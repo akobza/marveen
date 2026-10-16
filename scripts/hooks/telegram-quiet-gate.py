@@ -33,7 +33,9 @@ Decision (card 20e178fc):
     (never by a probe call, which names no gated tool). Without the marker a missing
     file means no quiet hours. With it, and for a file that exists but cannot be
     read or an entry that is malformed, every chat is stopped inside the fallback
-    window (23:00-07:00 Europe/Budapest), the send goes outside it, and either way a
+    windows (the last fully read config's own windows, kept in the install's store
+    directory; on an install that never had one, 23:00-07:00 in the install's zone),
+    the send goes outside them, and either way a
     line naming the file and the reason goes to the hook error log (hook_errlog.py)
     and to stderr. An earlier form of the rule, "missing = the fallback window",
     would have silenced every install without a config every night.
