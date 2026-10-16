@@ -1370,9 +1370,9 @@ function blankShellComments(command) {
 // empty) is not statically decidable -> fail closed (the a9c7bee0 rule, which the lead's brief names for this card).
 // A `/dev/tcp/...` word that is NOT a redirect target is a plain path string (the kernel has no such file): not matched.
 // The redirect operator is the anchor, so a quoted or commented mention (already blanked in the live text) is not one.
-const NET_DEV_REDIRECT = /(?:\d+)?(?:<>|>>|&>>?|>\||>|<)\s*(\/dev\/(?:tcp|udp)\/\S*)/gi
+const NET_DEV_REDIRECT = /(?:\d+)?(?:<>|>>|&>>?|>\||>&|<&|>|<)\s*(\/dev\/(?:tcp|udp)\/\S*)/gi
 // Whether any /dev/tcp|udp redirect is present at all (used to fail an unbounded loop closed).
-const DEV_NET_REDIRECT_PRESENT = /(?:\d+)?(?:<>|>>|&>>?|>\||>|<)\s*\/dev\/(?:tcp|udp)\//i
+const DEV_NET_REDIRECT_PRESENT = /(?:\d+)?(?:<>|>>|&>>?|>\||>&|<&|>|<)\s*\/dev\/(?:tcp|udp)\//i
 export function redirectNetDevices(text) {
   const hosts = []
   let nonLiteral = false

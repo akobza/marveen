@@ -36,6 +36,10 @@ describe('a bash /dev/tcp or /dev/udp redirect target is a network destination',
     [`eval "exec 3<>/dev/tcp/${EXT}/443"`, EXT],
     // wrapped behind a launcher (timeout) and a shell -c
     [`timeout 2 bash -c "echo >/dev/tcp/${EXT}/22"`, EXT],
+    // the word-form `>&`/`N>&`/`<&`: when the word is a path (not a digit), bash opens it, so a socket opens too
+    [`echo x >&/dev/tcp/${EXT}/80`, EXT],
+    [`exec 3>&/dev/tcp/${EXT}/443`, EXT],
+    [`cat 4<&/dev/tcp/${EXT}/22`, EXT],
   ]
   // host not statically decidable -> fail closed, and NO bogus host is reported
   const DENY_NONLITERAL = [
@@ -64,6 +68,11 @@ describe('a bash /dev/tcp or /dev/udp redirect target is a network destination',
     `ls /tmp # /dev/tcp/${EXT}/443`,
     // a plain filename ARGUMENT, not a redirect target: bash's /dev/tcp magic applies only to redirections
     `cat /dev/tcp/${EXT}/443`,
+    // `>&`/`N>&` with a DIGIT word is fd duplication, not a path: not a /dev/tcp redirect
+    `echo hi >&2`,
+    `exec 3>&1`,
+    // `>&` to a local pseudo-device is not external
+    `ls >&/dev/null`,
   ]
   it('denies a redirect to an external /dev/tcp or /dev/udp target, however it is wrapped', () => {
     for (const [cmd, host] of DENY) expect({ cmd, r: classify(cmd) }).toMatchObject({ cmd, r: { deny: true, hosts: [host] } })
