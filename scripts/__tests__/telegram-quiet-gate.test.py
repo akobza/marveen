@@ -14,9 +14,17 @@ WHAT IT PINS
   - the config states (card 20e178fc): ok; empty (send); missing WITHOUT the
     install's quiet-hours.seen marker (send, no defect, at any hour); missing WITH the
     marker, unreadable (0 bytes, not JSON, not an object) and a malformed entry (the
-    fallback window for every chat, and a defect either way);
+    fallback window for every chat, and a defect either way); these run in installs
+    whose zone is pinned to Europe/Budapest (SCHEDULER_TZ in the install's .env);
   - the marker: written only for a usable config that names a chat, only once,
     atomically (no temp file left behind), never by a probe call;
+  - the fallback's windows (ISSUE1895 and the card 23724bf8 re-layer): no zone written
+    into the module; an entry without "tz" reads the install's zone; an unusable config
+    holds the LAST fully read config's windows with their own zone (Europe/Budapest on
+    an install whose zone is UTC: 23:30 Budapest held, 07:30 Budapest sent); an install
+    that never had a usable config holds 23:00-07:00 in the install's zone; the kept
+    windows are not replaced by a partly malformed or an empty config, only by a
+    changed usable one, and a broken kept file falls back to the install's zone;
   - a call that names no chat: held while any configured window holds;
   - the gate end to end in a throwaway install (subprocess, the real stdin payload):
     reply, react and edit_message held for the protected chat inside its window,
@@ -38,6 +46,8 @@ NEGATIVE CONTROL, IN THIS FILE
   constant "send"), and the in-window probe must NOT block on that copy. The cut is
   verified (the marker found exactly once), so a marker drift fails loudly instead of
   turning the control vacuous. A probe that stays green on the cut copy measures nothing.
+  For the last good windows: the same unusable config on the same UTC install WITHOUT
+  the kept file sends at 23:30 Budapest -- what the fallback did before it kept them.
 
 DATA
   No real identifier: the chat ids "999" (protected) and "888" (another chat) are
@@ -85,6 +95,14 @@ def load_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def pinned_root(prefix, zone):
+    """A throwaway install directory whose zone is pinned: <root>/.env with SCHEDULER_TZ=<zone>."""
+    root = temp(prefix)
+    with open(os.path.join(root, ".env"), "w", encoding="utf-8") as f:
+        f.write("SCHEDULER_TZ=%s\n" % zone)
+    return root
 
 
 def state(cfg):
@@ -140,15 +158,15 @@ q = load_module()
 
 # 1. Fixed instants, both DST changes ------------------------------------------------
 ok_dir = state({PROTECTED: WINDOW})
-NO_SEEN = os.path.join(temp("quiet-gate-noseen-"), "store", "quiet-hours.seen")  # a marker that does not exist
+NO_SEEN = os.path.join(pinned_root("quiet-gate-noseen-", "Europe/Budapest"), "store", "quiet-hours.seen")  # a marker that does not exist
 
 
 def decision(d, chat, at, seen=NO_SEEN):
     return q.send_decision(d, chat, at, seen)
 
 
-def marker():
-    d = temp("quiet-gate-seen-")
+def marker(zone="Europe/Budapest"):
+    d = pinned_root("quiet-gate-seen-", zone)
     path = os.path.join(d, "store", "quiet-hours.seen")
     os.makedirs(os.path.dirname(path))
     open(path, "w").close()
@@ -220,7 +238,62 @@ check(q.remember_configured(ok_dir, seen_new, "test") is True and os.path.exists
 body = open(seen_new, encoding="utf-8").read()
 check(json.loads(body).get("config") == os.path.join(ok_dir, "quiet-hours.json") and json.loads(body).get("by") == "test", "marker: it names the config and the writer")
 check(q.remember_configured(ok_dir, seen_new, "again") is False and open(seen_new, encoding="utf-8").read() == body, "marker: a second call does not rewrite it")
-check(sorted(os.listdir(store)) == ["quiet-hours.seen"], "marker: no temp file left beside it")
+check(sorted(os.listdir(store)) == ["quiet-hours.last-good.json", "quiet-hours.seen"], "marker and last good windows: no temp file left beside them")
+
+# 2c. The fallback's windows: the install's zone, and the last good config's own ------------
+check("Europe/Budapest" not in open(os.path.join(HOOKS, "telegram_quiet_hours.py"), encoding="utf-8").read(),
+      "no zone is written into the module (ISSUE1895)")
+NIGHT_BP, MORNING_BP = z("2026-10-08T21:30:00Z"), z("2026-10-09T05:30:00Z")  # 23:30 and 07:30 in Budapest, 21:30 and 05:30 UTC
+NIGHT_NY, DAY_NY = z("2026-10-09T03:30:00Z"), z("2026-10-08T21:30:00Z")  # 23:30 and 17:30 in New York
+no_tz = state({PROTECTED: {"start": "23:00", "end": "07:00"}})
+ny_seen = os.path.join(pinned_root("quiet-gate-ny-", "America/New_York"), "store", "quiet-hours.seen")
+check(decision(no_tz, PROTECTED, NIGHT_NY, ny_seen)[0] is True and decision(no_tz, PROTECTED, DAY_NY, ny_seen)[0] is False,
+      "an entry without tz reads the install's zone: held 23:30 New York, sent 17:30 New York (= 23:30 Budapest)")
+check("America/New_York" in decision(no_tz, PROTECTED, NIGHT_NY, ny_seen)[1], "the reason names the install's zone for an entry without tz")
+utc_seen = marker("UTC")
+check(decision(ok_dir, PROTECTED, NIGHT_BP, utc_seen)[:1] == (True,) and decision(ok_dir, PROTECTED, MORNING_BP, utc_seen)[:1] == (False,),
+      "(1) a readable config is unchanged on a UTC install: its own Europe/Budapest window decides")
+q.remember_configured(ok_dir, utc_seen, "test")
+kept = json.load(open(q.last_good_path(utc_seen), encoding="utf-8"))
+check(kept.get("windows") == [WINDOW] and kept.get("by") == "test", "the last good windows are kept beside the marker, with their own zone")
+for raw, what in (("", "a 0-byte config"), ("{not json", "a config that is not JSON")):
+    broken = state(raw)
+    hold, why, defect = decision(broken, OTHER, NIGHT_BP, utc_seen)
+    check(hold and "utolso hasznalhato konfig ablaka" in why and "Europe/Budapest" in why and defect,
+          "(2) %s on a UTC install with last good windows: 23:30 Budapest held by the kept window, the defect reported" % what)
+    check(decision(broken, OTHER, MORNING_BP, utc_seen)[0] is False,
+          "(2) %s: 07:30 Budapest (05:30 UTC, inside a UTC 23-07) sent: the kept window, not the install's zone" % what)
+hold, why, defect = decision(state(None), OTHER, NIGHT_BP, utc_seen)
+check(hold and defect and "missing" in defect, "(2) a config lost after use: the kept window holds 23:30 Budapest")
+bad_entry = state({PROTECTED: {"start": "23:00", "end": "07:60", "tz": "Europe/Budapest"}})
+check(decision(bad_entry, PROTECTED, NIGHT_BP, utc_seen)[0] is True, "(2) a malformed entry: the kept window holds 23:30 Budapest")
+nk_seen = marker("UTC")
+hold, why, defect = decision(state(""), OTHER, NIGHT_BP, nk_seen)
+check(not hold and "az alapablak" in why and "UTC" in why,
+      "(4) NEGATIVE CONTROL: the same broken config on a UTC install without kept windows sends at 23:30 Budapest")
+fresh_seen = marker("America/New_York")
+hold, why, defect = decision(state(""), OTHER, NIGHT_NY, fresh_seen)
+check(hold and "az alapablak" in why and "America/New_York" in why,
+      "(3) an install that never had a usable config: 23:00-07:00 in the install's zone holds 23:30 New York")
+check(decision(state(""), OTHER, DAY_NY, fresh_seen)[0] is False, "(3) and sends at 17:30 New York")
+# the malformed config's readable entry differs from the kept one: a writer that kept the readable part would show
+for cfg, what in (({OTHER: {"start": "22:00", "end": "06:00", "tz": "UTC"}, PROTECTED: {"start": "25:00", "end": "07:00", "tz": "UTC"}},
+                   "a config with one malformed entry"),
+                  ({}, "an empty config")):
+    q.remember_configured(state(cfg), utc_seen, "later")
+    check(json.load(open(q.last_good_path(utc_seen), encoding="utf-8")).get("by") == "test",
+          "the kept windows are not replaced by %s" % what)
+two = {PROTECTED: WINDOW, OTHER: {"start": "22:00", "end": "06:00"}}
+q.remember_configured(state(two), utc_seen, "changed")
+kept = json.load(open(q.last_good_path(utc_seen), encoding="utf-8"))
+check(kept.get("by") == "changed" and kept.get("windows") == [WINDOW, {"start": "22:00", "end": "06:00", "tz": "UTC"}],
+      "a changed usable config replaces them; an entry without tz is kept with the install's zone of that day")
+check(decision(state(""), OTHER, z("2026-10-08T22:30:00Z"), utc_seen)[0] is True,
+      "with two kept windows, a time inside either one holds (22:30 UTC: inside 22:00-06:00 UTC)")
+q.remember_configured(state(two), utc_seen, "unchanged")
+check(json.load(open(q.last_good_path(utc_seen), encoding="utf-8")).get("by") == "changed", "the same windows again do not rewrite the file")
+open(q.last_good_path(nk_seen), "w").write("{broken")
+check("az alapablak" in decision(state(""), OTHER, NIGHT_BP, nk_seen)[1], "a broken kept file: the install's zone default, no crash")
 
 # 3. A call that names no chat ---------------------------------------------------------
 for chat in (None, "", "  "):
@@ -267,9 +340,9 @@ never = install(None)
 rc, err = run_gate(never, call(TOOL + "reply", PROTECTED))
 check(rc == 0 and errlog(never) == "" and not os.path.exists(seen_at(never)),
       "gate: no config and no marker -> exit 0 at any hour, no defect line, no marker")
-expect_hold = q._window_holds(q.FALLBACK_WINDOW, time.time())[0]
-edge = datetime.datetime.now(TZ).strftime("%H:%M") in ("22:59", "23:00", "06:59", "07:00")
 lost = install(None)
+expect_hold = q._window_holds(q.FALLBACK_WINDOW, time.time(), lost)[0]  # no kept windows there: the install's zone
+edge = datetime.datetime.now(ZoneInfo(q.install_zone(lost))).strftime("%H:%M") in ("22:59", "23:00", "06:59", "07:00")
 os.makedirs(os.path.join(lost, "store"))
 open(seen_at(lost), "w").close()
 rc, err = run_gate(lost, call(TOOL + "reply", OTHER))
@@ -281,6 +354,15 @@ open(os.path.join(empty_file, ".claude", "channels", "telegram", "quiet-hours.js
 rc, err = run_gate(empty_file, call(TOOL + "reply", OTHER))
 check("unreadable" in errlog(empty_file), "gate: a 0-byte config is a defect in the error log, with no marker needed")
 check(edge or rc == (2 if expect_hold else 0), "gate: a 0-byte config -> the fallback window decides (now %s, exit %d)" % ("held" if expect_hold else "send", rc))
+
+kept_inst = install({PROTECTED: around_now(-60, 60)})
+rc, err = run_gate(kept_inst, call(TOOL + "reply", OTHER))
+check(rc == 0 and os.path.exists(os.path.join(kept_inst, "store", "quiet-hours.last-good.json")),
+      "gate: a real send evaluated against a usable config keeps its windows in the install's store")
+os.remove(os.path.join(kept_inst, ".claude", "channels", "telegram", "quiet-hours.json"))
+rc, err = run_gate(kept_inst, call(TOOL + "reply", OTHER))
+check(rc == 2 and "utolso hasznalhato konfig ablaka" in err,
+      "gate: the config lost after that -> the kept Budapest window (now inside it) holds any chat, exit 2")
 
 # 5. The fallback sender -----------------------------------------------------------------
 fb = install({PROTECTED: around_now(-60, 60)}, with_fallback=True)

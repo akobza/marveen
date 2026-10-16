@@ -3,8 +3,10 @@
 Shared quiet-hours check for the Telegram hooks (submit / stop / reply-guard / watchdog).
 
 Config: <state_dir>/quiet-hours.json, e.g.
-  {"<chat_id>": {"start": "23:00", "end": "07:00", "tz": "Europe/Budapest"}}
-Windows may wrap midnight (start > end).
+  {"<chat_id>": {"start": "23:00", "end": "07:00", "tz": "<IANA zone>"}}
+Windows may wrap midnight (start > end). An entry without "tz" reads the install's zone
+(install_zone(): SCHEDULER_TZ, else the host zone, the rule of APP_TZ in src/config.ts;
+ISSUE1895), never a zone written into this file.
 
 Why this file lives in the repo (card e6680b3c): until 2026-09-22 it existed ONLY in
 ~/.claude/hooks, which is not version controlled. On 2026-09-12 15:32:53Z an update run
@@ -66,6 +68,73 @@ def _hm(s):
     return int(h) * 60 + int(m)
 
 
+# ---------------------------------------------------------------------------
+# The install's zone (ISSUE1895, #1895): src/config.ts resolves ONE zone for the
+# install (APP_TZ): SCHEDULER_TZ from store/config-overrides.json over .env, and
+# the host zone when it is unset or not a real zone. scripts/lib/install-tz.sh is
+# the shell side of the same rule, this is the hooks' side: they import only from
+# their own directory, so the rule lives here once more instead of an import.
+# ---------------------------------------------------------------------------
+
+def _module_root():
+    """The install this module belongs to: <root>/scripts/hooks/telegram_quiet_hours.py."""
+    return os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def _real_zone(name):
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def _pinned_zone(root):
+    """SCHEDULER_TZ, config-overrides.json over .env (the last .env line wins, one pair of quotes
+    dropped), only when it names a real zone; '' otherwise."""
+    value = ""
+    try:
+        with open(os.path.join(root, "store", "config-overrides.json"), encoding="utf-8") as f:
+            ov = json.load(f)
+        if isinstance(ov, dict) and isinstance(ov.get("SCHEDULER_TZ"), str):
+            value = ov["SCHEDULER_TZ"].strip()
+    except Exception:
+        pass
+    if not value:
+        try:
+            with open(os.path.join(root, ".env"), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("SCHEDULER_TZ="):
+                        value = line.split("=", 1)[1].strip()
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                            value = value[1:-1]
+        except Exception:
+            pass
+    return value if value and _real_zone(value) else ""
+
+
+def _host_zone():
+    """The host's zone by NAME (a ZoneInfo keeps the DST rules): TZ when it names one, else /etc/localtime."""
+    tz = (os.environ.get("TZ") or "").lstrip(":").strip()
+    if "/" in tz and _real_zone(tz):
+        return tz
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target and _real_zone(target.split("/zoneinfo/", 1)[1]):
+            return target.split("/zoneinfo/", 1)[1]
+    except Exception:
+        pass
+    return ""
+
+
+def install_zone(root=None):
+    """The install's zone: the pinned SCHEDULER_TZ, else the host zone, else UTC. `root` is the
+    install's directory; without it, the install this module was loaded from."""
+    return _pinned_zone(root or _module_root()) or _host_zone() or "UTC"
+
+
 def in_quiet(state_dir, chat_id, now=None):
     """True iff chat_id has a configured window and local time is inside it.
     [start, end) -- start inclusive, end exclusive."""
@@ -73,7 +142,7 @@ def in_quiet(state_dir, chat_id, now=None):
     if not cfg:
         return False
     try:
-        tzname = cfg.get("tz") or "Europe/Budapest"
+        tzname = cfg.get("tz") or install_zone()
         try:
             from zoneinfo import ZoneInfo
             tz = ZoneInfo(tzname)
@@ -99,7 +168,7 @@ def quiet_window_end(state_dir, chat_id, at_epoch):
         return None
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo(cfg.get("tz") or "Europe/Budapest")
+        tz = ZoneInfo(cfg.get("tz") or install_zone())
         t = datetime.datetime.fromtimestamp(int(at_epoch), tz)
         if not in_quiet(state_dir, chat_id, t):
             return None
@@ -122,8 +191,8 @@ def quiet_window_end(state_dir, chat_id, at_epoch):
 # the opposite safe side: a config that vanished must not reopen the quiet window
 # without a trace (the 2026-09-12 regression stayed silent for ten days exactly
 # because the fail-open path leaves none). So send_decision() tells "not quiet"
-# apart from "cannot say", and "cannot say" holds the send inside FALLBACK_WINDOW
-# for every chat (the gate cannot tell which chat is protected without the file),
+# apart from "cannot say", and "cannot say" holds the send inside the fallback
+# windows for every chat (the gate cannot tell which chat is protected without the file),
 # lets it go outside, and reports the defect either way -- but only on an install
 # that HAS used quiet hours: a missing file on an install that never had one is no
 # defect at all (send, no line), or every fresh install and the upstream default
@@ -135,9 +204,16 @@ def quiet_window_end(state_dir, chat_id, at_epoch):
 # says someone meant quiet hours.
 # ---------------------------------------------------------------------------
 
-# The window a missing or unusable config falls back to: the one owner window this
-# install configures today. Every chat, because the file is what names the chat.
-FALLBACK_WINDOW = {"start": "23:00", "end": "07:00", "tz": "Europe/Budapest"}
+# What a missing or unusable config falls back to, for every chat (the file is what
+# names the chat): the windows of the LAST config that was read in full, each with its
+# own zone, kept in the install's store directory (quiet-hours.last-good.json, written
+# by remember_configured() beside the marker). A broken config must not move an owner's
+# window, and the install's zone need not be the owner's (an install on UTC, an owner an
+# hour or two east of it): an install-zone fallback would let a send through for the
+# first hours of that night. Only an install that never had a usable config has no last
+# windows; there FALLBACK_WINDOW holds, in the install's zone.
+FALLBACK_WINDOW = {"start": "23:00", "end": "07:00"}
+LAST_GOOD_NAME = "quiet-hours.last-good.json"
 
 
 def _strict_hm(s):
@@ -148,7 +224,7 @@ def _strict_hm(s):
     return int(h) * 60 + int(m)
 
 
-def _window_holds(cfg, at_epoch):
+def _window_holds(cfg, at_epoch, root=None):
     """(inside, local 'HH:MM') for the instant at_epoch on cfg's own wall clock, [start, end).
     Raises on a malformed entry, unlike in_quiet(): the caller must be able to say 'cannot say'.
     The instant is converted with fromtimestamp(tz), so the answer is the local clock's
@@ -157,7 +233,7 @@ def _window_holds(cfg, at_epoch):
     from zoneinfo import ZoneInfo
     if not isinstance(cfg, dict):
         raise ValueError("the entry is not an object")
-    tz = ZoneInfo(cfg.get("tz") or "Europe/Budapest")
+    tz = ZoneInfo(cfg.get("tz") or install_zone(root))
     start, end = _strict_hm(cfg.get("start", "23:00")), _strict_hm(cfg.get("end", "07:00"))
     t = datetime.datetime.fromtimestamp(int(at_epoch), tz)
     cur = t.hour * 60 + t.minute
@@ -165,8 +241,8 @@ def _window_holds(cfg, at_epoch):
     return inside, t.strftime("%H:%M")
 
 
-def _window_text(cfg):
-    return "%s-%s %s" % (cfg.get("start", "23:00"), cfg.get("end", "07:00"), cfg.get("tz") or "Europe/Budapest")
+def _window_text(cfg, root=None):
+    return "%s-%s %s" % (cfg.get("start", "23:00"), cfg.get("end", "07:00"), cfg.get("tz") or install_zone(root))
 
 
 SEEN_NAME = "quiet-hours.seen"
@@ -177,15 +253,98 @@ def seen_path(install_root):
     return os.path.join(install_root, "store", SEEN_NAME)
 
 
+def last_good_path(seen):
+    """The last fully read config's windows, beside the marker: <root>/store/quiet-hours.last-good.json."""
+    return os.path.join(os.path.dirname(seen), LAST_GOOD_NAME)
+
+
+def _root_of(seen):
+    """The install directory a marker path names: <root>/store/quiet-hours.seen."""
+    return os.path.dirname(os.path.dirname(seen))
+
+
+def _usable_windows(cfg_all, root):
+    """Every entry of a config as {start, end, tz}, the zone written out (an entry without one
+    gets the install's zone of today), duplicates once; None when ANY entry is malformed: a config
+    that is only partly readable is not the last good one."""
+    if not isinstance(cfg_all, dict):
+        return None
+    out = []
+    for cfg in cfg_all.values():
+        if not isinstance(cfg, dict):
+            return None
+        w = {"start": str(cfg.get("start", "23:00")), "end": str(cfg.get("end", "07:00")),
+             "tz": cfg.get("tz") or install_zone(root)}
+        try:
+            _window_holds(w, 0, root)
+        except Exception:
+            return None
+        if w not in out:
+            out.append(w)
+    return out or None
+
+
+def _remember_last_good(state_dir, seen, by):
+    """Keep the windows of a config read in full beside the marker, so that a broken config later
+    falls back to THEM (see FALLBACK_WINDOW). Written only when they differ from the kept ones,
+    atomically (a temp file beside it, then replaced). Returns True if this call wrote; never raises."""
+    try:
+        root = _root_of(seen)
+        windows = _usable_windows(load(state_dir), root)
+        if not windows:
+            return False
+        path = last_good_path(seen)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if json.load(f).get("windows") == windows:
+                    return False
+        except Exception:
+            pass
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="." + LAST_GOOD_NAME + ".", dir=d)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"windows": windows, "config": config_path(state_dir), "by": by,
+                                     "saved": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}) + "\n")
+            os.replace(tmp, path)
+            return True
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except Exception:
+        return False
+
+
+def _fallback_windows(seen, root):
+    """(windows, source): the kept last-good windows when the file is there and every one of them
+    is usable, else FALLBACK_WINDOW in the install's zone."""
+    try:
+        with open(last_good_path(seen), encoding="utf-8") as f:
+            windows = json.load(f).get("windows")
+        if isinstance(windows, list) and windows:
+            for w in windows:
+                _window_holds(w, 0, root)
+            return windows, "last-good"
+    except Exception:
+        pass
+    return [dict(FALLBACK_WINDOW, tz=install_zone(root))], "default"
+
+
 def remember_configured(state_dir, seen, by):
     """Write the 'this install uses quiet hours' marker, only when the config is usable AND names a
     chat (an empty {} is a deliberate 'no quiet hours', and its loss is no defect), only when the
     marker is not there yet, and atomically: the content goes to a temp file beside it, which is then
     LINKED into place, so a racing writer cannot overwrite it and no half-written marker is ever
     visible. Called by the gate and the fallback sender only when they evaluate a real send (a probe
-    call never reaches it). Returns True if this call wrote the marker; never raises."""
+    call never reaches it). The same call keeps the config's windows as the last good ones
+    (_remember_last_good), on every call, not only the first. Returns True if this call wrote the
+    marker; never raises."""
     try:
-        if os.path.exists(seen) or config_state(state_dir) != STATE_OK:
+        if config_state(state_dir) != STATE_OK:
+            return False
+        _remember_last_good(state_dir, seen, by)
+        if os.path.exists(seen):
             return False
         d = os.path.dirname(seen)
         os.makedirs(d, exist_ok=True)
@@ -223,17 +382,25 @@ def send_decision(state_dir, chat_id, at_epoch, seen):
     config missing, no marker     -> send, no defect (this install never had quiet hours);
     config missing, marker there,
       config unreadable, or the chat's
-      entry malformed             -> FALLBACK_WINDOW for every chat, with a defect;
+      entry malformed             -> the fallback windows for every chat (the last good
+                                     config's, else FALLBACK_WINDOW in the install's
+                                     zone), with a defect;
     chat_id unknown (None / '')   -> hold when ANY configured window holds now: the
                                      protected chat cannot be ruled out.
     """
     path = config_path(state_dir)
+    root = _root_of(seen)
     chat = None if chat_id is None or str(chat_id).strip() == "" else str(chat_id).strip()
 
     def fallback(defect):
-        inside, local = _window_holds(FALLBACK_WINDOW, at_epoch)
-        why = "a quiet-hours konfig nem hasznalhato, ezert az alapablak ervenyes minden chatre (%s, helyi ido most %s)" % (
-            _window_text(FALLBACK_WINDOW), local)
+        windows, source = _fallback_windows(seen, root)
+        inside, texts = False, []
+        for w in windows:
+            held, local = _window_holds(w, at_epoch, root)
+            inside = inside or held
+            texts.append("%s, helyi ido most %s" % (_window_text(w, root), local))
+        why = "a quiet-hours konfig nem hasznalhato, ezert %s ervenyes minden chatre (%s)" % (
+            "az utolso hasznalhato konfig ablaka" if source == "last-good" else "az alapablak", "; ".join(texts))
         return inside, why, defect
 
     state = config_state(state_dir)
@@ -242,25 +409,25 @@ def send_decision(state_dir, chat_id, at_epoch, seen):
     if state == STATE_MISSING and not os.path.exists(seen):
         return False, "nincs csendes-ido konfig, es ez a telepites meg nem hasznalt ilyet", None
     if state == STATE_MISSING:
-        return fallback("%s: missing, pedig a telepites mar hasznalt csendes-ido konfigot (%s); az alapablak tart" % (path, seen))
+        return fallback("%s: missing, pedig a telepites mar hasznalt csendes-ido konfigot (%s); a tartalek ablak tart" % (path, seen))
     if state != STATE_OK:
-        return fallback("%s: %s (a csendes ido nem olvashato, az alapablak tart)" % (path, state))
+        return fallback("%s: %s (a csendes ido nem olvashato, a tartalek ablak tart)" % (path, state))
     cfg_all = load(state_dir)
     if chat is not None:
         cfg = cfg_all.get(chat)
         if cfg is None:
             return False, "a(z) %s chatnek nincs csendes ideje" % chat, None
         try:
-            inside, local = _window_holds(cfg, at_epoch)
+            inside, local = _window_holds(cfg, at_epoch, root)
         except Exception as e:
             return fallback("%s: a(z) %s chat bejegyzese hibas (%s: %s)" % (path, chat, type(e).__name__, e))
-        return inside, "a(z) %s chat csendes ideje %s, helyi ido most %s" % (chat, _window_text(cfg), local), None
+        return inside, "a(z) %s chat csendes ideje %s, helyi ido most %s" % (chat, _window_text(cfg, root), local), None
     for other, cfg in cfg_all.items():
         try:
-            inside, local = _window_holds(cfg, at_epoch)
+            inside, local = _window_holds(cfg, at_epoch, root)
         except Exception as e:
             return fallback("%s: a(z) %s chat bejegyzese hibas (%s: %s)" % (path, other, type(e).__name__, e))
         if inside:
             return True, "a hivas nem nevez chatet, es a(z) %s chat csendes idejeben vagyunk (%s, helyi ido most %s)" % (
-                other, _window_text(cfg), local), None
+                other, _window_text(cfg, root), local), None
     return False, "a hivas nem nevez chatet, es egyik beallitott chat sincs csendes idoben", None
