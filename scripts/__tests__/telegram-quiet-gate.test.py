@@ -250,6 +250,24 @@ ny_seen = os.path.join(pinned_root("quiet-gate-ny-", "America/New_York"), "store
 check(decision(no_tz, PROTECTED, NIGHT_NY, ny_seen)[0] is True and decision(no_tz, PROTECTED, DAY_NY, ny_seen)[0] is False,
       "an entry without tz reads the install's zone: held 23:30 New York, sent 17:30 New York (= 23:30 Budapest)")
 check("America/New_York" in decision(no_tz, PROTECTED, NIGHT_NY, ny_seen)[1], "the reason names the install's zone for an entry without tz")
+# the install zone's own sources: config-overrides.json over .env, a quoted .env value, a zone that is not real
+pin = temp("quiet-gate-pin-")
+os.makedirs(os.path.join(pin, "store"))
+with open(os.path.join(pin, ".env"), "w", encoding="utf-8") as f:
+    f.write("SCHEDULER_TZ=Europe/Budapest\n")
+with open(os.path.join(pin, "store", "config-overrides.json"), "w", encoding="utf-8") as f:
+    json.dump({"SCHEDULER_TZ": "America/New_York"}, f)
+check(q.install_zone(pin) == "America/New_York", "the install zone: SCHEDULER_TZ in config-overrides.json wins over the .env one")
+pin_seen = os.path.join(pin, "store", "quiet-hours.seen")
+check(decision(no_tz, PROTECTED, NIGHT_NY, pin_seen)[0] is True and decision(no_tz, PROTECTED, NIGHT_BP, pin_seen)[0] is False,
+      "an entry without tz on that install: held 23:30 New York, sent 23:30 Budapest (the .env zone loses)")
+with open(os.path.join(pin, "store", "config-overrides.json"), "w", encoding="utf-8") as f:
+    json.dump({"SCHEDULER_TZ": "Nowhere/Nothing"}, f)
+check(q.install_zone(pin) == (q._host_zone() or "UTC"), "an override that is no real zone: the host zone, the .env one is not read (the rule of config.ts)")
+quoted = temp("quiet-gate-quoted-")
+with open(os.path.join(quoted, ".env"), "w", encoding="utf-8") as f:
+    f.write("SCHEDULER_TZ=Europe/Berlin\nSCHEDULER_TZ=\"America/New_York\"\n")
+check(q.install_zone(quoted) == "America/New_York", "the .env: the last SCHEDULER_TZ line wins, one pair of quotes dropped")
 utc_seen = marker("UTC")
 check(decision(ok_dir, PROTECTED, NIGHT_BP, utc_seen)[:1] == (True,) and decision(ok_dir, PROTECTED, MORNING_BP, utc_seen)[:1] == (False,),
       "(1) a readable config is unchanged on a UTC install: its own Europe/Budapest window decides")
