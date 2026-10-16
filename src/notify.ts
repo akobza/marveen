@@ -124,7 +124,7 @@ export async function notifyChannel(text: string, meta?: AlertMeta): Promise<voi
     const alertChat = normalizeChatId(ALERT_CHAT_ID)
     // sendToChat reports now, this caller does not care: drop the result so the
     // callback keeps its Promise<void> shape (slack-notify wiring contract).
-    if (alertChat) return sendToChat(alertChat, text, meta, 'alert-chat').then(() => {})
+    if (alertChat) return sendToChat(alertChat, text, { meta, recipient: 'alert-chat' }).then(() => {})
     return telegramOwner(text, meta)
   })
 }
@@ -193,17 +193,20 @@ async function telegramOwner(text: string, meta?: AlertMeta): Promise<void> {
     if (CHANNEL_TOKEN) signalOwnerChatMissing(text, owner.reason ?? 'ismeretlen ok')
     return
   }
-  await sendToChat(owner.chatId, text, meta, 'owner')
+  await sendToChat(owner.chatId, text, { meta, recipient: 'owner' })
 }
 
 // PR1655 review, ask 2: this used to return void and swallow every provider
 // exception, so a caller could not tell a delivered notification from a dead
 // one. It reports now; every existing caller ignores the value, so nothing
 // else changes shape.
-async function sendToChat(chatId: string, text: string, meta?: AlertMeta, recipient: AlertRecipient = 'owner'): Promise<ChannelSendResult> {
+// `alert` is set by the alert paths only (notifyChannel, notifyOwner): they get
+// the delivery line. sendOwnerMessage leaves it out, since its caller logs the
+// result itself and an approval message is no alert to count.
+async function sendToChat(chatId: string, text: string, alert?: { meta?: AlertMeta; recipient: AlertRecipient }): Promise<ChannelSendResult> {
   if (!CHANNEL_TOKEN) {
     logger.warn('Channel ertesites kihagyva: nincs token')
-    logAlertDelivery(meta, recipient, 'skipped')
+    if (alert) logAlertDelivery(alert.meta, alert.recipient, 'skipped')
     return { sent: false, reason: 'no-token' }
   }
 
@@ -239,7 +242,7 @@ async function sendToChat(chatId: string, text: string, meta?: AlertMeta, recipi
   }
   const failedChunks = chunks.length - delivered
   const outcome: AlertOutcome = failedChunks === 0 ? 'sent' : delivered > 0 ? 'partial' : 'failed'
-  logAlertDelivery(meta, recipient, outcome, chunks.length, failedChunks)
+  if (alert) logAlertDelivery(alert.meta, alert.recipient, outcome, chunks.length, failedChunks)
   if (delivered === 0) {
     logger.warn({ err: lastError, provider: CHANNEL_PROVIDER }, 'channel send failed on every chunk')
     return { sent: false, reason: 'send-failed' }
