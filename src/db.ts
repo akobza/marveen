@@ -5818,7 +5818,7 @@ export function getRecentStoreFileEvents(limit = 200): StoreFileAuditRow[] {
 
 // --- Unified Audit Log Query ---
 
-export type AuditSource = 'config' | 'idea' | 'store' | 'diary'
+export type AuditSource = 'config' | 'idea' | 'store' | 'diary' | 'owner_rule'
 
 export interface AuditLogEntry {
   id: number
@@ -5845,6 +5845,9 @@ export interface AuditLogEntry {
   category?: string
   keywords?: string
   entry_type?: 'log' | 'memory'
+  // owner_rule (owner_rule_events): event_type and actor above, plus
+  rule_id?: number
+  auth_kind?: string | null
 }
 
 export function queryAuditLog(opts: {
@@ -5856,7 +5859,7 @@ export function queryAuditLog(opts: {
   limit: number
 }): AuditLogEntry[] {
   const { sources, from, to, q, agent, limit } = opts
-  const all: AuditSource[] = ['config', 'idea', 'store', 'diary']
+  const all: AuditSource[] = ['config', 'idea', 'store', 'diary', 'owner_rule']
   const active = sources.length > 0 ? sources : all
 
   const parts: AuditLogEntry[] = []
@@ -5881,6 +5884,18 @@ export function queryAuditLog(opts: {
     sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
     const rows = db.prepare(sql).all(...params) as Array<{ id: number; idea_id: string; from_status: string | null; to_status: string; actor: string; note: string | null; created_at: number }>
     for (const r of rows) parts.push({ ...r, source: 'idea' })
+  }
+
+  if (active.includes('owner_rule')) {
+    let sql = 'SELECT id, rule_id, event_type, actor, auth_kind, created_at FROM owner_rule_events WHERE 1=1'
+    const params: unknown[] = []
+    if (from) { sql += ' AND created_at >= ?'; params.push(from) }
+    if (to)   { sql += ' AND created_at <= ?'; params.push(to) }
+    if (agent) { sql += ' AND actor = ?'; params.push(agent) }
+    if (q)    { sql += ' AND (event_type LIKE ? OR actor LIKE ?)'; const p = `%${q}%`; params.push(p, p) }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
+    const rows = db.prepare(sql).all(...params) as Array<{ id: number; rule_id: number; event_type: string; actor: string; auth_kind: string | null; created_at: number }>
+    for (const r of rows) parts.push({ ...r, source: 'owner_rule' })
   }
 
   if (active.includes('store')) {
