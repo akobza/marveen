@@ -315,6 +315,18 @@ export function listScheduledTasks(): ScheduledTask[] {
   return tasks.sort((a, b) => b.createdAt - a.createdAt)
 }
 
+/**
+ * ffc45c28 (b2): the names of every field writeScheduledTask persists, in ONE place. The schedule write log names an
+ * update's fields from this list (src/web/routes/schedules.ts), so a field the writer keeps must be listed here or the
+ * log hides it as "(other)": that hid the telegramChatId and the command an update had set (measured live 2026-10-14).
+ * src/__tests__/schedule-write-log-fields.test.ts reads the writer and fails when it persists a field missing here.
+ */
+export const SCHEDULED_TASK_WRITE_FIELDS = [
+  'description', 'prompt', 'schedule', 'agent', 'enabled', 'type', 'skipIfBusy', 'forceSend', 'targetSession',
+  'command', 'timeoutMs', 'failThreshold', 'preCheck', 'catchUpMaxAgeMinutes', 'stuckAfterMinutes', 'injectMetrics',
+  'sendDigestDirect', 'telegramChatId', 'channelProvider', 'once',
+] as const
+
 export function writeScheduledTask(
   taskName: string,
   data: { description?: string; prompt?: string; schedule?: string; agent?: string; enabled?: boolean; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: number; stuckAfterMinutes?: number; injectMetrics?: boolean; sendDigestDirect?: boolean; telegramChatId?: string; channelProvider?: ChannelProviderType | null; once?: boolean },
