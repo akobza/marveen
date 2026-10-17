@@ -1054,6 +1054,9 @@ export function readExtraChannelPluginIds(projectRoot: string = PROJECT_ROOT): s
 // NOTE: inbound from `--channels` also goes through the allowlist at
 // /etc/claude-code/managed-settings.json (allowedChannelPlugins); a plugin not
 // listed there has its MCP notifications silently dropped. See channels.sh.
+/** The install .env channels.sh reads CLAUDE_CODE_OAUTH_TOKEN from (scripts/channels.sh:48). */
+const MAIN_ENV_FILE = join(PROJECT_ROOT, '.env')
+
 export function buildMainSessionRespawnCmd(opts: {
   claudePath: string
   pluginId: string
@@ -1102,6 +1105,8 @@ export function buildMainSessionRespawnCmd(opts: {
    * disabled, and the extra bot comes up deaf. null/absent = no flag.
    */
   extraSettingsPath?: string | null
+  /** The install .env the token line is read from (parity with channels.sh). Tests only; default MAIN_ENV_FILE. */
+  envFile?: string
 }): string {
   return [
     // FLEETVENV923: same venv-first PATH as startAgentProcess and channels.sh.
@@ -1152,7 +1157,17 @@ export function buildMainSessionRespawnCmd(opts: {
             ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && _plan_token="$(node '${RESOLVE_PLAN_TOKEN_PATH}' '${opts.config.tokenSecretId}' '${FLEET_OAUTH_TOKEN_PATH}' '${CHANNELS_FAILURES_LOG_PATH}')" && export CLAUDE_CODE_OAUTH_TOKEN="$_plan_token"`]
             : [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`])
       : opts.config.fleetToken
-        ? [`&& export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`]
+        ? [
+            // Parity with channels.sh:48-57: the .env CLAUDE_CODE_OAUTH_TOKEN line FIRST, the fleet
+            // setup-token file only as the fallback when .env carries none. 89c95eaf, measured
+            // 2026-09-23 14:5xZ: exporting the fleet file unconditionally put a respawned main agent
+            // on the FLEET token (72166520) instead of its own (.env, b184a7ef), and a token-rotation
+            // switch -- which rewrites the .env line -- never reached the new process. Hidden until
+            // the respawn stopped dying (the channels.sh restart used to re-read .env). Both values
+            // are read at launch via $(...), so no secret lands in argv/`ps`.
+            `&& export CLAUDE_CODE_OAUTH_TOKEN="$(grep -E '^CLAUDE_CODE_OAUTH_TOKEN=' ${shSingleQuote(opts.envFile ?? MAIN_ENV_FILE)} 2>/dev/null | head -1 | cut -d= -f2-)"`,
+            `&& { [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"; }`,
+          ]
         : []),
     '&&', opts.claudePath,
     ...(opts.continueSession ? ['--continue'] : []),
