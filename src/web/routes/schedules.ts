@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -15,7 +16,7 @@ import { listAgentNames } from '../agent-config.js'
 import { readFileOr, readJsonObjectForWrite } from '../agent-config.js'
 import {
   SCHEDULED_TASKS_DIR, MAX_SCHEDULED_TASK_PROMPT_LEN,
-  listScheduledTasks, writeScheduledTask, markDefaultTaskRemoved,
+  listScheduledTasks, writeScheduledTask, markDefaultTaskRemoved, type ScheduledTask,
 } from '../scheduled-tasks-io.js'
 import { runScheduledTaskNow } from '../schedule-runner.js'
 import type { RouteContext } from './types.js'
@@ -45,6 +46,13 @@ export function summarizeScheduledTasks(tasks: Array<{ enabled?: boolean }>): { 
   // explicitly false (absent field = enabled).
   const enabled = tasks.filter(t => t.enabled !== false).length
   return { total: tasks.length, enabled, disabled: tasks.length - enabled }
+}
+
+// The list form of a task: everything but the prompt, which is replaced by its length and
+// sha256 (card 12b0f698).
+export function withoutPrompt(task: ScheduledTask): Omit<ScheduledTask, 'prompt'> & { promptLength: number; promptSha256: string } {
+  const { prompt, ...rest } = task
+  return { ...rest, promptLength: prompt.length, promptSha256: createHash('sha256').update(prompt).digest('hex') }
 }
 
 export async function tryHandleSchedules(ctx: RouteContext): Promise<boolean> {
@@ -121,8 +129,18 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     return true
   }
 
+  // Card 12b0f698: the list leaves the prompts out unless asked (?include=prompt). About
+  // 2338 tasks travel on every read, and most readers want a name, a cron or a flag; the
+  // prompt's length and sha256 stay, so a changed prompt is still visible. The dashboard's
+  // schedule editor asks for the prompts (web/app.js loadSchedules).
   if (path === '/api/schedules' && method === 'GET') {
-    json(res, listScheduledTasks())
+    const include = ctx.url.searchParams.get('include')
+    if (include !== null && include !== 'prompt') {
+      json(res, { error: 'unknown include', include, accepted: ['prompt'] }, 400)
+      return true
+    }
+    const tasks = listScheduledTasks()
+    json(res, include === 'prompt' ? tasks : tasks.map(withoutPrompt))
     return true
   }
 
