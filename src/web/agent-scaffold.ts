@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readd
 import { readRemovedDefaultTasks } from './scheduled-tasks-io.js'
 import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, AGENT_API_ORIGIN, STORE_DIR } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, AGENT_API_ORIGIN, STORE_DIR, LIVE_GIT_TREE_PATH, LIVE_GIT_TREE_OWNER } from '../config.js'
+import { liveGitTreePathError, liveGitTreeOwnerError } from '../live-git-tree.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
@@ -3580,6 +3581,119 @@ export function ensureFleetAuthSection(name: string): void {
   const updated = hasBlock
     ? existing.replace(FLEET_AUTH_BLOCK_RE, block)
     : existing.trimEnd() + '\n\n' + block + '\n'
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
+// LIVETREEGIT1010: the rule for a production git work tree that one unix user
+// owns. Measured on one install: twice in ten days a git command run as root on
+// that tree -- a plain `git status` the second time -- left .git/index owned by
+// root with mode 0600, after which every git command of the owning user failed,
+// and the deploy chain with it. The rule lived only in a skill, which loads on
+// a trigger, not at session start.
+// Generic in shape, install-specific in its two values: the text lives here
+// with placeholders, the values come from the install (LIVE_GIT_TREE_PATH and
+// LIVE_GIT_TREE_OWNER, config.ts). Distribution-safe: with either value unset,
+// or not of a usable shape (live-git-tree.ts), NO block is generated, and a
+// block left from an earlier configuration is REMOVED -- unlike the
+// append-only sections above, because a stale path must not keep instructing
+// every agent.
+// No root exception: `git diff` and `git diff --stat` rewrite the index even
+// with --no-optional-locks (git 2.53.0), so no git on the tree runs as root,
+// `git status` and `git diff` included.
+// LIVETREEGIT1013: one text for two kinds of shell. The same tree is reached
+// from a shell that runs as root and from a restricted shell that runs as an
+// ordinary user and refuses the runuser / sudo -u / su prefix. The root shell
+// runs git as the owner (runuser); any other shell runs it directly, as
+// itself. The agent tells the two apart by the shell's measured identity
+// (`id -un`; no measurement, no git there), so the template carries no list
+// of agent names: a second, hand-kept list would drift from the one the shell
+// enforces.
+const LIVE_TREE_GIT_BEGIN = '<!-- BEGIN GENERATED: live-tree-git (auto-generated, do not edit by hand) -->'
+const LIVE_TREE_GIT_END = '<!-- END GENERATED: live-tree-git -->'
+const LIVE_TREE_GIT_BLOCK_RE = new RegExp(
+  `${LIVE_TREE_GIT_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${LIVE_TREE_GIT_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+export interface LiveTreeGitConfig {
+  path: string
+  owner: string
+}
+
+/** The install's configured tree and owner (boot-time values, see config.ts). */
+export function liveTreeGitConfig(): LiveTreeGitConfig {
+  return { path: LIVE_GIT_TREE_PATH, owner: LIVE_GIT_TREE_OWNER }
+}
+
+export function buildLiveTreeGitBody(cfg: LiveTreeGitConfig): string {
+  return [
+    '## Élő git-fa: rootként semmilyen git (MEGSZEGHETETLEN)',
+    '',
+    'Az élő git-fán rootként semmilyen git nem fut, a sima `git status` és a `git diff` sem,',
+    'és a `--no-optional-locks` alak sem kivétel: a `git diff` és a `git diff --stat` azzal is',
+    'újraírja az indexet. Ok: a rootként futtatott git a fa `.git/index`-ét root-tulajdonúvá',
+    'írja, és utána a tulajdonos minden git-parancsa (a kiadásé is) hibával elhal.',
+    '',
+    'Az alakot a héj MÉRT identitása dönti el, nem emlékezet és nem névlista: abban a',
+    'héjban, ahol a git futna, előbb `id -un`. Ha az identitás nem mérhető, a fán nem fut git.',
+    '',
+    '- `root` (rootként futó héj): a git csak a fa tulajdonosaként fut, ebben az alakban:',
+    `  \`runuser -u ${cfg.owner} -- git -C ${cfg.path} ...\``,
+    '- bármely más felhasználó (például egy korlátozott héj): közvetlenül, ebben az alakban:',
+    `  \`git -C ${cfg.path} ...\``,
+    '  Ott a `runuser`, a `sudo -u` és a `su` előtag elutasított.',
+  ].join('\n')
+}
+
+// Both values set and of a usable shape, or null. Neither set is the default
+// (silent). Only one of the two set, or a value of an unusable shape, is a
+// misconfiguration the operator must see: logged, never written into the
+// prompt.
+function usableLiveTreeGitConfig(cfg: LiveTreeGitConfig): LiveTreeGitConfig | null {
+  const path = cfg.path.trim()
+  const owner = cfg.owner.trim()
+  if (!path && !owner) return null
+  const err = !path || !owner
+    ? 'only one of LIVE_GIT_TREE_PATH and LIVE_GIT_TREE_OWNER is set'
+    : liveGitTreePathError(path) ?? liveGitTreeOwnerError(owner)
+  if (err) {
+    logger.warn({ err }, 'LIVE_GIT_TREE_PATH / LIVE_GIT_TREE_OWNER not usable: the live-tree-git block is not generated')
+    return null
+  }
+  return { path, owner }
+}
+
+export function ensureLiveTreeGitSection(name: string, cfg: LiveTreeGitConfig = liveTreeGitConfig()): void {
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  const match = LIVE_TREE_GIT_BLOCK_RE.exec(existing)
+  const usable = usableLiveTreeGitConfig(cfg)
+  let updated: string
+  if (!usable) {
+    if (!match) return
+    // Unset (or unusable) now, a block from before: take it out together with
+    // the blank lines that joined it, as if it had never been appended.
+    const before = existing.slice(0, match.index).replace(/\n+$/, '')
+    const after = existing.slice(match.index + match[0].length).replace(/^\n+/, '')
+    updated = after ? `${before}\n\n${after}` : `${before}\n`
+  } else {
+    const block = `${LIVE_TREE_GIT_BEGIN}\n${buildLiveTreeGitBody(usable)}\n${LIVE_TREE_GIT_END}`
+    // A function replacement: the path must never be read as a `$&`-style pattern.
+    updated = match
+      ? existing.replace(LIVE_TREE_GIT_BLOCK_RE, () => block)
+      : existing.trimEnd() + '\n\n' + block + '\n'
+  }
 
   if (updated === existing) return
   atomicWriteFileSync(claudeMdPath, updated)

@@ -615,6 +615,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     ensureAgentIdHeaderSection(MAIN_AGENT_ID)
     ensureMemorySearchLabelSection(MAIN_AGENT_ID)
     ensureFleetAuthSection(MAIN_AGENT_ID)
+    ensureLiveTreeGitSection(MAIN_AGENT_ID)
     ensureEvidenceSection(MAIN_AGENT_ID)
     ensureMcpListChannelSection(MAIN_AGENT_ID)
     ensureMessageCloseSection(MAIN_AGENT_ID)
