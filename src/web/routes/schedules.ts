@@ -121,13 +121,45 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
     return true
   }
 
+  // Card 12b0f698: the list leaves the prompts out unless asked (?include=prompt). About
+  // 2338 tasks travel on every read, and most readers want a name, a cron or a flag; the
+  // prompt's length and sha256 stay, so a changed prompt is still visible. The dashboard's
+  // schedule editor asks for the prompts (web/app.js loadSchedules).
   if (path === '/api/schedules' && method === 'GET') {
-    json(res, listScheduledTasks())
+    const include = ctx.url.searchParams.get('include')
+    if (include !== null && include !== 'prompt') {
+      json(res, { error: 'unknown include', include, accepted: ['prompt'] }, 400)
+      return true
+    }
+    const tasks = listScheduledTasks()
+    json(res, include === 'prompt' ? tasks : tasks.map(withoutPrompt))
     return true
   }
 
   if (path === '/api/schedules/summary' && method === 'GET') {
     json(res, summarizeScheduledTasks(listScheduledTasks()))
+    return true
+  }
+
+  // The write log for the alugynok-utemezes-audit: newest first; since = unix seconds; a malformed value is
+  // refused (400), never read as "everything".
+  if (path === '/api/schedules/write-log' && method === 'GET') {
+    const sinceRaw = ctx.url.searchParams.get('since')
+    const limitRaw = ctx.url.searchParams.get('limit')
+    let since: number | undefined
+    if (sinceRaw !== null) {
+      if (!/^\d+$/.test(sinceRaw)) { json(res, { error: 'since must be unix seconds' }, 400); return true }
+      since = Number(sinceRaw)
+    }
+    let limit = WRITE_LOG_DEFAULT_LIMIT
+    if (limitRaw !== null) {
+      if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1) { json(res, { error: 'limit must be a positive integer' }, 400); return true }
+      limit = Math.min(Number(limitRaw), WRITE_LOG_MAX_LIMIT)
+    }
+    json(res, {
+      note: 'claimed_agent is the X-Agent-Id the caller sent (self-asserted, one shared token: not authenticated)',
+      rows: getScheduleWriteLog({ since, limit }),
+    })
     return true
   }
 
