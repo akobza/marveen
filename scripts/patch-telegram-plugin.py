@@ -22,7 +22,8 @@ when the variable is unset). Never both: an install with its own config dir
 must not rewrite the user-level cache other Claude Code sessions load
 (maintainer review on #1529, 2026-09-25).
 
-- idempotent: a file carrying the marker is left alone;
+- idempotent: a file carrying the marker is left alone (a patch that superseded
+  an earlier marker also removes that marker's line, see the reply patch);
 - all-or-nothing per patch: if ANY anchor of a patch is missing (a plugin
   update changed the code), that patch is left out and one loud line says so
   -- /status and /help then fall back to the plugin's own answers, or a
@@ -34,6 +35,22 @@ must not rewrite the user-level cache other Claude Code sessions load
   its marker, so taking it back is deleting the lines that carry
   "MARVEEN-PATCH(c67f5f34-kbd)" (the file is then byte-identical to the one
   patched without it; tested);
+- the permission-approver patch (fc8629d7) works the same way, and it is the
+  one patch that fails CLOSED: when its anchors are not all there, a one-line
+  fallback (perm-off) takes the plugin's permission capability away, so a
+  permission request reaches nobody's chat instead of every allowlisted one;
+- the reply patch (426fa59f) is one marked line in the inbound meta: the
+  replied-to message's id and, when its author is the bot itself or an
+  allowlisted sender, its first 200 characters, never in the content. Its
+  marker says v3: the earlier marker (the v2 line, which gave the text of ANY
+  replied-to author, and the first v3 build) is superseded, and a line
+  carrying it is removed before the v3 line goes in, so a file the v2 patched
+  becomes v3 on the next run instead of saying "already" (D10); if an anchor is missing the file is left as it was (all or nothing);
+- the receipt patch (3e4a4772) is one marked line before the channel
+  notification: per inbound message handed to the session, one JSON line of
+  metadata only (chat_id, message_id, ts, at, delivered) into
+  <STATE_DIR>/inbound-receipts.jsonl, never the text; delivered says whether
+  the notification's promise resolved;
 - with --state FILE, the outcome per file (and per patch) is written there as
   JSON, so /status can say in one line when a patch is missing
   (src/web/system-status.ts) instead of the command silently falling back.
@@ -52,6 +69,11 @@ MARKER = "// MARVEEN-PATCH(elsokor922-d4): /status and /help belong to the comma
 FWD_MARKER = "// MARVEEN-PATCH(elsokor922-fwd): forwarded flag for the command hook"
 EVID_MARKER = "// MARVEEN-PATCH(cmd920-evid): inbound evidence for owner write commands"
 KBD_MARKER = "// MARVEEN-PATCH(c67f5f34-kbd): one-tap answer buttons"
+PERM_MARKER = "// MARVEEN-PATCH(fc8629d7-perm): permission requests only for the approver list"
+PERM_OFF_MARKER = "// MARVEEN-PATCH(fc8629d7-perm-off): permission relay off, the approver patch did not apply"
+REPLY_MARKER = "// MARVEEN-PATCH(426fa59f-reply-v3): the message this one replies to, in the meta only"
+# The earlier reply marker (the v2 line, and the first v3 build carried it too): superseded, its line is removed.
+REPLY_MARKER_V2 = "// MARVEEN-PATCH(426fa59f-reply): the message this one replies to, in the meta only"
 
 # Each anchor is the handler's full block, up to its closing `})` at column 0.
 ANCHORS = [
@@ -85,6 +107,63 @@ EVID_INSERT = (
     "text, at: Date.now() }}) + '\\n', {{ flag: 'a', mode: 0o600 }}) }} catch {{}} " + EVID_MARKER + "\n"
 )
 
+# 3e4a4772: whether a message that arrives while the main agent restarts surfaces in the new
+# session cannot be told from the session side: the ledger sees only what reached the session, and the evidence log
+# above carries the text and is written BEFORE the hand-over, so it cannot say whether the hand-over worked. One JSON
+# line per inbound message handed to Claude Code, into <STATE_DIR>/inbound-receipts.jsonl, METADATA ONLY (never the
+# text): chat_id, message_id, ts (the message's Telegram date, as in the meta), at (when it was handed over) and
+# delivered (true when the channel notification's promise resolved, false when it rejected). Bounded like the
+# evidence log (past 256 KiB the file becomes .1), mode 0600. Whole lines only, so the call's own lines stay as they
+# are: the inserted line wraps the very next mcp.notification call once (it puts the original back before calling
+# it) and writes the record when the promise settles; no await stands between the line and the call. A failure inside
+# the line leaves the call to run unwrapped: the log never stands in the way of the delivery. The gate's drops, the
+# pairing reply and the permission-answer intercept hand nothing to the session as chat and are not recorded.
+RX_MARKER = "// MARVEEN-PATCH(3e4a4772-rx): inbound receipt, metadata only, whether the hand-over worked"
+RX_ANCHOR = ("channel notification", EVID_ANCHOR[1])
+RX_INSERT = (
+    "{indent}try {{ const rxAt = new Date().toISOString(), rxOrig = mcp.notification; "
+    "mcp.notification = (...rxArgs: Parameters<typeof rxOrig>) => {{ mcp.notification = rxOrig; "
+    "const rxP = rxOrig.apply(mcp, rxArgs); const rxNote = (delivered: boolean) => {{ try {{ "
+    "const rxFile = join(STATE_DIR, 'inbound-receipts.jsonl'); "
+    "try {{ if (statSync(rxFile).size > 262144) renameSync(rxFile, rxFile + '.1') }} catch {{}}; "
+    "writeFileSync(rxFile, JSON.stringify({{ chat_id, message_id: msgId != null ? String(msgId) : null, "
+    "ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(), at: rxAt, delivered }}) + '\\n', "
+    "{{ flag: 'a', mode: 0o600 }}) }} catch {{}} }}; rxP.then(() => rxNote(true), () => rxNote(false)); return rxP }} }} "
+    "catch {{}} " + RX_MARKER + "\n"
+)
+
+# An owner answers with Telegram's reply ("igen", "nem jo") and the inbound meta
+# does not say to WHICH message (426fa59f): the session had to guess from the
+# order. One meta line more, after image_path: the id of the replied-to message
+# (reply_to_message_id, the ledger already stores it,
+# scripts/hooks/ledger-capture.py) and its first 200 characters (reply_to_text:
+# its text or caption, on one line). In that text '"' becomes "'", '<' and '>'
+# become '(' and ')', so the value cannot close the attribute or open a tag in
+# the channel tag, and '=' becomes the fullwidth equals sign (U+FF1D): a text
+# ending in 'attachment_file_id=' would otherwise turn the value's closing quote
+# into the opening quote of a later attribute for a regex reader of the tag.
+# Meta only, like image_path: a "[reply to: ...]" line in the content would be
+# forgeable by any allowlisted sender typing it. No reply, no key.
+# The text comes only when the replied-to message's author is the bot itself
+# (ctx.me) or a sender on the allowlist (access.allowFrom, the list the gate
+# admits by): in a group, a reply to a member who is not allowlisted would
+# otherwise bring that member's words into the session. Any other author (a
+# group member, an anonymous admin, a channel post) gives the id only. The
+# line reads the handler's `const access = result.access`, so that line is
+# a second anchor (inserting nothing): without it the patch is left out loudly.
+REPLY_ACCESS = ("inbound handler access", re.compile(r"^ *const access = result\.access\n", re.MULTILINE),
+                "insert-after", "")
+REPLY_ANCHOR = ("inbound meta image_path", re.compile(
+    r"^( *)\.\.\.\(imagePath \? \{ image_path: imagePath \} : \{\}\),\n", re.MULTILINE))
+REPLY_INSERT = (
+    "{indent}...((r, ok) => (r ? {{ reply_to_message_id: String(r.message_id), "
+    "...(ok ? ((t) => (t ? {{ reply_to_text: t }} : {{}}))(Array.from(String(r.text ?? r.caption ?? '')"
+    ".replace(/\\s+/g, ' ').trim().replace(/[\"<>=]/g, (c) => ({{ '\"': \"'\", '<': '(', '>': ')', '=': '\\uff1d' }})[c]))"
+    ".slice(0, 200).join('')) : {{}}) }} : {{}}))(ctx.message?.reply_to_message, "
+    "((a, me) => a !== '' && (a === me || access.allowFrom.includes(a)))"
+    "(String(ctx.message?.reply_to_message?.from?.id ?? ''), String(ctx.me?.id ?? ''))), " + REPLY_MARKER + "\n"
+)
+
 # The staff are asked one question at a time, with lettered options (A/B/C),
 # and today they type the letter back (c67f5f34, owner request). The reply
 # tool can send no button: its schema has no such field and the send passes
@@ -116,20 +195,62 @@ KBD_SEND = ("reply send options", re.compile(
     "kbdButtons.map(label => [{{ text: label }}]), one_time_keyboard: true, resize_keyboard: true }} : "
     "{{ remove_keyboard: true as const }} }} : {{}}), " + KBD_MARKER + "\n")
 
+# The plugin relays the main agent's tool-permission request to EVERY chat in
+# access.allowFrom, with Allow / Deny buttons, and takes an answer -- a button or
+# a "yes <id>" text -- from any of them (fc8629d7: an owner who is not the
+# operator got "Permission: Bash" buttons). Allowlisted means "may talk to the
+# agent", not "may approve its tool calls". So the approvers are a list of their
+# own, TELEGRAM_PERMISSION_APPROVERS (comma-separated chat ids) in the channel's
+# .env next to TELEGRAM_BOT_TOKEN (the file the plugin loads itself) or in the
+# real environment, and all three paths check it: the relay sends only to them,
+# the button and the text answer count only from them. An empty or missing list
+# leaves the permission capability undeclared, so Claude Code relays nothing:
+# the request stays in the terminal (fail-closed). Five lines, one per anchor.
+PERM_LIST = ("mcp server construction", re.compile(r"^const mcp = new Server\(\n", re.MULTILINE), "insert-before",
+    "const PERMISSION_APPROVERS = (process.env.TELEGRAM_PERMISSION_APPROVERS ?? '').split(',')"
+    ".map(s => s.trim()).filter(Boolean) " + PERM_MARKER + "\n")
+PERM_CAP = ("permission capability", re.compile(r"^( *)'claude/channel/permission': \{\},\n", re.MULTILINE), "insert-after",
+    "{indent}...(PERMISSION_APPROVERS.length ? {{}} : {{ 'claude/channel/permission': undefined }}), " + PERM_MARKER + "\n")
+PERM_RELAY = ("permission relay loop", re.compile(r"^( *)for \(const chat_id of access\.allowFrom\) \{\n", re.MULTILINE),
+    "insert-after", "{indent}  if (!PERMISSION_APPROVERS.includes(chat_id)) continue " + PERM_MARKER + "\n")
+PERM_BUTTON = ("permission button answer", re.compile(r"^( *)const \[, behavior, request_id\] = m\n", re.MULTILINE),
+    "insert-after",
+    "{indent}if (!PERMISSION_APPROVERS.includes(senderId)) {{ await ctx.answerCallbackQuery({{ text: 'Not authorized.' }})"
+    ".catch(() => {{}}); return }} " + PERM_MARKER + "\n")
+# A "yes <id>" from someone who may not approve is not relayed as chat either
+# (the plugin never did that for this shape); it is dropped.
+PERM_TEXT = ("permission text answer", re.compile(r"^( *)if \(permMatch\) \{\n", re.MULTILINE), "insert-after",
+    "{indent}  if (!PERMISSION_APPROVERS.includes(String(from.id))) return " + PERM_MARKER + "\n")
+# The fallback, applied only when the approver patch could not be: the
+# capability is taken away for good, whatever the list says.
+PERM_OFF = ("permission capability", PERM_CAP[1], "insert-after",
+    "{indent}...({{ 'claude/channel/permission': undefined }}), " + PERM_OFF_MARKER + "\n")
+
 # Independent patches: each has its own marker and is all-or-nothing on its
 # own, so a plugin update that moves one anchor does not undo the other.
+# "only_if_failed" names a patch whose anchor-missing is this one's condition.
 PATCHES = [
     {"name": "d4", "marker": MARKER, "anchors": ANCHORS, "mode": "remove",
      "fallback": "/status and /help fall back to the plugin's own answers"},
     {"name": "fwd", "marker": FWD_MARKER, "anchors": [FWD_ANCHOR], "mode": "insert-after",
      "insert": "{indent}...(ctx.message?.forward_origin ? {{ forwarded: '1' }} : {{}}), " + FWD_MARKER + "\n",
      "fallback": "forwarded messages are not marked, a forwarded command runs like a typed one"},
+    {"name": "reply", "marker": REPLY_MARKER, "supersedes": [REPLY_MARKER_V2], "anchors": [REPLY_ACCESS, REPLY_ANCHOR],
+     "mode": "insert-after", "insert": REPLY_INSERT,
+     "fallback": "a reply does not say which message it answers: the session guesses from the order"},
     {"name": "evid", "marker": EVID_MARKER, "anchors": [EVID_ANCHOR], "mode": "insert-before",
      "insert": EVID_INSERT,
      "fallback": "no inbound evidence is recorded, owner write commands are refused"},
+    {"name": "rx", "marker": RX_MARKER, "anchors": [RX_ANCHOR], "mode": "insert-before", "insert": RX_INSERT,
+     "fallback": "no receipt log: whether an inbound message was handed to the session is not recorded"},
     # an anchor may carry its own mode and insert (name, regex, mode, insert): the three kbd lines differ
     {"name": "kbd", "marker": KBD_MARKER, "anchors": [KBD_SCHEMA, KBD_CHECK, KBD_SEND], "mode": "insert-after",
      "fallback": "the reply tool has no buttons: a question goes out without them and is answered by typing"},
+    {"name": "perm", "marker": PERM_MARKER, "anchors": [PERM_LIST, PERM_CAP, PERM_RELAY, PERM_BUTTON, PERM_TEXT],
+     "mode": "insert-after",
+     "fallback": "the perm-off line takes the permission relay away instead (next line), so approvals stay in the terminal"},
+    {"name": "perm-off", "marker": PERM_OFF_MARKER, "anchors": [PERM_OFF], "mode": "insert-after", "only_if_failed": "perm",
+     "fallback": "the plugin still relays permission requests to EVERY allowlisted chat, with Allow / Deny buttons"},
 ]
 
 # Topics (TELEGRAM_TOPICS_ENABLED, default off). A private chat with topic mode
@@ -195,10 +316,17 @@ def log(msg):
 
 
 def apply_patch(text, patch):
-    """Returns (new_text, status). status: 'patched' | 'already' | 'anchor-missing:<name>'."""
-    if patch["marker"] in text:
+    """Returns (new_text, status). status: 'patched' | 'already' | 'anchor-missing:<name>'.
+    A "supersedes" marker's whole line is removed first (also when the patch's own line is already there: an older
+    patcher run after a newer one puts the old line back); an anchor missing returns the text as it was."""
+    stale = [old for old in patch.get("supersedes", ()) if old in text]
+    if patch["marker"] in text and not stale:
         return text, "already"
     out = text
+    for old in stale:
+        out = re.sub(r"^[^\n]*" + re.escape(old) + r"[^\n]*(?:\n|\Z)", "", out, flags=re.MULTILINE)
+    if patch["marker"] in out:
+        return out, "patched"
     for anchor in patch["anchors"]:
         name, rx = anchor[0], anchor[1]
         mode = anchor[2] if len(anchor) > 2 else patch["mode"]
@@ -255,11 +383,19 @@ TOPICS_PATCH = {"name": "topics", "fallback": TOPICS_FALLBACK}
 
 
 def patch_text(text, topics=False):
-    """Returns (new_text, [(patch, status), ...]). The topics entry is there
-    when the switch is on, or when switching it off took the patch out."""
+    """Returns (new_text, [(patch, status), ...]). A patch with only_if_failed
+    runs only when that patch is anchor-missing in this run; otherwise its
+    status is 'not-needed'. The topics entry is there when the switch is on,
+    or when switching it off took the patch out."""
     results = []
+    statuses = {}
     for patch in PATCHES:
-        text, status = apply_patch(text, patch)
+        dep = patch.get("only_if_failed")
+        if dep and not statuses.get(dep, "").startswith("anchor-missing"):
+            status = "not-needed"
+        else:
+            text, status = apply_patch(text, patch)
+        statuses[patch["name"]] = status
         results.append((patch, status))
     if topics:
         text, status = apply_topics(text)
@@ -272,12 +408,12 @@ def patch_text(text, topics=False):
 
 
 def file_status(results):
-    """One word for the file: 'already' when every patch was there,
-    'patched' when this run wrote (or took out) one, else the first anchor-missing."""
+    """One word for the file: 'already' when every patch was there (or not
+    needed), 'patched' when this run wrote (or took out) one, else the first anchor-missing."""
     statuses = [st for _, st in results]
     if "patched" in statuses or "removed" in statuses:
         return "patched"
-    if all(st == "already" for st in statuses):
+    if all(st in ("already", "not-needed") for st in statuses):
         return "already"
     return next(st for st in statuses if st.startswith("anchor-missing"))
 

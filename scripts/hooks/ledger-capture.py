@@ -73,7 +73,10 @@ def _trace(reason, **fields):
 
 
 def _attr(attrs, name):
-    m = re.search(name + r'="([^"]*)"', attrs)
+    # The name must start an attribute: since 426fa59f the Telegram tag carries
+    # reply_to_message_id, and a bare 'message_id="' search would read that one
+    # when the tag has no message_id of its own.
+    m = re.search(r'(?:^|\s)' + name + r'="([^"]*)"', attrs)
     return m.group(1) if m else None
 
 
@@ -99,7 +102,8 @@ def main():
         att_kind = _attr(attrs, "attachment_kind")
         att_file_id = _attr(attrs, "attachment_file_id")
         # Which earlier message (if any) the sender quoted. Only the id is
-        # captured, never reply_to_excerpt (df3b48a7): the excerpt is a copy of
+        # captured, never the quoted text (df3b48a7; the Telegram plugin patch
+        # sends it as reply_to_text since 426fa59f): the excerpt is a copy of
         # that other row's own text, and storing it twice would drift the
         # moment either side is edited/redacted.
         reply_to_message_id = _attr(attrs, "reply_to_message_id")
