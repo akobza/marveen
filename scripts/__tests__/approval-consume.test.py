@@ -7,7 +7,11 @@ POST /api/approvals/<id>/consume:
     that sends only on 0 sends exactly once -- the double send the card is about;
   - the request carries the bearer token and exactly the anchor, the consumer and the Message-Id;
   - 404 -> 4; 500, an unreadable answer, an unreachable dashboard, a missing token -> 2 (never 0);
-  - a malformed anchor or Message-Id is refused locally (2) and the dashboard is never called.
+  - a malformed anchor or Message-Id is refused locally (2) and the dashboard is never called;
+  - a 200 is a yes only with ok:true, and a 302 is never followed, so its target never gets the
+    token (db121902 D2, with a control that plain urllib does follow it);
+  - an SMS approval (--category external_message, db121902) is consumed without an anchor, with
+    an optional --ref, once; an anchor, a Message-Id or a malformed ref is refused locally.
 
 Run: python3 <thisfile>   Exit 0 = all pass.
 """
@@ -19,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,9 +44,15 @@ def check(name, cond):
 class Stub(BaseHTTPRequestHandler):
     consumed = {}      # approval id -> consumer of the first successful consume
     seen = []          # (path, auth header, parsed body) per request
+    landed = []        # (path, auth header) of every GET: only a FOLLOWED redirect lands here
 
     def log_message(self, *a):  # keep the test output clean
         pass
+
+    def do_GET(self):
+        # urllib turns the POST into a GET when it follows a 302; this target answers like a yes.
+        Stub.landed.append((self.path, self.headers.get("Authorization")))
+        return self._send(200, {"ok": True, "approval": {"id": "landing"}})
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -58,14 +69,27 @@ class Stub(BaseHTTPRequestHandler):
             return self._send(200, None, raw=b"<html>not json</html>")
         if aid == "missing":
             return self._send(404, {"ok": False, "reason": "not_found"})
-        if body is None or body.get("content_hash") != HASH:
+        if aid == "okless":
+            return self._send(200, {"approval": {"id": aid}})
+        if aid == "okstring":
+            return self._send(200, {"ok": "true", "approval": {"id": aid}})
+        if aid == "okfalse":
+            return self._send(200, {"ok": False})
+        if aid == "redirect":
+            self.send_response(302)
+            self.send_header("Location", "/landing")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        sms = body is not None and body.get("category") == "external_message"  # db121902: no anchor
+        if not sms and (body is None or body.get("content_hash") != HASH):
             return self._send(409, {"ok": False, "reason": "hash_mismatch"})
         if aid in Stub.consumed:
             return self._send(409, {"ok": False, "reason": "already_consumed",
                                     "approval": {"id": aid, "consumed_by": Stub.consumed[aid]}})
         Stub.consumed[aid] = body.get("consumer")
         return self._send(200, {"ok": True, "approval": {"id": aid, "consumed_at": 1, "consumed_by": body.get("consumer"),
-                                                         "consumed_ref": body.get("message_id")}})
+                                                         "consumed_ref": body.get("ref" if sms else "message_id")}})
 
     def _send(self, status, obj, raw=None):
         data = raw if raw is not None else json.dumps(obj).encode("utf-8")
@@ -135,6 +159,23 @@ check("an unreachable dashboard exits 2", rc == 2 and "unreachable" in (out.get(
 rc, out = run("--id", "appr-3", "--content-hash", HASH, "--consumer", "send-tool", token_file=os.path.join(tmp, "nope"))
 check("a missing token file exits 2", rc == 2)
 
+# --- db121902 D2: a 200 is a yes ONLY with ok:true, and a redirect is never followed -----------------
+for aid, what in (("okless", "a 200 without ok"), ("okstring", 'a 200 with ok:"true" (a string)'),
+                  ("okfalse", "a 200 with ok:false")):
+    rc, out = run("--id", aid, "--content-hash", HASH, "--consumer", "send-tool")
+    check("%s exits 2, not 0" % what, rc == 2 and out.get("consumed") is False)
+rc, out = run("--id", "redirect", "--content-hash", HASH, "--consumer", "send-tool")
+check("a 302 is not followed: exits 2 and names the status", rc == 2 and out.get("status") == 302)
+check("the redirect target got no request, so the bearer token did not travel", Stub.landed == [])
+# Control: plain urllib DOES follow this 302 and carries the token, so the two checks above can fail.
+ctl =urllib.request.Request(API + "/api/approvals/redirect/consume", data=b"{}", method="POST",
+                             headers={"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN})
+with urllib.request.urlopen(ctl, timeout=30) as resp:
+    resp.read()
+check("control: a default urllib client follows the 302 with the token",
+      Stub.landed == [("/landing", "Bearer " + TOKEN)])
+Stub.landed.clear()
+
 # --- refused locally, the dashboard is never called --------------------------------------------
 before = len(Stub.seen)
 rc, _ = run("--id", "appr-4", "--content-hash", "AB" * 32, "--consumer", "send-tool")
@@ -153,6 +194,34 @@ rc, body = mod.consume(API, TOKEN, "appr-5", HASH, "lib-caller")
 check("consume() returns (0, body) on the first call", rc == 0 and body.get("ok") is True)
 rc, body = mod.consume(API, TOKEN, "appr-5", HASH, "lib-caller")
 check("consume() returns (3, body) on the second call", rc == 3 and body.get("reason") == "already_consumed")
+
+# --- db121902: an SMS approval (external_message): no anchor, no Message-Id, an optional ref -------
+before = len(Stub.seen)
+rc, out = run("--category", "external_message", "--id", "sms-1", "--consumer", "seeme-send", "--ref", "fleet-adhoc-1")
+check("an SMS consume exits 0 without an anchor and echoes the ref", rc == 0 and out.get("consumed_ref") == "fleet-adhoc-1")
+check("the SMS body is exactly category + consumer + ref", len(Stub.seen) > before and
+      Stub.seen[before][2] == {"category": "external_message", "consumer": "seeme-send", "ref": "fleet-adhoc-1"})
+rc, out = run("--category", "external_message", "--id", "sms-1", "--consumer", "seeme-send", "--ref", "fleet-adhoc-2")
+check("a SECOND SMS consume of the same approval exits 3 (already_consumed)", rc == 3 and out.get("reason") == "already_consumed")
+rc, out = run("--category", "external_message", "--id", "sms-2", "--consumer", "seeme-send")
+check("the ref is optional", rc == 0 and len(Stub.seen) > 0 and
+      Stub.seen[-1][2] == {"category": "external_message", "consumer": "seeme-send"})
+rc, body = mod.consume(API, TOKEN, "sms-3", None, "lib-caller", category="external_message", ref="r-3")
+check("consume() takes category and ref", rc == 0 and (body.get("approval") or {}).get("consumed_ref") == "r-3")
+before = len(Stub.seen)
+SMS = ("--category", "external_message", "--id", "sms-4", "--consumer", "seeme-send")
+for args, what in (
+        (SMS + ("--content-hash", HASH), "an SMS consume with an anchor"),
+        (SMS + ("--message-id", "<m1@example.org>"), "an SMS consume with a Message-Id"),
+        (SMS + ("--ref", " padded"), "a ref with a surrounding blank"),
+        (SMS + ("--ref", "x" * 121), "a 121-character ref"),
+        (SMS + ("--ref", "a" + chr(10) + "b"), "a ref with a newline"),
+        (("--id", "appr-9", "--content-hash", HASH, "--consumer", "send-tool", "--ref", "r1"), "a letter consume with a ref"),
+        (("--id", "appr-9", "--consumer", "send-tool"), "a letter consume without its anchor"),
+        (("--category", "sms", "--id", "appr-9", "--consumer", "send-tool"), "an unknown category")):
+    rc, _ = run(*args)
+    check("%s is refused locally (2)" % what, rc == 2)
+check("none of the SMS-side local refusals reached the dashboard", len(Stub.seen) == before)
 
 # --- control: this suite can fail -----------------------------------------------------------------
 # Without it, a stub that answered 200 to everything would make every refusal check above vacuous.
