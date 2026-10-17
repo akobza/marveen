@@ -284,6 +284,33 @@ const IDLE_BACKGROUND_ONE_SHELL_HIDDEN = [
   '  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage',
 ].join('\n')
 
+// Claude Code 2.1.283+ (card a58a8ede): the footer of a session with background
+// work ends with the counters alone -- no ctrl+t, `↓ to manage` or `← for agents`
+// after them. Both lines below were captured live from fleet panes
+// (`tmux capture-pane -p`) on 2026-09-30 and are kept byte for byte. The 2- and
+// 3-shell forms (measured on 2026-09-26) differ only in the count and the plural,
+// so they are derived from the captured line instead of retyped.
+const BARE_ONE_SHELL_FOOTER = '  ⏵⏵ bypass permissions on · 1 shell'
+const BARE_SHELL_AND_MONITOR_FOOTER = '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor'
+
+// Card a38182bd: footer-looking lines that are NOT the live footer. A tool that printed a raw
+// footer (here the OLD form, which the a58a8ede v2 does not narrow) and a reply that quotes the
+// bare form on a line of its own (two spaces, the glyph: the very shape the v2 accepts) both
+// leave such a line on the visible screen; neither has the input box right above it.
+const RAW_OLD_FOOTER_SCROLLBACK = [
+  '● Bash(tmux capture-pane -p -t x | awk NF | tail -1)',
+  '  ⎿  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  '',
+  '● Kész, a lábléc mérve.',
+  '',
+].join('\n')
+const QUOTED_BARE_FOOTER_REPLY = ['● A lábléc most:', BARE_ONE_SHELL_FOOTER, ''].join('\n')
+const IDLE_BARE_ONE_SHELL = modeFooter(BARE_ONE_SHELL_FOOTER)
+const IDLE_BARE_TWO_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '2 shells'))
+const IDLE_BARE_THREE_SHELLS = modeFooter(BARE_ONE_SHELL_FOOTER.replace('1 shell', '3 shells'))
+const IDLE_BARE_SHELL_AND_MONITOR = modeFooter(BARE_SHELL_AND_MONITOR_FOOTER)
+const IDLE_BARE_MONITORS = modeFooter(BARE_SHELL_AND_MONITOR_FOOTER.replace('1 shell, 1 monitor', '2 monitors'))
+
 // Wedged thinking-block API error. An assistant turn ended with the
 // 400 about thinking blocks that "cannot be modified"; the pane shows
 // the tool-output chrome (`⎿  API Error: ...`), a past-tense thinking
@@ -519,6 +546,130 @@ describe('detectPaneState', () => {
     expect(detectPaneState(bare)).toBe('idle')
     const quotedAbove = ['  ⏵⏵ bypass permissions on · 1 shell', '', SEP, '❯ ', SEP, '  some status line'].join('\n')
     expect(detectPaneState(quotedAbove)).toBe('unknown')
+  })
+
+  it('does NOT classify a footer cut mid-word ("· 1 sh") as idle', () => {
+    // Defense in depth: the shells-variant requires either the
+    // "· N shells · ctrl+t" marker or the "· N shells · ↓ to manage"
+    // marker, not just the bare "· N shell(s)" prefix. Two reasons we
+    // pin this down with an explicit negative test:
+    //   1. A malformed or partially rendered footer (terminal
+    //      corruption, mid-render frame) must classify as 'unknown'
+    //      so we do not deliver a prompt into a pane that is not
+    //      really ready.
+    //   2. The "bypass permissions on · 1 shell" substring could
+    //      appear in scrollback as quoted log output or an echoed
+    //      message, and the regex must not be tricked into treating
+    //      that as a live footer.
+    // The fixture is deliberately minimal: no other idle markers
+    // (no "(shift+tab to cycle)", no "? for shortcuts") so the
+    // assertion isolates the truncated-shells path specifically.
+    // Since Claude Code 2.1.283 the bare "· 1 shell" footer this test
+    // used to reject IS the complete live footer (card a58a8ede, the
+    // bare counter tests below), so the truncation is now cut mid-word;
+    // reason 2 (a quote in scrollback) is covered by the end-of-line tests.
+    const truncated = [
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on · 1 sh',
+    ].join('\n')
+    expect(detectPaneState(truncated)).toBe('unknown')
+  })
+
+  // Claude Code 2.1.283+ (card a58a8ede): the bare counter tail is the whole
+  // footer of a session with background work. Before, every such pane read
+  // 'unknown', and the router did not deliver to it.
+  it.each([
+    ['· 1 shell (captured live)', IDLE_BARE_ONE_SHELL],
+    ['· 2 shells', IDLE_BARE_TWO_SHELLS],
+    ['· 3 shells', IDLE_BARE_THREE_SHELLS],
+    ['· 1 shell, 1 monitor (captured live)', IDLE_BARE_SHELL_AND_MONITOR],
+    ['· 2 monitors', IDLE_BARE_MONITORS],
+  ])('detects idle on the bare counter footer %s', (_label, pane) => {
+    expect(detectPaneState(pane)).toBe('idle')
+    expect(isReadyForPrompt(pane)).toBe(true)
+  })
+
+  it('reads the bare counter tail as idle only when it ends the line right after the mode', () => {
+    // A quote of the new footer inside prose: a closing quote and more words follow it.
+    const quotedProse = ['', SEP, '❯ ', SEP, '  A szerver lábléce "' + BARE_ONE_SHELL_FOOTER.trim() + '" volt, a router nem kézbesített.'].join('\n')
+    // More text after the counters on the same line.
+    const trailingText = modeFooter(BARE_ONE_SHELL_FOOTER + ' running')
+    // The counter is not directly after the mode segment.
+    const notAfterMode = modeFooter('  ⏵⏵ bypass permissions on · tasks · 1 shell')
+    // Counters with no mode segment at all.
+    const noMode = modeFooter('  · 3 shells')
+    for (const pane of [quotedProse, trailingText, notAfterMode, noMode]) {
+      expect(detectPaneState(pane)).toBe('unknown')
+    }
+  })
+
+  // Card b235cb20: the feedback-draft counter after the counters (the first line captured live from a fleet pane
+  // on 2026-10-01, byte for byte) and the counter left after the draft modal closes. The alone and the plural
+  // forms are not captured; they follow the shape.
+  it('reads the feedback-draft counter in the bare footer as idle', () => {
+    const live = modeFooter('  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · 1 feedback draft')
+    expect(detectPaneState(live)).toBe('idle')
+    expect(isReadyForPrompt(live)).toBe(true)
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 feedback draft'))).toBe('idle')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 2 shells · 2 feedback drafts'))).toBe('idle')
+  })
+
+  it('keeps the bare footer rules for the feedback-draft counter', () => {
+    for (const tail of [
+      '  ⏵⏵ bypass permissions on · 1 shell · 1 feedback draft pending', // more text after it on the line
+      '  ⏵⏵ bypass permissions on · 1 feedback d…', // cut with ONE separator: neither the bare form nor a #1743 clipped footer
+      '  ⏵⏵ bypass permissions on · tasks · 1 feedback draft', // not directly after the mode
+    ]) {
+      expect(detectPaneState(modeFooter(tail))).toBe('unknown')
+    }
+    // Merged with upstream #1743 (stash-pop 2026-10-10): a cut with TWO separators before the `…` is the
+    // tmux-clipped live footer, which reads idle on the last line under the input box like any clipped footer.
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 shell · 1 feedback d…'))).toBe('idle')
+  })
+
+  // a58a8ede: a RAW bare footer line in the visible pane -- the output of
+  // `tmux capture-pane ... | tail -1` in a Bash tool result -- must not be taken for the footer.
+  it('keeps a parked input typing under a raw bare footer line in tool output', () => {
+    const raw = ['● Bash(tmux capture-pane -p -t x | awk NF | tail -1)', '  ⎿  ' + BARE_ONE_SHELL_FOOTER.trim(), ''].join('\n')
+    const typing = ['', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP, BARE_ONE_SHELL_FOOTER].join('\n')
+    expect(detectPaneState(raw + '\n' + typing)).toBe('typing')
+    expect(isReadyForPrompt(raw + '\n' + typing)).toBe(false)
+  })
+
+  // Card a38182bd: the live footer is the LAST footer line, with the input box right above it.
+  it('keeps a parked input typing under a raw old-form footer line in tool output', () => {
+    const typing = ['', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    expect(detectPaneState(RAW_OLD_FOOTER_SCROLLBACK + '\n' + typing)).toBe('typing')
+    expect(isReadyForPrompt(RAW_OLD_FOOTER_SCROLLBACK + '\n' + typing)).toBe(false)
+  })
+
+  it('reads the real empty prompt idle under a footer line higher up (the last footer wins)', () => {
+    expect(detectPaneState(RAW_OLD_FOOTER_SCROLLBACK + '\n' + IDLE_BYPASS)).toBe('idle')
+    expect(detectPaneState(QUOTED_BARE_FOOTER_REPLY + '\n' + IDLE_BARE_ONE_SHELL)).toBe('idle')
+  })
+
+  it('reads idle with rows between the box and the footer, and with rows after the footer', () => {
+    // The live shapes measured on 2026-09-30: a statusline (and once a three-line warning block)
+    // between the box and the footer, and agent rows under the footer. The row texts are neutral.
+    const withStatusline = ['', SEP, '❯ ', SEP, '  (statusline)', '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    const withWarningBlock = ['', SEP, '❯ ', SEP, '  (warning row 1)', '  (warning row 2)', '  (warning row 3)', '  (statusline)',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    const withAgentRows = ['', SEP, '❯ ', SEP, '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents', '  (agent row 1)', '  (agent row 2)'].join('\n')
+    for (const pane of [withStatusline, withWarningBlock, withAgentRows]) {
+      expect(detectPaneState(pane)).toBe('idle')
+    }
+  })
+
+  it('pins the box distance: a footer 8 rows below the box is live, 9 rows is not', () => {
+    const footerRowsBelowBox = (n: number) => ['', SEP, '❯ ', SEP, ...Array(n - 1).fill('  (row between)'),
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    expect(detectPaneState(footerRowsBelowBox(1))).toBe('idle')
+    expect(detectPaneState(footerRowsBelowBox(8))).toBe('idle')
+    // Farther than that the footer is not taken for live: 'unknown', the safe direction.
+    expect(detectPaneState(footerRowsBelowBox(9))).toBe('unknown')
   })
 
   it('detects busy when "esc to interrupt" footer marker is present', () => {
@@ -768,8 +919,10 @@ describe('detectPaneState', () => {
 
   it('handles pane without any separators gracefully', () => {
     const snap = '  ⏵⏵ bypass permissions on (shift+tab to cycle)'
-    // Footer alone (no box) -> treat as idle. No parked input to detect.
-    expect(detectPaneState(snap)).toBe('idle')
+    // Footer alone (no box): since card a38182bd the live footer is the one right below the
+    // input box, so a lone footer line is not proof of an idle prompt -> 'unknown' (the router
+    // waits). It used to read 'idle'; no live pane has this shape (74 measured, 2026-09-30).
+    expect(detectPaneState(snap)).toBe('unknown')
   })
 
   it('handles footer with missing bottom separator', () => {
@@ -1983,6 +2136,69 @@ describe('detectsPermissionDialog', () => {
     expect(detectsPermissionDialog('')).toBe(false)
     expect(detectsPermissionDialog('   \n  ')).toBe(false)
   })
+
+  // a58a8ede: a RAW bare footer line in tool output (its first line under
+  // the result glyph, the next one indented five spaces) must not hide a dialog or a menu.
+  it('still sees the dialog and the menu under a raw bare footer line in tool output', () => {
+    const raw = ['● Bash(tmux capture-pane -p -t x | awk NF | tail -1)', '  ⎿  ' + BARE_ONE_SHELL_FOOTER.trim(), '     ' + BARE_SHELL_AND_MONITOR_FOOTER.trim(), ''].join('\n')
+    for (const dialog of [PERMISSION_DIALOG, BASH_PERMISSION_DIALOG]) {
+      expect(detectsPermissionDialog(raw + '\n' + dialog)).toBe(true)
+      expect(detectPaneState(raw + '\n' + dialog)).toBe('unknown')
+    }
+    expect(detectsBlockingMenu(raw + '\n' + GENUINE_MENU)).toBe(true)
+  })
+
+  // Card a38182bd: the same for the old-form raw footer and for a reply that quotes the bare
+  // footer on its own line; neither is the live footer, so neither may veto a detector.
+  it('still sees the dialog, the menu and the consent dialog under a footer line that is not live', () => {
+    const consent = ['  Fable 5 now uses usage credits', '    1. Continue with Fable 5', '  ❯ 2. Switch to Sonnet 5 and continue',
+      '  Enter to confirm · Esc to cancel'].join('\n')
+    for (const above of [RAW_OLD_FOOTER_SCROLLBACK, QUOTED_BARE_FOOTER_REPLY]) {
+      for (const dialog of [PERMISSION_DIALOG, BASH_PERMISSION_DIALOG]) {
+        expect(detectsPermissionDialog(above + '\n' + dialog)).toBe(true)
+        expect(detectPaneState(above + '\n' + dialog)).toBe('unknown')
+        expect(isReadyForPrompt(above + '\n' + dialog)).toBe(false)
+      }
+      expect(detectsBlockingMenu(above + '\n' + GENUINE_MENU)).toBe(true)
+      expect(detectsModelConsentDialog(above + '\n' + consent)).toBe(true)
+    }
+  })
+
+  // The other side of the rule (footerVetoesDialog): in a frame without the input box a footer
+  // as the LAST line still vetoes, so a quoted menu hint above it is not a menu. Two of the
+  // vetoed detectors answer with keystrokes; the quote-proofing must not depend on the box.
+  it('keeps the quote-proofing in a frame without the input box: a footer as the last line vetoes', () => {
+    const quoted = ['  Az üzenet: "↑/↓ to navigate · Enter to confirm · Esc to cancel"', '❯', '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n')
+    expect(detectsBlockingMenu(quoted)).toBe(false)
+  })
+})
+
+// a38182bd (low): four call sites of the live footer were not pinned one by one -- the dialog
+// veto's live-footer branch, liveInputBox, the retry gate (and overfullParkedInputTail, in
+// sched-overfull-parked-input.test.ts). Each test below fails when its site goes back to the whole pane or to the
+// FIRST footer-looking line.
+describe('the live footer at each call site (a38182bd)', () => {
+  // The live prompt with rows after its footer: the footer is live but not the last content line.
+  const promptWithRowsAfterFooter = (above: string[]) => [...above, SEP, '❯ ', SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents', '  (agent row 1)', '  (agent row 2)'].join('\n')
+
+  it('the dialog and menu vetoes take the live footer even when rows follow it', () => {
+    expect(detectsBlockingMenu(promptWithRowsAfterFooter(['  ↑/↓ to navigate · Enter to confirm · Esc to cancel']))).toBe(false)
+    expect(detectsPermissionDialog(promptWithRowsAfterFooter(['  Do you want to proceed?', '  ❯ 1. Yes', '    2. No']))).toBe(false)
+  })
+
+  it('reads a parked input typing in a footerless frame with a raw footer line higher up', () => {
+    const footerless = [RAW_OLD_FOOTER_SCROLLBACK, '', SEP, '❯ Valami, amit a felhasználó elkezdett gépelni', SEP].join('\n')
+    expect(detectPaneState(footerless)).toBe('typing')
+  })
+
+  it('the retry gate and the box it reads take the live footer, not the first footer-looking line', () => {
+    // A raw footer higher up does not hide the live box with the parked payload ...
+    expect(shouldRetrySubmit(RAW_OLD_FOOTER_SCROLLBACK + '\n' + STUCK_VERBATIM, PAYLOAD_HINT)).toBe(true)
+    // ... and does not stand in for a live footer in a frame that has none (the gate's conservative skip).
+    const footerlessPayload = [RAW_OLD_FOOTER_SCROLLBACK, '', SEP, `❯ ${PAYLOAD_HINT} cycle-043`, SEP].join('\n')
+    expect(shouldRetrySubmit(footerlessPayload, PAYLOAD_HINT)).toBe(false)
+  })
 })
 
 describe('detectsPastePlaceholder', () => {
@@ -2537,6 +2753,11 @@ describe('detectsFirstRunGate / mcpTrustAcceptKeys: the MCP approval dialog', ()
 
   it('classifies it as a first-run gate instead of returning null', () => {
     expect(detectsFirstRunGate(MCP_PANE)).toBe('mcp-trust')
+  })
+
+  it('still classifies it under a footer line that is not the live footer (card a38182bd)', () => {
+    expect(detectsFirstRunGate(RAW_OLD_FOOTER_SCROLLBACK + '\n' + MCP_PANE)).toBe('mcp-trust')
+    expect(detectsFirstRunGate(QUOTED_BARE_FOOTER_REPLY + '\n' + MCP_PANE)).toBe('mcp-trust')
   })
 
   it('selects THIS server with cursor-relative keys, never by number', () => {
