@@ -239,6 +239,11 @@ def _record_block(path, message_id, count):
 
 
 def main():
+    # cc457550 (J4): a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) has no Telegram turn of its own and no reply tool; blocking its stop over the main agent's open question
+    # would push it to answer the owner from a session that is not the conversation.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:

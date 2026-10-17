@@ -44,6 +44,11 @@ def _web_port():
 
 
 def main():
+    # cc457550 (J4): a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) runs in the main agent's cwd, so it would pass the main-agent check below and CLAIM the main agent's
+    # pending inter-agent messages, which its live session would then never see.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:

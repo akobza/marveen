@@ -206,6 +206,11 @@ def _fit_output(transcript, open_q, open_q_name, byte_budget, reply_tool=None):
 
 
 def main():
+    # cc457550 (J4): a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) is no continuation of the owner's conversation: replaying it, open question first, would make the round
+    # act on a conversation it does not own.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     payload = None
     try:
         payload = json.load(sys.stdin)

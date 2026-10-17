@@ -18,10 +18,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import clearstate_lib  # noqa: E402
-import ledger_lib  # noqa: E402
 
 
 def main():
+    # cc457550 (J4): a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) has no pre-/clear state of its own; replaying the long-running session's would hand it someone else's.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -43,8 +46,7 @@ def main():
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": clearstate_lib.build_injection(
-                record, ledger_lib.owner_name()),
+            "additionalContext": clearstate_lib.build_injection(record),
         }
     }, ensure_ascii=False))
     sys.stdout.flush()

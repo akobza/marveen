@@ -83,6 +83,10 @@ def _req(method, path, token):
 
 
 def main():
+    # cc457550 (J4): a scheduled round in a FRESH session (MARVEEN_SESSION_ROLE=scheduled, set only by the schedule
+    # runner) starts from its own prompt; restoring the long-running session's task state into it would mix the two.
+    if os.environ.get("MARVEEN_SESSION_ROLE") == "scheduled":
+        sys.exit(0)
     try:
         payload = json.load(sys.stdin)
     except Exception:
