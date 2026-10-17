@@ -51,11 +51,17 @@ type AgentSkill = {
 }
 
 // List the skill directories under `dir`, tagging each with where it came from
-// and whether it can be deleted from this agent's view.
+// and whether it can be deleted from this agent's view. A folder whose name
+// starts with a dot is no skill: the skill folders are git repos, and their
+// .git must not be listed (or offered for delete). The global Skills route
+// (skills.ts) skips the same names.
 function scanSkillDir(dir: string, source: 'agent' | 'global', deletable: boolean): AgentSkill[] {
   if (!existsSync(dir)) return []
   return readdirSync(dir)
-    .filter((f) => { try { return statSync(join(dir, f)).isDirectory() } catch { return false } })
+    .filter((f) => {
+      if (f.startsWith('.')) return false
+      try { return statSync(join(dir, f)).isDirectory() } catch { return false }
+    })
     .map((f) => ({
       name: f,
       hasSkillMd: existsSync(join(dir, f, 'SKILL.md')),
@@ -157,9 +163,15 @@ export async function tryHandleAgentsSkills(ctx: RouteContext): Promise<boolean>
   const skillActionMatch = path.match(/^\/api\/agents\/([^/]+)\/skills\/([^/]+)$/)
   if (skillActionMatch && method === 'DELETE') {
     const name = sanitizeAgentName(decodeURIComponent(skillActionMatch[1]))
-    const skillName = sanitizeSkillName(decodeURIComponent(skillActionMatch[2]))
-    if (!name || !skillName) { json(res, { error: 'Invalid agent or skill name' }, 400); return true }
+    // The DELETE targets exactly the folder name the list shows (scanSkillDir lists a skill by its folder name). Run
+    // through sanitizeSkillName the name was rewritten: ".git" became "git" and targeted that skill, and a listed
+    // "v1.2-notes" or "My_Skill" could not be deleted at all. A name the list never shows (empty, a leading dot, a
+    // path separator) is not found; safeJoin below still keeps the target inside the skills folder.
+    const rawSkillName = decodeURIComponent(skillActionMatch[2])
+    if (!name || !rawSkillName) { json(res, { error: 'Invalid agent or skill name' }, 400); return true }
     if (!agentExistsFor(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (rawSkillName.startsWith('.') || /[/\\\0]/.test(rawSkillName)) { json(res, { error: 'Skill not found' }, 404); return true }
+    const skillName = rawSkillName
     let skillDir: string
     try {
       skillDir = safeJoin(skillsRootFor(name), skillName)
