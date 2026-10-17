@@ -356,6 +356,11 @@ export LEDGER_PRINCIPALS_PATH="$PRINC3"
 emit_inbound 20000000001 11 "ELSO_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
 emit_inbound 20000000002 12 "MASODIK_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
 emit_reply 20000000002 "VALASZ_A_MASODIKNAK" | run_hook ledger-outbound.py "$DB_P3"
+# The reply lies well before the next two inbounds. Since REPLYGUARDTS914 (#1323) a reply sent up to
+# MAX_PROCESSING_LAG (15 min) before an inbound's ledger write counts as answering it (the fixture ts
+# is fixed in the past, so the arrival clamps to that lower bound); a reply in the same second would
+# close the unknown sender's question and this block would test the window, not the sender label.
+age_rows "$DB_P3" 1800
 emit_inbound 20000000003 13 "HARMADIK_TULAJ_KERESE" | run_hook ledger-capture.py "$DB_P3"
 emit_inbound 29999999999 14 "IDEGEN_UZENET" | run_hook ledger-capture.py "$DB_P3"
 age_rows "$DB_P3" 3600
