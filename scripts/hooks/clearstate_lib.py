@@ -25,7 +25,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ledger_lib  # noqa: E402  (main_agent_id / owner_name resolution)
+import ledger_lib  # noqa: E402  (main_agent_id resolution)
 
 # How many of the owner's most recent prompts to carry across the clear. The
 # continuity failure mode is not a too-short window -- it is having nothing at
@@ -229,7 +229,7 @@ def is_replayable(record, now=None, ttl=TTL_SECONDS):
     return bool(record.get("prompts") or record.get("lastReply"))
 
 
-def build_injection(record, owner="A felhasználó"):
+def build_injection(record):
     """The SessionStart additionalContext text for a cleared thread.
 
     Deliberately NON-directive: a /clear can be a deliberate fresh start as
@@ -248,8 +248,13 @@ def build_injection(record, owner="A felhasználó"):
     ]
     prompts = record.get("prompts") or []
     if prompts:
+        # Card 7c813be5: this heading used to name the ONE configured owner, so
+        # every carried prompt -- another owner's channel message included --
+        # read as that owner's. Each prompt keeps its own header (a channel
+        # message starts with its sender and chat id), so the heading names no one.
         lines.append(
-            "%s UTOLSO KERESEI (idorendben):\n" % owner
+            "AZ ELOZO SZAL UTOLSO BEJOVO UZENETEI (idorendben; a feladot mindegyiknel "
+            "a sajat fejlece mondja, nem ez a cim):\n"
             + "\n".join("  - %s" % p for p in prompts)
         )
     last_reply = record.get("lastReply") or ""
