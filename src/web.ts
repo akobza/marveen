@@ -112,7 +112,7 @@ import { tryHandleFleet } from './web/routes/fleet.js'
 import { tryHandleVaultSshKeys } from './web/routes/vault-ssh-keys.js'
 import { tryHandleCustomProviders } from './web/routes/custom-providers.js'
 import type { RouteContext } from './web/routes/types.js'
-import { isMalformedBodyError } from './web/malformed-body.js'
+import { isMalformedBodyError, isMalformedUrlError } from './web/malformed-body.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
 
@@ -299,6 +299,13 @@ export function startWebServer(port = 3420): http.Server {
         json(res, {
           error: 'Hibas JSON torzs, a keres nem hajtodott vegre. Sortores es idezojel a szoveges mezokben escape-elve kell legyen.',
         }, 400)
+        return
+      }
+      // 218d76b8: a malformed percent-encoding in the URL is the caller's mistake too: a route's
+      // decodeURIComponent threw on it. 400 and a warning, for every route, instead of a 500 and an error.
+      if (isMalformedUrlError(err, req.url || path)) {
+        logger.warn({ method, path, reason: (err as Error).message }, 'Hibas szazalek-kodolas az URL-ben -- a keres NEM hajtodott vegre')
+        json(res, { error: 'Hibas szazalek-kodolas az URL-ben, a keres nem hajtodott vegre.' }, 400)
         return
       }
       logger.error({ err, method, path }, 'Web szerver hiba')
