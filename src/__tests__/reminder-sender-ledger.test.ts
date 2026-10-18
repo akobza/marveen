@@ -55,6 +55,8 @@ function deps(over: Partial<ReminderSenderDeps> = {}) {
     alertMain: () => {},
     copyToAgent: () => {},
     digestMain: () => {},
+    // the sender's send-time allowlist gate is a required dependency since the reminders fix it is layered on (fb79dc1f)
+    recipientCheck: () => ({ ok: true }),
     ...over,
   }
   return { d, sent }
