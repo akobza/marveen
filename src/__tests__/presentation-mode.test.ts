@@ -21,6 +21,7 @@ import {
   expirePresentationModeIfDue,
   listPresentationModeEvents,
   getPendingMessages,
+  claimPresentationPriority,
 } from '../db.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { logger } from '../logger.js'
@@ -151,6 +152,42 @@ describe('4edaf0a1 drain: OFF is today, ON puts the owner gateways first (D1 B)'
     expect(orderOf(out.text, ['d1-p1', 'd1-s1', 'd1-s2'])).toEqual(['d1-p1', 'd1-s1', 'd1-s2'])
     expect(markedBlocks(out.text)).toBe(1)
     expect(getPendingMessages(MAIN).map((m) => m.content)).toEqual(['d1-o1'])
+  })
+
+  it('df476cab (A): an authenticated STOP row and an urgent row of any sender go in the same drain, after the priority block, STOP first', () => {
+    modeOn()
+    createAgentMessage('peer-a', MAIN, 'a1-o1')
+    createAgentMessage('peer-b', MAIN, 'a1-u1', null, null, { urgent: true })
+    createAgentMessage(SYSTEM_DIRECTIVE_SENDER, MAIN, 'a1-s1')
+    createAgentMessage('peer-c', MAIN, 'a1-stop', null, null, { stopAuthorized: true })
+    createAgentMessage('owner-gw-a', MAIN, 'a1-p1')
+    const out = drainMainInbox(MAIN)
+    expect(orderOf(out.text, ['a1-p1', 'a1-stop', 'a1-u1', 'a1-s1'])).toEqual(['a1-p1', 'a1-stop', 'a1-u1', 'a1-s1'])
+    expect(markedBlocks(out.text)).toBe(1)
+    expect(getPendingMessages(MAIN).map((m) => m.content)).toEqual(['a1-o1'])
+  })
+
+  it('df476cab (A) negative: a rank-less row and a peer high of a non-gateway sender still wait while the mode is ON', () => {
+    modeOn()
+    createAgentMessage('peer-a', MAIN, 'a2-o1')
+    createAgentMessage('peer-b', MAIN, 'a2-h1', null, null, { priority: 1 })
+    createAgentMessage('owner-gw-b', MAIN, 'a2-p1')
+    const out = drainMainInbox(MAIN)
+    expect(out.count).toBe(1)
+    expect(orderOf(out.text, ['a2-p1', 'a2-o1', 'a2-h1'])).toEqual(['a2-p1'])
+    expect(getPendingMessages(MAIN).map((m) => m.content).sort()).toEqual(['a2-h1', 'a2-o1'])
+  })
+
+  it('df476cab (A): the exception block is cut in the delivery order, so a newer STOP is not left behind older system rows', () => {
+    modeOn()
+    createAgentMessage('owner-gw-a', MAIN, 'a3-p1')
+    for (let i = 1; i <= 4; i++) createAgentMessage(SYSTEM_DIRECTIVE_SENDER, MAIN, `a3-s${i}`)
+    createAgentMessage('peer-c', MAIN, 'a3-stop', null, null, { stopAuthorized: true })
+    const pri = claimPresentationPriority(MAIN, 3, SYSTEM_DIRECTIVE_SENDER)
+    expect(pri).not.toBeNull()
+    expect(pri!.claimed.map((m) => m.content)).toEqual(['a3-p1', 'a3-stop', 'a3-s1', 'a3-s2'])
+    expect(pri!.claimed.find((m) => m.content === 'a3-stop')?.stop_authorized).toBe(1)
+    expect(getPendingMessages(MAIN).map((m) => m.content)).toEqual(['a3-s3', 'a3-s4'])
   })
 
   it('T9 fail-closed: a malformed on-row is OFF (one warn per spell), and the drain stays FIFO', () => {

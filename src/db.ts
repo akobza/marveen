@@ -4174,7 +4174,8 @@ export function claimPendingForAgent(toAgent: string, limit: number): AgentMessa
 // The owner's switch: while ON, the main agent's drain hands over the pending rows of
 // the owner gateways (PRESENTATION_PRIORITY_SENDERS in .env) FIRST and EXCLUSIVELY
 // (decision D1 (B)); every other sender
-// waits for the next drain. It changes ORDER only, never trust: the framing stays
+// waits for the next drain -- except an authenticated STOP row and an urgent row (card
+// df476cab, decision (A)), which go with the system rows. It changes ORDER only, never trust: the framing stays
 // whatever classifyAgentMessage gives. The senders are matched EXACTLY on the stored
 // from_agent (no sanitize/normalize): for a privilege the strict direction is the safe
 // one. claimPendingForAgent above is NOT touched: with the mode OFF the drain runs it
@@ -4263,7 +4264,12 @@ export function expirePresentationModeIfDue(nowMs: number = Date.now()): Present
 /** The ON claim (D1 (B), exclusive). When a priority sender has a pending row: claim
  *  ONLY those (oldest first, up to `limit`) plus -- the D1 exception -- the pending
  *  rows of `systemSender` (directives and alerts never wait behind a presentation),
- *  up to `limit` of their own, FIFO, AFTER the priority block. Every other row stays
+ *  up to `limit` of their own, AFTER the priority block. Card df476cab, decision (A): an
+ *  authenticated STOP row (stop_authorized = 1) and an urgent row (urgent = 1) of ANY
+ *  sender join that block: the stop and the alarm are the safety
+ *  path, the mode keeps out the noise, not the brakes. The block is taken and returned in
+ *  the delivery order (STOP, urgent, then the system rows, FIFO inside each), so the limit
+ *  never cuts a STOP for a system notice. Every other row (a peer high too) stays
  *  pending. Returns null when no priority row is pending: the caller then runs the
  *  ordinary claimPendingForAgent. One transaction, the same atomic
  *  UPDATE ... WHERE status='pending' RETURNING shape (no double claim) and the same
@@ -4293,18 +4299,19 @@ export function claimPresentationPriority(
        RETURNING ${cols}`,
     ).all(now, toAgent, ...prioritySenders, limit) as AgentMessage[]
     if (priority.length === 0) return null
+    const rank = deliveryRankSql()
     const system = db.prepare(
       `UPDATE agent_messages SET status = 'delivered', delivered_at = ?
          WHERE id IN (
            SELECT id FROM agent_messages
-           WHERE to_agent = ? AND status = 'pending' AND from_agent = ?
-           ORDER BY created_at ASC, id ASC
+           WHERE to_agent = ? AND status = 'pending' AND (from_agent = ? OR stop_authorized = 1 OR urgent = 1)
+           ORDER BY ${rank.sql} DESC, created_at ASC, id ASC
            LIMIT ?
          )
        RETURNING ${cols}`,
-    ).all(now, toAgent, systemSender, limit) as AgentMessage[]
+    ).all(now, toAgent, systemSender, ...rank.params, limit) as AgentMessage[]
     const stillPending = (db.prepare("SELECT count(*) AS n FROM agent_messages WHERE to_agent = ? AND status = 'pending'").get(toAgent) as { n: number }).n
-    return { claimed: [...priority.sort(fifo), ...system.sort(fifo)], priority: priority.length, system: system.length, stillPending }
+    return { claimed: [...priority.sort(fifo), ...system.sort(compareDeliveryOrder)], priority: priority.length, system: system.length, stillPending }
   })()
 }
 
