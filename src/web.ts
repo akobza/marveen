@@ -19,11 +19,13 @@ import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames, listAllAgentNames } from './web/agent-config.js'
 import { ensureRotationHeartbeatTask } from './web/claude-rotation-heartbeat.js'
-import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureLiveTreeGitSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureChildClaudeGuard, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection, ensureLiveTreeGitSection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { mainAgentConfigDirIfSeparate } from './web/agent-process.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
+import { createAgentMessage } from './db.js'
+import { setOwnerChatMissingSink } from './notify.js'
 import { startUpdateChecker } from './web/update-checker.js'
 import { startScheduleRunner, startHeartbeatGapGuard } from './web/schedule-runner.js'
 import { startChannelPluginMonitor } from './web/channel-monitor.js'
@@ -50,6 +52,8 @@ import { tryHandleMessages } from './web/routes/messages.js'
 import { tryHandleFederation } from './web/routes/federation.js'
 import { startFederationPoller } from './web/federation/poller.js'
 import { registerBuiltinCommands } from './web/builtin-commands.js'
+import { registerTopicCommands } from './web/topic-commands.js'
+import { telegramTopicsEnabled } from './web/telegram-topics.js'
 import { tryHandleCommands } from './web/routes/commands.js'
 import { initCustomCommands } from './web/custom-commands.js'
 import { sweepModelHold, armHoldExpiryFromFile } from './web/main-model.js'
@@ -67,6 +71,7 @@ import { tryHandleHomoglyphs } from './web/routes/homoglyphs.js'
 import { tryHandleMemories } from './web/routes/memories.js'
 import { tryHandleMigrate } from './web/routes/migrate.js'
 import { tryHandleKanban } from './web/routes/kanban.js'
+import { tryHandleKanbanProjects } from './web/routes/kanban-projects.js'
 import { tryHandleHeartbeat } from './web/routes/heartbeat.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
@@ -222,6 +227,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
       if (await tryHandleKanban(routeCtx)) return
+      if (await tryHandleKanbanProjects(routeCtx)) return
       if (await tryHandleHeartbeat(routeCtx)) return
       if (await tryHandleSchedules(routeCtx)) return
       if (await tryHandleConnectorsHu(routeCtx)) return
@@ -411,6 +417,9 @@ export function startWebServer(port = 3420): http.Server {
 
   const routerInterval = webOnly ? undefined : startMessageRouter()
   if (!webOnly) logger.info('Agent message router started (5s poll)')
+  // Card 3ed09d25: an alert whose owner chat cannot be resolved reaches the main
+  // agent's inbox (once an hour) instead of vanishing; the log line fires every time.
+  if (!webOnly) setOwnerChatMissingSink((text) => { createAgentMessage('system', MAIN_AGENT_ID, text) })
 
   const scheduleInterval = webOnly ? undefined : startScheduleRunner()
   if (!webOnly) logger.info('Schedule runner started (60s poll)')
@@ -599,6 +608,8 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
   // UserPromptSubmit hook (scripts/hooks/marveen-commands.py) dispatches into
   // through POST /api/commands/dispatch, answered without a main-session turn.
   registerBuiltinCommands()
+  // /topic exists only with the topics switch on (topic-commands.ts header).
+  if (telegramTopicsEnabled()) registerTopicCommands()
   if (!webOnly) {
     initCustomCommands()
     // The /model hold revert: a one-shot timer at the exact expiry (re-armed
@@ -632,6 +643,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       const bashParserPatched: string[] = []
       const govPatched: string[] = []
       const copyGatePatched: string[] = []
+      const childGuardPatched: string[] = []
       const pruned: string[] = []
       // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
       // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
@@ -666,6 +678,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
         if (ensureBashEgressParser(agentName)) bashParserPatched.push(agentName)
         if (ensureGovernanceGateCommands(agentName)) govPatched.push(agentName)
         if (ensureTelegramCopyGate(agentName)) copyGatePatched.push(agentName)
+        if (ensureChildClaudeGuard(agentName)) childGuardPatched.push(agentName)
         ensureQuarantineReader(agentName)
       }
       // EGRESSRENDER824: a grant added to store/egress-allowlist.json must
@@ -693,6 +706,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       if (bashParserPatched.length) logger.info({ patched: bashParserPatched }, 'bash-egress-parser Bash hook backfilled into agent settings.json (EGRESSPARSER923)')
       if (govPatched.length) logger.info({ patched: govPatched }, 'governance gate hook commands upgraded to absolute node path in agent settings.json')
       if (copyGatePatched.length) logger.info({ patched: copyGatePatched }, 'outgoing-copy-gate wired onto the Telegram send tools in agent settings.json (GATECOPY828)')
+      if (childGuardPatched.length) logger.info({ patched: childGuardPatched }, 'child-claude channel guard wired onto Bash in agent settings.json (CHILDCLAUDEPOLLER1010)')
     } catch (err) {
       logger.warn({ err }, 'Agent hook backfill skipped')
     }
