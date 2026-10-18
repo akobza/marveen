@@ -2713,6 +2713,40 @@ describe('idle footer that ends in a background-shell count (VAGTECHIDLE1009)', 
     expect(detectPaneState(modeFooter('  the toggle was turned on · 1 shell later it broke'))).toBe('unknown')
   })
 
+  it('reads the comma shell-plus-monitor tail and a monitor-only tail as idle (card a58a8ede)', () => {
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 shell, 1 monitor'))).toBe('idle')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 2 monitors'))).toBe('idle')
+    expect(detectPaneState(modeFooter('  ⏵⏵ accept edits on · 1 monitor'))).toBe('idle')
+    expect(isReadyForPrompt(modeFooter('  ⏵⏵ bypass permissions on · 2 shells, 1 monitor'))).toBe(true)
+  })
+
+  it('does not count a monitor tail in the scrollback, cut mid-word, or with text after it', () => {
+    const above = ['2026-07-29 log: bypass permissions on · 1 shell, 1 monitor', '', SEP, '❯ ', SEP, '  some status line'].join('\n')
+    expect(detectPaneState(above)).toBe('unknown')
+    const aboveMonitor = ['2026-07-29 log: bypass permissions on · 2 monitors', '', SEP, '❯ ', SEP, '  some status line'].join('\n')
+    expect(detectPaneState(aboveMonitor)).toBe('unknown')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 shell, 1 mon'))).toBe('unknown')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 2 monitors later it broke'))).toBe('unknown')
+    expect(detectPaneState(modeFooter('  ⏵⏵ bypass permissions on · 1 shell, 1 monitor and more'))).toBe('unknown')
+  })
+
+  it('a monitor-tail line above a command-permission prompt does not hide the prompt', () => {
+    const pane = [
+      '  ⏵⏵ bypass permissions on · 1 shell, 1 monitor',
+      ' Bash command',
+      '   rm -rf ./build',
+      '   Remove the build directory',
+      '',
+      ' Do you want to proceed?',
+      ' ❯ 1. Yes',
+      '   2. No, and tell Claude what to do differently (esc)',
+      '',
+      ' Esc to cancel',
+    ].join('\n')
+    expect(isReadyForPrompt(pane)).toBe(false)
+    expect(detectsPermissionDialog(pane)).toBe(true)
+  })
+
   it('a shell-tail line above a command-permission prompt does not hide the prompt', () => {
     const pane = [
       SHELL_TAIL,
