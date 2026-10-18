@@ -21,7 +21,15 @@ import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { detectPaneState, paneShowsContextSaturation, paneShowsContextSaturationHardError } from '../pane-state.js'
 import { readContextTokensFromProjectDir, readActiveModelFromProjectDir, readTranscriptMtimeFromProjectDir } from './active-model.js'
 import { readContextGuardConfig } from './context-guard-store.js'
+import {
+  readPendingResumes,
+  writePendingResumes,
+  restorableResumeStates,
+  type PendingResume,
+  type PendingResumeMap,
+} from './context-guard-resume-store.js'
 import { localMidnightMs } from '../auto-restart.js'
+import { ownerQuestionHolds } from './open-question.js'
 import { recordRescueFailure, clearRescueFailures } from './rescue-failure-tracker.js'
 import { createAgentMessage } from '../db.js'
 import {
@@ -29,7 +37,7 @@ import {
   contextLimitForModel,
   calibrateLimit,
   handoffStaleMinutes,
-  applyDailyHandoffSweep,
+  applyDailyHandoffSkipSweep,
   DAILY_HANDOFF_REASON_PREFIX,
   IDLE_FLUSH_REASON_PREFIX,
   INITIAL_GUARD_STATE,
@@ -67,7 +75,68 @@ const SATURATION_OVERRIDE_TTL_MS = 3 * INTERVAL_MS
 // agent name -> guard state. In-memory: a dashboard restart re-arms every
 // agent at 'idle', which is safe -- the worst case is a repeated handoff
 // request, and cooldown prevents restart loops within a run.
+//
+// ONE exception: 'await-ready' is NOT safe to lose. It is the
+// only record that a fresh session is still owed its resume prompt, and
+// nothing else will ever send it -- the agent just sits at an empty prompt.
+// That obligation is mirrored to store/context-guard-pending-resume.json
+// (context-guard-resume-store.ts) and re-armed by restorePendingResumes() when
+// the runner starts.
 const guardStates = new Map<string, GuardState>()
+
+// Write-through mirror of the persisted resume obligations. Held in memory so
+// the per-sweep "drop if present" checks cost no I/O; the file is written only
+// when an entry is actually added or removed.
+let pendingResumes: PendingResumeMap = {}
+
+function persistPendingResumes(): void {
+  try { writePendingResumes(pendingResumes) }
+  catch (err) { logger.warn({ err }, 'context-guard: pending-resume persist failed') }
+}
+
+function recordPendingResume(name: string, entry: PendingResume): void {
+  pendingResumes = { ...pendingResumes, [name]: entry }
+  persistPendingResumes()
+}
+
+function dropPendingResume(name: string, why: string): void {
+  if (!(name in pendingResumes)) return
+  const { [name]: _dropped, ...rest } = pendingResumes
+  pendingResumes = rest
+  persistPendingResumes()
+  logger.info({ name, why }, 'context-guard: pending resume cleared')
+}
+
+/**
+ * Re-arm every resume obligation a previous dashboard process left behind.
+ * Live entries (younger than PENDING_RESUME_TTL_MS) put the agent back in
+ * 'await-ready', so the first sweep delivers the resume prompt exactly as the
+ * old process would have; expired ones are dropped with a WARN, because a
+ * resume that never arrived is a fact the operator should be able to find.
+ * Returns the re-armed agent names. Exported for the regression test.
+ */
+export function restorePendingResumes(nowMs: number): string[] {
+  pendingResumes = readPendingResumes()
+  const { live, expired } = restorableResumeStates(pendingResumes, nowMs)
+  for (const [name, st] of live) {
+    if (!guardStates.has(name)) guardStates.set(name, st)
+  }
+  if (expired.length > 0) {
+    for (const name of expired) {
+      logger.warn(
+        { name, restartedAtMs: pendingResumes[name]?.restartedAtMs, reason: pendingResumes[name]?.reason },
+        'context-guard: pending resume EXPIRED across a dashboard restart -- the fresh session never got its resume prompt',
+      )
+      const { [name]: _expired, ...rest } = pendingResumes
+      pendingResumes = rest
+    }
+    persistPendingResumes()
+  }
+  if (live.size > 0) {
+    logger.info({ agents: [...live.keys()] }, 'context-guard: re-armed pending resume(s) from a previous dashboard run')
+  }
+  return [...live.keys()]
+}
 
 // agent name -> when the daily-handoff tier last fired (ms). Seeded on first
 // sight WITHOUT firing, so a slot that already passed before the dashboard
@@ -77,6 +146,17 @@ const guardStates = new Map<string, GuardState>()
 // which is the safe direction (a missed daily handoff costs one day of
 // context; a spurious one ends a live conversation).
 const lastDailyHandoff = new Map<string, number>()
+// Agents whose last due daily slot was skipped for an open inbound question;
+// their next due slot fires regardless (see dailyHandoffSkipSweep). In-memory
+// like lastDailyHandoff: a dashboard restart forgets it, which can allow one
+// more skip in a row.
+const dailySkipped = new Set<string>()
+
+/** Does the owner's open question hold this agent back (the /clear gate's rule)? undefined = unreadable. */
+function dailyQuestionOpen(name: string): boolean | undefined {
+  try { return ownerQuestionHolds(name) }
+  catch { return undefined }
+}
 const remoteSkipLogged = new Set<string>()
 // Agents currently in the banner-vs-measurement mismatch state. The
 // condition holds on EVERY sweep while a mis-tagged agent keeps running, so
@@ -353,6 +433,7 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
   // decideGuard ever saw the agent, with no log line to say so.
   if (!cfg.enabled && !cfg.saturationRestart && !cfg.idleFlushEnabled && !cfg.dailyHandoffEnabled) {
     guardStates.delete(name)
+    dropPendingResume(name, 'guard disabled')
     return
   }
 
@@ -462,9 +543,10 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
     // (handoffStaleMinutes) needs the transcript mtime on every decision path
     // that can restart, and the probe is a single stat().
     idleMs: running && needPct ? measureIdleMs(name, nowMs) : null,
-    // Seed-on-first-ARMED-sight, and forget-while-disarmed on every sweep:
-    // dailyHandoffSweep decides both, applyDailyHandoffSweep applies the record.
-    dailyHandoffDue: applyDailyHandoffSweep(lastDailyHandoff, name, cfg, running && state.phase === 'idle', localMidnightMs(nowMs), nowMs),
+    // Seed-on-first-ARMED-sight, forget-while-disarmed on every sweep, and the
+    // open-question skip: dailyHandoffSkipSweep decides all three,
+    // applyDailyHandoffSkipSweep applies the record and the skip flag.
+    dailyHandoffDue: applyDailyHandoffSkipSweep(lastDailyHandoff, dailySkipped, name, cfg, running && state.phase === 'idle', localMidnightMs(nowMs), nowMs, () => dailyQuestionOpen(name), () => logger.info({ name }, 'context-guard: daily handoff skipped today -- open inbound question (the next slot fires regardless)')),
   }
 
   const decision = decideGuard(state, inputs, cfg)
@@ -476,6 +558,7 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
   // until midnight.
   if (decision.reason.startsWith(DAILY_HANDOFF_REASON_PREFIX)) {
     lastDailyHandoff.set(name, nowMs)
+    dailySkipped.delete(name)
   }
 
   // Post-respawn grace for the main session. Making the Linux restart path work
@@ -513,6 +596,11 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
   }
 
   guardStates.set(name, decision.nextState)
+  // Leaving await-ready WITHOUT delivering (ready timeout, guard disabled
+  // mid-wait) ends the obligation too; delivery clears it in inject-resume.
+  if (state.phase === 'await-ready' && decision.nextState.phase !== 'await-ready' && decision.action !== 'inject-resume') {
+    dropPendingResume(name, decision.reason)
+  }
   if (decision.action === 'none') {
     // Idle-flush non-decisions carry the measurement that blocked them
     // ("quiet for only 4m of 20m"), which is the only way to see the tier
@@ -580,6 +668,14 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
           await performRestart(name)
           // The streak is over: only a rescue that actually ran clears it.
           clearRescueFailures(name)
+          // Persisted only AFTER the restart succeeded, so a
+          // failed rescue (rolled back below) never leaves an obligation that
+          // would send "continue from your handoff" into the OLD pane.
+          recordPendingResume(name, {
+            restartedAtMs: Date.now(),
+            handoffStaleMinutes: decision.nextState.handoffStaleMinutes,
+            reason: decision.reason,
+          })
         } catch (err) {
           // guardStates was advanced to the post-restart phase BEFORE this
           // switch, so a failed rescue would otherwise be filed as a completed
@@ -667,11 +763,28 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
         // measuring now would be meaningless (the old session is gone).
         // GUARDHITELES903: anchored like the handoff request -- the resume
         // prompt steers a fresh session's entire first turn.
-        await sendSystemDirective(
-          name,
-          session,
-          resumePrompt(name, handoffPathFor(name), hadHandoff, state.handoffStaleMinutes),
-        )
+        let outcome: Awaited<ReturnType<typeof sendSystemDirective>>
+        try {
+          outcome = await sendSystemDirective(
+            name,
+            session,
+            resumePrompt(name, handoffPathFor(name), hadHandoff, state.handoffStaleMinutes),
+          )
+        } catch (err) {
+          // Not retried: a throw from the tmux layer can come after part of
+          // the text already landed, and a second copy is worse than none.
+          dropPendingResume(name, 'resume delivery threw')
+          throw err
+        }
+        if (outcome === 'sent') {
+          dropPendingResume(name, 'resume delivered')
+        } else {
+          // Nothing was injected ('aborted-busy' / 'skipped-locked'): keep
+          // the obligation and stay in await-ready, so the next sweep retries
+          // until the phase deadline instead of silently cooling down.
+          guardStates.set(name, state)
+          logger.warn({ name, outcome }, 'context-guard: resume prompt NOT injected -- retrying on the next sweep')
+        }
         break
       }
     }
@@ -756,6 +869,11 @@ export function getHardGuardPhase(name: string): string {
 }
 
 export function startContextGuardRunner(): NodeJS.Timeout {
+  // Before the first sweep can run, so an agent restarted by the
+  // previous dashboard process is not re-armed at 'idle' and left without its
+  // resume prompt.
+  try { restorePendingResumes(Date.now()) }
+  catch (err) { logger.warn({ err }, 'context-guard: pending-resume restore failed') }
   let tickRunning = false
   async function sweep() {
     // Re-entrancy guard: checkAgent's 'restart' action now awaits a real
