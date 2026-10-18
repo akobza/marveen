@@ -70,6 +70,8 @@ const EXEMPT: Record<string, string> = {
     'shared library imported by outgoing-copy-gate.py (and the level-2 email approval gate, EMAILKAPU901 PR2); not itself a hook',
   'credential_lib.py':
     'shared library: the credential detector and state, imported by credential-gate.py and scripts/credential-gate-cli.py (CREDGATE1003); not itself a hook',
+  'bash-egress-parser-upstream.mjs':
+    'a pinned copy of the upstream egress parser (blob d3c652fc; the code byte-identical, one comment example spelled in words), loaded by bash-egress-parser.mjs as its second classifier (95800e1d); not itself a hook',
   'memory-save.sh':
     'legacy: referenced only by a historical rebuild prompt, wired nowhere; kept pending a maintainer decision to remove it',
   'telegram-ack.py':
