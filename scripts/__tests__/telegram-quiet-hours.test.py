@@ -326,6 +326,12 @@ def rogzitve(sd, gyoker):
     return os.path.realpath(q.config_path(sd)) in q.seen_configs(q.seen_path(gyoker))
 
 
+def last_good_nincs(gyoker):
+    """The hooks record their own channel's config with keep_windows=False: the install's last good windows (the
+    send gate's fallback) are never written from a channel's config."""
+    return not os.path.exists(os.path.join(gyoker, "store", q.LAST_GOOD_NAME))
+
+
 with tempfile.TemporaryDirectory(prefix="tg-hooks-g-") as munka:
     otthon = os.path.join(munka, "home")
     os.makedirs(otthon)
@@ -355,6 +361,8 @@ with tempfile.TemporaryDirectory(prefix="tg-hooks-g-") as munka:
     rc0, ki0 = wd_fut(gy, otthon)
     ok("watchdog, hasznalhato config: nincs DEFECT, es a futas rogziti a jelolobe",
        (rc0, "QUIET-HOURS DEFECT" in ki0, rogzitve(sd, gy)) == (0, False, True), ki0)
+    ok("watchdog, hasznalhato config: a csatorna configjabol nem lesz a telepites tartalek ablaka (last-good)",
+       last_good_nincs(gy), ki0)
     os.remove(q.config_path(sd))
     futasok = [wd_fut(gy, otthon) for _ in range(2)]
     ok("watchdog, elveszett config: MINDKET futas DEFECT, 'config lost' cimkevel",
@@ -380,6 +388,8 @@ with tempfile.TemporaryDirectory(prefix="tg-hooks-g-") as munka:
     rc0, uj0 = stop_fut(sd, gy, otthon)
     ok("Stop-fallback, hasznalhato config: nincs DEFECT, es a Stop rogziti a jelolobe",
        (rc0, "QUIET-HOURS DEFECT" in uj0, rogzitve(sd, gy)) == (0, False, True), uj0)
+    ok("Stop-fallback, hasznalhato config: a csatorna configjabol nem lesz a telepites tartalek ablaka (last-good)",
+       last_good_nincs(gy), uj0)
     os.remove(q.config_path(sd))
     futasok = [stop_fut(sd, gy, otthon) for _ in range(2)]
     ok("Stop-fallback, elveszett config: MINDKET Stop DEFECT, 'config lost' cimkevel",
