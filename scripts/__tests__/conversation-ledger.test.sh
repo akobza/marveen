@@ -341,7 +341,16 @@ if printf '%s' "$P3_CTX" | grep -qF "Gyula"; then
 else
     pass "7c813be5: OWNER_NAME is not used once principals.json exists"
 fi
-if printf '%s' "$P3_CTX" | grep -qF "ismeretlen feladó utolsó üzenete (chat 29999999999"; then
+# The open question of an UNKNOWN sender names it as unknown. Its own ledger, without the outbound
+# row above: every fixture inbound arrives at the same fixed ts, and a reply sent after an inbound
+# ARRIVED counts as answering it (REPLYGUARDTS914), so any outbound in the DB would close it.
+DB_P3U="$TMPDIR_BASE/principals3u.db"
+emit_inbound 20000000001 31 "ELSO_TULAJ_MASIK" | run_hook ledger-capture.py "$DB_P3U"
+emit_inbound 29999999999 32 "IDEGEN_KERDES" | run_hook ledger-capture.py "$DB_P3U"
+age_rows "$DB_P3U" 3600
+emit_session | run_hook ledger-replay.py "$DB_P3U" > "$TMPDIR_BASE/principals3u.json"
+P3U_CTX="$(ctx_of "$TMPDIR_BASE/principals3u.json")"
+if printf '%s' "$P3U_CTX" | grep -qF "ismeretlen feladó utolsó üzenete (chat 29999999999"; then
     pass "7c813be5: the open question names its own (unknown) sender"
 else
     fail "7c813be5: the open question does not name its own sender"
