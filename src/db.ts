@@ -46,6 +46,25 @@ function tightenDbPermissions(dbPath: string): void {
 // STILL gets pre-create + tighten -- this lets the permission tests exercise the
 // tightening logic on a throwaway file instead of touching the prod DB. The
 // STORE_DIR mkdir stays prod-only; a temp-file override owns its own directory.
+/** The federation case-fold backfill initDatabase runs at every boot (its comment there); module-level so the
+ *  query-plan test (boot-db-cost.test.ts) explains exactly these statements. */
+export const FEDERATION_CASE_FOLD_SQL = {
+  from: `
+    UPDATE agent_messages
+       SET from_agent = lower(substr(from_agent, 1, instr(from_agent, '/') - 1)) || substr(from_agent, instr(from_agent, '/'))
+     WHERE rowid IN (SELECT rowid FROM agent_messages
+                      WHERE instr(from_agent, '/') > 0
+                        AND substr(from_agent, 1, instr(from_agent, '/') - 1) <> lower(substr(from_agent, 1, instr(from_agent, '/') - 1)))
+  `,
+  to: `
+    UPDATE agent_messages
+       SET to_agent = lower(substr(to_agent, 1, instr(to_agent, '/') - 1)) || substr(to_agent, instr(to_agent, '/'))
+     WHERE rowid IN (SELECT rowid FROM agent_messages
+                      WHERE instr(to_agent, '/') > 0
+                        AND substr(to_agent, 1, instr(to_agent, '/') - 1) <> lower(substr(to_agent, 1, instr(to_agent, '/') - 1)))
+  `,
+}
+
 export function initDatabase(dbPathOverride?: string): void {
   const useOverride = dbPathOverride !== undefined
   const isMemory = dbPathOverride === ':memory:'
@@ -984,18 +1003,12 @@ export function initDatabase(dbPathOverride?: string): void {
   // segment keeps its case -- it is the peer's namespace). Idempotent: an
   // already-lowercase prefix compares equal and is skipped, so this is a
   // safe no-op after the first run and on fresh installs.
-  db.exec(`
-    UPDATE agent_messages
-       SET from_agent = lower(substr(from_agent, 1, instr(from_agent, '/') - 1)) || substr(from_agent, instr(from_agent, '/'))
-     WHERE instr(from_agent, '/') > 0
-       AND substr(from_agent, 1, instr(from_agent, '/') - 1) <> lower(substr(from_agent, 1, instr(from_agent, '/') - 1))
-  `)
-  db.exec(`
-    UPDATE agent_messages
-       SET to_agent = lower(substr(to_agent, 1, instr(to_agent, '/') - 1)) || substr(to_agent, instr(to_agent, '/'))
-     WHERE instr(to_agent, '/') > 0
-       AND substr(to_agent, 1, instr(to_agent, '/') - 1) <> lower(substr(to_agent, 1, instr(to_agent, '/') - 1))
-  `)
+  // Card 75693151: it runs at EVERY boot, so the candidates are picked in a subquery the planner answers from a covering
+  // index (idx_agent_messages_thread for from_agent, an index on to_agent for to_agent) instead of the whole table: on a
+  // 109k-row store copy the table scan read 324.7 MB, cold, 2.6 s, and on the saturated 2026-10-19 disk the boot's
+  // initDatabase took 57.7 s; through the index 46.4 MB and 150 ms. Same rows, same result.
+  db.exec(FEDERATION_CASE_FOLD_SQL.from)
+  db.exec(FEDERATION_CASE_FOLD_SQL.to)
 
   // --- Pending Channel Requests (Slack channel opt-in workflow) ---
   db.exec(`
