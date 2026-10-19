@@ -2079,9 +2079,22 @@ export function touchMemoriesAccessed(ids: number[]): void {
 
 export function decayMemories(): void {
   const oneWeekAgo = Math.floor(Date.now() / 1000) - 7 * 86400
-  // Gentler decay: 0.5% per day, only for memories older than 1 week
-  // Never delete -- salience just goes lower but memories persist
-  db.prepare('UPDATE memories SET salience = MAX(salience * 0.995, 0.01) WHERE created_at < ?').run(oneWeekAgo)
+  for (let r = decayMemoriesBatch(0, DECAY_BATCH_ROWS, oneWeekAgo); r.lastId !== null; r = decayMemoriesBatch(r.lastId, DECAY_BATCH_ROWS, oneWeekAgo)) { /* next batch */ }
+}
+
+/** Rows per decay transaction (card 75693151: the single 6220-row UPDATE held the event loop 1.2 s on an idle disk). */
+export const DECAY_BATCH_ROWS = 500
+
+// One decay transaction: the next `limit` memories after `afterId` (rowid order) created before `cutoff`.
+// Gentler decay: 0.5% per sweep (at most one a day, decay-sweep-schedule.ts), only for memories older than 1 week
+// Never delete -- salience just goes lower but memories persist
+// lastId null = nothing left; the caller passes it back as afterId for the next batch.
+export function decayMemoriesBatch(afterId: number, limit: number, cutoff: number): { lastId: number | null; changes: number } {
+  const ids = db.prepare('SELECT id FROM memories WHERE id > ? AND created_at < ? ORDER BY id LIMIT ?').all(afterId, cutoff, limit) as { id: number }[]
+  if (ids.length === 0) return { lastId: null, changes: 0 }
+  const upd = db.prepare('UPDATE memories SET salience = MAX(salience * 0.995, 0.01) WHERE id = ?')
+  const changes = db.transaction(() => ids.reduce((n, r) => n + upd.run(r.id).changes, 0))()
+  return { lastId: ids[ids.length - 1].id, changes }
 }
 
 export function getMemoriesForChat(chatId: string, limit = 10, offset = 0, category?: string): Memory[] {

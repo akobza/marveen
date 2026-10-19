@@ -12,7 +12,7 @@ const SYSTEM_FILES = new Set([
   // SQLite database
   'claudeclaw.db', 'claudeclaw.db-wal', 'claudeclaw.db-shm',
   // Marveen runtime / scheduler state
-  'schedule-last-run.json', 'external-ops-last-run',
+  'schedule-last-run.json', 'external-ops-last-run', '.decay-sweep-last',
   'kanban-audit-state.json',
   // Settings and config overrides written by dashboard routes
   'config-overrides.json', 'dashboard-settings.json',
