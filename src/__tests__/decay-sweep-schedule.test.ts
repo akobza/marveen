@@ -173,7 +173,8 @@ describe('the batched decay', () => {
     seed(1203, 3)
     const cutoff = now() - 7 * 86400
     const sizes: number[] = []
-    for (let r = decayMemoriesBatch(0, 500, cutoff); r.lastId !== null; r = decayMemoriesBatch(r.lastId, 500, cutoff)) sizes.push(r.changes)
+    // bounded: a batch that does not move past its own last id would loop forever and hang the worker (mutant D8, 75693151)
+    for (let r = decayMemoriesBatch(0, 500, cutoff); r.lastId !== null && sizes.length < 10; r = decayMemoriesBatch(r.lastId, 500, cutoff)) sizes.push(r.changes)
     expect(sizes).toEqual([500, 500, 203])
     expect(new Set(saliences('old %'))).toEqual(new Set([0.995]))
     expect(saliences('fresh %')).toEqual([1, 1, 1])
