@@ -9,6 +9,7 @@ import {
   scrubPaths as scrubPathsBase,
   type McpListEntry,
 } from '../mcp-list-parser.js'
+import { trackChildProcess } from './detached-groups.js'
 
 const CLAUDE = resolveFromPath('claude')
 
@@ -95,12 +96,14 @@ export function refreshMcpListCache(): Promise<McpListCache> {
         stderr: string
         execError: Error | null
       }>((resolve, reject) => {
-        execFile(CLAUDE, ['mcp', 'list'], {
+        let untrack = (): void => {}
+        const child = execFile(CLAUDE, ['mcp', 'list'], {
           cwd: getMcpListWorkingDir(),
           timeout: 30_000,
           encoding: 'utf-8',
           maxBuffer: 10 * 1024 * 1024,
         }, (err, stdoutStr, stderrStr) => {
+          untrack()
           // A non-zero exit is not fatal on its own: `claude mcp list`
           // can exit with code 1 when any one of the configured servers
           // fails its health check (a realistic steady state when e.g.
@@ -114,6 +117,7 @@ export function refreshMcpListCache(): Promise<McpListCache> {
           }
           resolve({ stdout: stdoutStr ?? '', stderr: stderrStr ?? '', execError: err ?? null })
         })
+        untrack = trackChildProcess(child?.pid, 'claude mcp list')
       })
       const stderrTrimmed = stderr ? stderr.trim() : ''
       if (stderrTrimmed) {

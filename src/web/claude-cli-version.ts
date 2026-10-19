@@ -5,6 +5,7 @@
 import { execFile, execFileSync } from 'node:child_process'
 import { tryResolveFromPath } from '../platform.js'
 import { parseClaudeVersion } from '../claude-cli-support.js'
+import { trackChildProcess } from './detached-groups.js'
 
 export interface ClaudeCliVersionResult {
   /** Parsed dotted version, or null when not measurable. */
@@ -43,12 +44,15 @@ export function measureClaudeCliVersion(opts: { fresh?: boolean } = {}): Promise
       resolve(cache)
       return
     }
-    execFile(bin, ['--version'], { encoding: 'utf-8', timeout: PROBE_TIMEOUT_MS }, (err, stdout) => {
+    let untrack = (): void => {}
+    const child = execFile(bin, ['--version'], { encoding: 'utf-8', timeout: PROBE_TIMEOUT_MS }, (err, stdout) => {
+      untrack()
       const version = parseClaudeVersion(String(stdout ?? ''))
       const error = err ? `claude --version failed: ${err.message.slice(0, 120)}` : version ? null : `unparseable output: ${String(stdout).slice(0, 60)}`
       cache = { version: err ? null : version, measuredAt: Date.now(), error: err ? error : (version ? null : error), source: 'probe' }
       resolve(cache)
     })
+    untrack = trackChildProcess(child?.pid, 'claude --version')
   })
 }
 
