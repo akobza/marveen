@@ -257,11 +257,11 @@ describe('runDecaySweep (the daily entry point)', () => {
     tool.run('tool-fresh', now)
   }
 
-  it('runs all four retention prunes when switched on: old rows go, fresh and in-flight rows stay', () => {
+  it('runs all four retention prunes when switched on: old rows go, fresh and in-flight rows stay', async () => {
     seedOldAndFresh()
     const db = getDb()
 
-    runDecaySweep()
+    await runDecaySweep()
 
     const col = (sql: string) => (db.prepare(sql).all() as Array<Record<string, unknown>>).map((r) => Object.values(r)[0])
     expect(col('SELECT message_id FROM conversation_log ORDER BY message_id')).toEqual(['conv-fresh'])
@@ -270,7 +270,7 @@ describe('runDecaySweep (the daily entry point)', () => {
     expect(col('SELECT session_id FROM tool_call_log ORDER BY session_id')).toEqual(['tool-fresh'])
   })
 
-  it('deletes nothing with all four settings at their default (unset), however old the rows', () => {
+  it('deletes nothing with all four settings at their default (unset), however old the rows', async () => {
     // An install whose owner never switched retention on must keep its full
     // history: the conversation log doubles as an audit source.
     clearRetentionStubs()
@@ -294,7 +294,7 @@ describe('runDecaySweep (the daily entry point)', () => {
        VALUES ('tool-year', 'Bash', 'x', 1, ?)`,
     ).run(yearOld)
 
-    runDecaySweep()
+    await runDecaySweep()
 
     const col = (sql: string) => (db.prepare(sql).all() as Array<Record<string, unknown>>).map((r) => Object.values(r)[0])
     expect(col('SELECT message_id FROM conversation_log ORDER BY message_id')).toEqual([
@@ -366,11 +366,11 @@ describe('retention is off by default (0 = keep forever)', () => {
     expect(counts()).toEqual([1, 1, 1, 1])
   })
 
-  it('switching one table on prunes only that table', () => {
+  it('switching one table on prunes only that table', async () => {
     retention.CONVERSATION_LOG_RETENTION_DAYS = 90
     seedYearOld()
 
-    runDecaySweep()
+    await runDecaySweep()
 
     expect(counts()).toEqual([0, 1, 1, 1])
   })

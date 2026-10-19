@@ -16,7 +16,7 @@ import { PROJECT_ROOT, STORE_DIR, PID_FILENAME, WEB_PORT, MAIN_AGENT_ID, RESPAWN
 import { resolveOwnerChatId } from './owner-chat.js'
 import { initDatabase, backfillEmbeddings } from './db.js'
 import { runDecaySweep, runDailyDigest } from './memory.js'
-import { DECAY_SWEEP_INTERVAL_MS } from './db.js'
+import { readDecaySweepStamp, scheduleDecaySweep, writeDecaySweepStamp } from './decay-sweep-schedule.js'
 import { initHeartbeat, stopHeartbeat, ensureHeartbeatWorkerHidden } from './heartbeat.js'
 import { ensureHeartbeatAgent, shouldBootHeartbeatAgent, HEARTBEAT_AGENT_NAME } from './web/heartbeat-agent-scaffold.js'
 import { startAgentProcess } from './web/agent-process.js'
@@ -411,7 +411,7 @@ function releaseLock(): void {
 // after partial state was already wired up (e.g. initDatabase throws after
 // acquireLock wrote the pidfile -- we still need to drop the heartbeat /
 // digest timers and release the pidfile on the way out).
-let decayInterval: NodeJS.Timeout | null = null
+let stopDecaySweep: (() => void) | null = null
 let digestTimer: NodeJS.Timeout | null = null
 let digestInterval: NodeJS.Timeout | null = null
 let logRotationInterval: NodeJS.Timeout | null = null
@@ -436,7 +436,7 @@ const shutdown = (): void => {
     try { stopInviteMonitor() } catch (err) { logger.warn({ err }, 'stopInviteMonitor threw during shutdown') }
     try { stopChannelRequestWatcher() } catch (err) { logger.warn({ err }, 'stopChannelRequestWatcher threw during shutdown') }
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
-    if (decayInterval) clearInterval(decayInterval)
+    if (stopDecaySweep) stopDecaySweep()
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
     if (logRotationInterval) clearInterval(logRotationInterval)
@@ -499,11 +499,6 @@ async function main(): Promise<void> {
   backfillEmbeddings().then(({ embedded, attempted, failed }) => {
     if (embedded > 0) logger.info({ count: embedded, attempted, failed }, 'Embedding backfill befejezve')
   }).catch(err => logger.warn({ err }, 'Embedding backfill hiba (Ollama nem elerheto)'))
-
-  // Memory decay (24h cycle)
-  runDecaySweep()
-  decayInterval = setInterval(runDecaySweep, DECAY_SWEEP_INTERVAL_MS)
-  logger.info('Memoria leepulesi ciklus beallitva (24 oras)')
 
   // Log rotation (LOGROTATE910): copytruncate on the launcher-redirected
   // logs, size-capped, hourly check. Runs inside the dashboard so every
@@ -616,6 +611,21 @@ async function main(): Promise<void> {
 
   // Web dashboard
   webServer = startWebServer(WEB_PORT)
+
+  // Memory decay (card 75693151): armed only once the listener is up, at most one sweep a day counted from the last
+  // successful one (decay-sweep-schedule.ts). It used to run synchronously right here, before the listener, at every boot.
+  const armDecaySweep = (): void => {
+    stopDecaySweep = scheduleDecaySweep({
+      run: runDecaySweep,
+      now: Date.now,
+      readStamp: () => readDecaySweepStamp(),
+      writeStamp: (ms) => writeDecaySweepStamp(ms),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (t) => clearTimeout(t),
+    })
+  }
+  if (webServer.listening) armDecaySweep()
+  else webServer.once('listening', armDecaySweep)
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')

@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import {
   saveMemory,
-  decayMemories as dbDecay,
+  decayMemoriesBatch,
+  DECAY_BATCH_ROWS,
   pruneAuditLogs,
   pruneTokenUsage,
   pruneConversationLog,
@@ -112,8 +113,16 @@ export async function saveConversationTurn(
   // Non-semantic turns are NOT saved individually -- they go into daily digest
 }
 
-export function runDecaySweep(): void {
-  dbDecay()
+// Card 75693151: the decay runs in DECAY_BATCH_ROWS-row transactions with an event-loop turn between two, so the web
+// listener keeps answering while it runs (one 6220-row UPDATE read the whole memories table, 123 MB with the embeddings,
+// and took 48.7 s on the 2026-10-19 saturated disk, with the dashboard deaf). The scheduler is decay-sweep-schedule.ts.
+export async function runDecaySweep(): Promise<void> {
+  const cutoff = Math.floor(Date.now() / 1000) - 7 * 86400
+  let memoriesDecayed = 0
+  for (let r = decayMemoriesBatch(0, DECAY_BATCH_ROWS, cutoff); r.lastId !== null; r = decayMemoriesBatch(r.lastId, DECAY_BATCH_ROWS, cutoff)) {
+    memoriesDecayed += r.changes
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
   pruneAuditLogs()
   const tokenRowsPruned = pruneTokenUsage()
   const convRowsPruned = pruneConversationLog()
@@ -125,6 +134,7 @@ export function runDecaySweep(): void {
   const compact = checkpointAndCompact()
   logger.info(
     {
+      memoriesDecayed,
       tokenRowsPruned,
       convRowsPruned,
       spanRowsPruned,
