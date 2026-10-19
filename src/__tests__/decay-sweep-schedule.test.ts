@@ -209,8 +209,10 @@ describe('the boot wiring', () => {
     expect(web).toBeGreaterThan(0)
     expect(arm).toBeGreaterThan(web)
     expect(src).toContain('run: runDecaySweep,')
-    expect(src.indexOf("webServer.once('listening', armDecaySweep)")).toBeGreaterThan(web)
-    expect(src).toContain('if (webServer.listening) armDecaySweep()')
+    // 2nd PR: the listening handler (afterListening) arms the sweep, next to the store watcher
+    expect(src.indexOf("webServer.once('listening', afterListening)")).toBeGreaterThan(web)
+    expect(src).toContain('if (webServer.listening) afterListening()')
+    expect(src.indexOf('armDecaySweep()', src.indexOf('const afterListening = (): void => {'))).toBeGreaterThan(web)
     expect(src).toContain('if (stopDecaySweep) stopDecaySweep()')
   })
 

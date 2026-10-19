@@ -50,3 +50,18 @@ describe('the federation case-fold backfill', () => {
     }
   })
 })
+
+// STRUCTURAL (the boot would need every subsystem up; the decay-sweep-schedule boot-wiring test makes the same trade).
+describe('the boot wiring', () => {
+  it('w1: startStoreWatcher runs only in the listening handler, after startWebServer', () => {
+    const root = join(fileURLToPath(import.meta.url), '..', '..', '..')
+    const src = readFileSync(join(root, 'src', 'index.ts'), 'utf-8').split('\n').filter((l) => !l.trimStart().startsWith('//')).join('\n')
+    const calls = [...src.matchAll(/\bstartStoreWatcher\(\)/g)].map((m) => m.index ?? -1)
+    expect(calls).toHaveLength(1)
+    const handler = src.indexOf('const afterListening = (): void => {')
+    expect(handler).toBeGreaterThan(src.indexOf('webServer = startWebServer(WEB_PORT)'))
+    expect(calls[0]).toBeGreaterThan(handler)
+    expect(src).toContain("webServer.once('listening', afterListening)")
+    expect(src).toContain('if (webServer.listening) afterListening()')
+  })
+})

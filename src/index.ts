@@ -609,9 +609,6 @@ async function main(): Promise<void> {
   // Slack channel request watcher (audit.jsonl -> pending_channel_requests).
   startChannelRequestWatcher()
 
-  // Store file audit watcher
-  startStoreWatcher()
-
   // Web dashboard
   webServer = startWebServer(WEB_PORT)
 
@@ -627,8 +624,14 @@ async function main(): Promise<void> {
       clearTimer: (t) => clearTimeout(t),
     })
   }
-  if (webServer.listening) armDecaySweep()
-  else webServer.once('listening', armDecaySweep)
+  // Store file audit watcher (card 75693151): its first walk of store/ and the recursive fs.watch set-up are synchronous;
+  // on the saturated 2026-10-19 disk they took 13.3 s before the listener. Now they run once the listener is up.
+  const afterListening = (): void => {
+    startStoreWatcher()
+    armDecaySweep()
+  }
+  if (webServer.listening) afterListening()
+  else webServer.once('listening', afterListening)
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')
