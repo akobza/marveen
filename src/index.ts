@@ -24,7 +24,7 @@ import { runLogRotationSweep, LOG_ROTATION_SWEEP_MS } from './web/log-rotation.j
 import { sweepScheduledRunSnapshots } from './web/scheduled-run-snapshot.js'
 import { renameSharedCredentialsIfSafe, fleetTokenBootPass } from './web/claude-credentials-guard.js'
 import { startWebServer } from './web.js'
-import { endAllDetachedGroups } from './web/detached-groups.js'
+import { endAllChildProcesses, endAllDetachedGroups } from './web/detached-groups.js'
 import { logger } from './logger.js'
 import { startInviteMonitor, stopInviteMonitor } from './web/channel-invites.js'
 import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
@@ -430,6 +430,9 @@ const shutdown = (): void => {
     // (outside our process group), so neither launchd nor our own exit ends
     // them, and their timeout timers die with us. End them first.
     try { endAllDetachedGroups('dashboard shutdown') } catch (err) { logger.warn({ err }, 'endAllDetachedGroups threw during shutdown') }
+    // Card 75693151 (3): the plain claude children (claude --version, the auth probe, claude mcp list); KillMode=process
+    // would leave them in the unit's cgroup.
+    try { endAllChildProcesses('dashboard shutdown') } catch (err) { logger.warn({ err }, 'endAllChildProcesses threw during shutdown') }
     if (heartbeatStarted) {
       try { stopHeartbeat() } catch (err) { logger.warn({ err }, 'stopHeartbeat threw during shutdown') }
     }

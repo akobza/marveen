@@ -7,6 +7,7 @@ import { PLATFORM, resolveFromPath } from '../platform.js'
 import { STORE_DIR } from '../config.js'
 import { logger } from '../logger.js'
 import { FLEET_OAUTH_TOKEN_PATH } from './agent-process.js'
+import { trackChildProcess } from './detached-groups.js'
 
 // --- Linux shared-credentials race guard (opt-in) ----------------------------
 //
@@ -146,15 +147,18 @@ export async function liveProbeAuth(envOverride: Record<string, string>, claudeB
     delete env.ANTHROPIC_API_KEY
     Object.assign(env, envOverride)
     const run = await new Promise<{ ran: boolean; exitedNonZero: boolean; output: string }>((resolve) => {
-      execFile(
+      let untrack = (): void => {}
+      const child = execFile(
         bin,
         ['-p', 'Reply with exactly: OK', '--model', LIVE_TEST_MODEL],
         { timeout: 60_000, encoding: 'utf-8', env: env as NodeJS.ProcessEnv },
         (err, stdout, stderr) => {
+          untrack()
           if (err && (err as { code?: unknown }).code === 'ENOENT') { resolve({ ran: false, exitedNonZero: true, output: '' }); return }
           resolve({ ran: true, exitedNonZero: Boolean(err), output: `${stdout ?? ''}\n${stderr ?? ''}` })
         },
       )
+      untrack = trackChildProcess(child?.pid, 'claude -p (auth probe)')
     })
     return classifyAuthProbe(run)
   } catch {
