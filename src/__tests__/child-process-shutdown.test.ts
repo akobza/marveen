@@ -39,7 +39,7 @@ describe('the plain child registry', () => {
   })
 
   it('an unknown pid (the launch failed) is not tracked; a gone pid is quiet at shutdown', () => {
-    trackChildProcess(undefined, 'no pid')()
+    trackChildProcess(undefined, 'no pid') // not untracked on purpose: nothing may have been recorded (mutant C3, 75693151)
     expect(runningChildProcesses()).toEqual([])
     trackChildProcess(2 ** 22 + 12345, 'gone') // above the default pid_max: ESRCH
     expect(endAllChildProcesses('dashboard shutdown')).toBe(0)
