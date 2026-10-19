@@ -481,8 +481,8 @@ export function initDatabase(dbPathOverride?: string): void {
   // Stamp updated_at on CONTENT-shaped updates only. Maintenance writes
   // (salience decay, accessed_at bumps, embedding backfills) must NOT stamp,
   // or updated_at would degrade into "last decay time". A separate trigger
-  // rather than extending memories_au: that one is the FTS-sync contract and
-  // fires on every update by design.
+  // rather than extending memories_au: that one is the FTS-sync contract
+  // (it fires on every update of the two indexed columns, see below).
   // Recursion safety under PRAGMA recursive_triggers=ON: the inner UPDATE
   // changes updated_at, so the re-fired trigger fails the
   // `new.updated_at IS old.updated_at` guard and stops. A writer that sets
@@ -519,6 +519,16 @@ export function initDatabase(dbPathOverride?: string): void {
       WHERE id = new.id;
     END
   `)
+
+  // FTS sync only when the indexed text changes (card 75693151). memories_fts indexes content and keywords and nothing
+  // else, but memories_au fired on EVERY update: the daily salience decay re-indexed every week-old memory (on a store copy
+  // 6220 rows, 23% of the decay's WAL pages) and so did each accessed_at or embedding write. `UPDATE OF content, keywords`
+  // fires whenever either column is in the SET list, changed or not, so every text write still re-indexes. The nested
+  // UPDATE of memories_touch sets only updated_at/updated_by and no longer re-enters this trigger. DROP before CREATE:
+  // CREATE TRIGGER IF NOT EXISTS would keep an installed old body. The FTS has its keywords column here on every path
+  // (fresh installs and older DBs both go through the rebuild above).
+  db.exec('DROP TRIGGER IF EXISTS memories_au')
+  db.exec(`CREATE TRIGGER memories_au AFTER UPDATE OF content, keywords ON memories BEGIN INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES('delete', old.id, old.content, old.keywords); INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords); END`)
 
   // Memory version history (card 27ab6a18, 2026-09-14).
   //
