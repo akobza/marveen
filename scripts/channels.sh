@@ -716,7 +716,14 @@ unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN
 # scrub the env var before any tmux command runs.
 unset TMUX
 
-export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# NATIVECLAUDEFIRST1011 (#1896): $HOME/.local/bin leads, so `command -v claude`
+# below picks the install user's native launcher (~/.local/bin/claude) over a
+# Homebrew/npm copy in /opt/homebrew/bin -- the order the dashboard's launchd
+# PATH and platform.ts KNOWN_BIN_DIRS already use. With /opt/homebrew/bin first,
+# a Mac that also had an older shared claude there ran the main session on that
+# one while the sub-agents ran the native build, and claude_is_native looked at
+# the wrong binary. Every other directory keeps its relative order.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 # FLEETVENV923: the fleet Python venv's bin/ goes FIRST, when it is set and
 # exists, so the main session's `python3` (and markitdown & co.) come from the
@@ -933,12 +940,51 @@ claude_relink_native() {
   command -v claude >/dev/null 2>&1
 }
 
+# NATIVEBEHIND1011 (#1901 review): a host that once ran the native installer and
+# then went back to npm keeps an intact ~/.local/bin/claude -> versions/<old>.
+# With ~/.local/bin first on the PATH, that older build now wins, and because
+# claude_is_native is true the update path is skipped. The #1613 evidence that
+# npm was the live install -- the update stamp newer than the build -- is
+# named here with both versions, so the owner sees that the CLI went backwards
+# and why. Only a log line: the session still starts. The npm version is read
+# from package.json, never by running a second binary at boot.
+# Once per build (#1901 re-review): the line is written once for a given native
+# build and npm copy, not on every start; a new native build or a new npm copy
+# names it again. Without npm on the PATH the npm half of the advice is moot, so
+# only `claude install stable` is suggested.
+claude_native_behind_npm_note() {
+  local b t ver npm_root npm_ver="" npm_state fix key
+  local seen="$INSTALL_DIR/store/.claude-native-behind-warned"
+  b="$(command -v claude 2>/dev/null)" || return 0
+  t="$(claude_realpath "$b")" || return 0
+  [ -n "$t" ] && [ -e "$CLAUDE_UPDATE_STAMP" ] && [ "$CLAUDE_UPDATE_STAMP" -nt "$t" ] || return 0
+  ver="$(basename "$t")"
+  if command -v npm >/dev/null 2>&1; then
+    npm_root="$(npm root -g 2>/dev/null)"
+    if [ -n "$npm_root" ] && [ -f "$npm_root/@anthropic-ai/claude-code/package.json" ]; then
+      npm_ver="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$npm_root/@anthropic-ai/claude-code/package.json" | head -1)"
+    fi
+    npm_state="${npm_ver:-unknown}"
+    fix="\`claude install stable\` to bring the native build forward, or remove ~/.local/bin/claude to stay on npm"
+  else
+    npm_state="unknown (npm not found)"
+    fix="\`claude install stable\` to bring the native build forward"
+  fi
+  key="$t $npm_state"
+  [ "$(cat "$seen" 2>/dev/null)" = "$key" ] && return 0
+  if { echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN the native claude launcher wins and runs build ${ver} ($t), but the npm update stamp is newer than that build -- npm was the live install (npm copy: ${npm_state}). The main session now runs the OLDER native build and the update path is skipped. Fix: ${fix}." >> "$INSTALL_DIR/store/channels-failures.log"; } 2>/dev/null; then
+    { printf '%s\n' "$key" > "$seen"; } 2>/dev/null || true
+  fi
+}
+
 if ! command -v claude >/dev/null 2>&1; then
   if ! claude_relink_native; then
     claude_install "binary missing -- self-heal"
   fi
 elif claude_is_native; then
   echo "$(date '+%F %T') claude update SKIPPED: native install, npm path disabled" >&2
+  claude_native_behind_npm_note
 elif [ "$AVX_LESS" = "0" ] && [ -z "$(find "$CLAUDE_UPDATE_STAMP" -mtime -1 2>/dev/null)" ]; then
   # AVX-less hosts are excluded on purpose: their claude is pinned, and
   # "keep it current" is exactly what breaks them.
@@ -1059,7 +1105,19 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       # Both carry their OWN .credentials.json (an operator-logged-in dir for
       # `explicit`, a registered plan's dir for `rotated` -- design 6.5/4) --
       # neither wants the fleet token injected below.
-      CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && "
+      # Not injecting is not enough: AUTH_PANE_ENV (sourced BEFORE CFG_ENV in
+      # the pane command) and the tmux global env already carry the fleet
+      # token, and an env CLAUDE_CODE_OAUTH_TOKEN wins over the dir's own
+      # login. The setup-token is inference-only, so the claude.ai connectors
+      # (user:mcp_servers) never loaded (measured 2026-10-16). Unset it here.
+      # The same two places carry ANTHROPIC_API_KEY when .env has one (the
+      # auth file and `set-environment -g` below), and it ranks above both the
+      # OAuth token and a /login credential (Claude Code docs, "Authentication
+      # precedence"); with it active the claude.ai connectors do not load either,
+      # and an interactive session first asks to approve the key. This dir
+      # authenticates with its own login only, so the key goes as well.
+      # A custom provider still gets its key: CUSTOM_PROVIDER_ENV comes after.
+      CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY && "
     elif [ "$_cfg_mode" = "token" ]; then
       # Token-mode rotated plan: same credential-less dir as `isolated`, but
       # export THAT plan's vault-stored token instead of the flotta's.
@@ -1380,7 +1438,14 @@ _tmux_set_auth_globals() {
   # on this.
   $TMUX set-environment -g DISABLE_AUTOUPDATER 1 2>/dev/null || true
 }
-$TMUX start-server 2>/dev/null || true
+# start-server, too, runs without the state-dir var exported above (same rule
+# as TMUXSERVERREAP929 for new-session). With exit-empty on (the default) the
+# server it forks exits at once, but under `set -g exit-empty off` (a user
+# tmux.conf) it LIVES, carrying <PROVIDER>_STATE_DIR in its own environ and
+# global env: every session created before the -g -u below inherits the main
+# session's channel dir, and the server process itself matches the reap's env
+# needle for its whole life (measured with tmux 3.4 on an isolated socket).
+env -u "$STATE_ENV_VAR" $TMUX start-server 2>/dev/null || true
 _tmux_set_auth_globals
 
 # Layer 1 of CHANNELSAUTHRACE923, WITHOUT the secret in any argv (TOKENARGV929).

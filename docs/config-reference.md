@@ -62,6 +62,8 @@ Ha el szeretnéd hagyni a Beállítások oldalt (másik menüpontra kattintasz, 
 
 Egyes beállítások mellett "Újraindítást igényel" feliratú badge látható -- ha ilyen értéket módosítasz (pl. `DASHBOARD_PUBLIC_URL`, `OLLAMA_URL`, `HEARTBEAT_AGENT_ENABLED`), a változás csak a szerver következő újraindítása után lép életbe. A kanban és heartbeat időablak-beállítások (pl. `KANBAN_WIP_*`, `KANBAN_AGING_*`, `HEARTBEAT_START_HOUR`) azonnal hatnak, újraindítás nélkül.
 
+Az oldalon elmentett érték felülírásként a `store/config-overrides.json`-be kerül. A felülírt sor mellett "felülírva" jelzés és egy **Alapértelmezés** gomb látszik: a gomb megerősítést kér, amelyben kulcsonként látszik a mostani érték, a visszaállás utáni érték és annak forrása (ugyanezt mutatja a fülenkénti **Mind alapértelmezés** gomb is), majd törli a felülírást, és az érték visszaáll az `.env`-ben megadottra, vagy ha ott nincs, a registry alapértékére. Ugyanez API-n: `DELETE /api/settings/<KULCS>`; a `GET /api/settings` soronként megmondja a forrást (`override` / `env` / `default`), és azt is, mivé válna az érték a felülírás nélkül (`resetValue`, `resetSource`).
+
 **Mit állíthatsz be?**
 
 A beállítások három modulba vannak csoportosítva:
@@ -510,6 +512,7 @@ A főbb konfigurációs változók a launchd plist-ben (`~/Library/LaunchAgents/
 | `OWNER_NAME` | A tulajdonos neve (pl. "Jónás Gergő") |
 | `BOT_NAME` | A főágens neve (pl. "Jarvis") |
 | `VOICE_TRANSCRIBE_INBOUND` | `1` = a text módú ügynököknél is átirat készül a bejövő hangüzenetről (alapból ki; az ügynökönkénti `voice.transcribeInbound` felülírja). Lásd `voice.md` |
+| `PERMISSION_ALERT_MARKS` | Mikor szóljon a figyelő egy megválaszolatlan engedélykérő dialógusról: vesszővel elválasztott időpontok a dialógus megjelenésétől (alapból `15m,30m,1h,2h,8h,24h`; egy al-ügynök kérdéséről a fő ügynök azonnal üzenetet kap, a gazda az első időponttól; `s`/`m`/`h`/`d`, a puszta szám perc). Az utolsó érték egyben az ismétlési idő; a `0` első értékként azonnali jelzés. Értelmezhetetlen értéknél az alapértelmezés marad, naplózva |
 
 ---
 

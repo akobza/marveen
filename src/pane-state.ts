@@ -284,7 +284,7 @@ const PASTE_REGION_FALLBACK_LINES = 8
 // destructive Ctrl-C + resend on a perfectly healthy session. Scoping to
 // the box (same discipline as BUSY_ESC_TO_INTERRUPT_RX / the footer checks)
 // confines the match to where a genuine parked stub actually lives.
-function pastePlaceholderRegion(pane: string): string {
+function pastePlaceholderRegion(pane: string): { where: PastePlaceholderWhere; text: string } {
   const lines = pane.split('\n')
   let bottomSep = -1
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -295,9 +295,21 @@ function pastePlaceholderRegion(pane: string): string {
     for (let i = bottomSep - 1; i >= 0; i--) {
       if (BOX_SEP_RX.test(lines[i])) { topSep = i; break }
     }
-    if (topSep >= 0) return lines.slice(topSep + 1, bottomSep).join('\n')
+    if (topSep >= 0) return { where: 'box', text: lines.slice(topSep + 1, bottomSep).join('\n') }
   }
-  return lines.slice(-PASTE_REGION_FALLBACK_LINES).join('\n')
+  return { where: 'tail', text: lines.slice(-PASTE_REGION_FALLBACK_LINES).join('\n') }
+}
+
+// Card 71263d15 (a3): WHERE the stub was found. 'box' is a placeholder confirmed in the live input
+// box (between the two separators); 'tail' is the fallback match on the last lines when the box
+// separators are not on screen, and nothing there proves the input box holds it. The difference
+// matters to the Ctrl-C that clears a placeholder: on an EMPTY box that key quits the TUI.
+export type PastePlaceholderWhere = 'box' | 'tail'
+
+export function pastePlaceholderLocation(pane: string | null): PastePlaceholderWhere | null {
+  if (!pane) return null
+  const region = pastePlaceholderRegion(pane)
+  return PENDING_PASTE_RX.test(region.text) ? region.where : null
 }
 
 // A placeholder pane is identified by the `[Pasted text #N]` stub IN THE LIVE
@@ -312,8 +324,7 @@ function pastePlaceholderRegion(pane: string): string {
 // dependency-free so callers (detectPaneState, shouldRetrySubmit, the recovery
 // decision) share ONE definition instead of re-inlining the regex.
 export function detectsPastePlaceholder(pane: string): boolean {
-  if (!pane) return false
-  return PENDING_PASTE_RX.test(pastePlaceholderRegion(pane))
+  return pastePlaceholderLocation(pane) != null
 }
 
 // Input-box separator lines are made of U+2500 BOX DRAWINGS LIGHT
@@ -672,6 +683,16 @@ export function detectsBlockingMenu(pane: string): boolean {
   const footerRegion = liveTailRegion(lines, MENU_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
   if (hasIdleFooter(lines)) return false
+  // A held cross-session message is a QUESTION for a person, not a stray
+  // modal: Escape there is not a neutral "back" -- it may decline the message
+  // and tell the sender so (the dialog's Deny: "drop it and tell the sender it
+  // was declined"). Never treat it as a menu to pop; the sub-agent sweep
+  // (stuck-tool-call-watcher.ts) alerts the owner instead (#1596 review).
+  // It is still a dialog for anything that TYPES: a caller that uses this
+  // function to refuse text + Enter must check detectsHeldPeerMessage too
+  // (urgentEmitRefusal, paneRefusesIdentityCommand), since that Enter would
+  // confirm the highlighted "Deliver this message to Claude".
+  if (detectsHeldPeerMessage(pane)) return false
   return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
 }
 
@@ -699,18 +720,29 @@ export function detectsBlockingMenu(pane: string): boolean {
 //
 // Returns null when either piece is missing: an alert with a half-parsed
 // question is worse than an alert that just says "open the pane".
-const PERMISSION_RULE_LINE_RX = /^\s*─{8,}\s*$/
+const PERMISSION_RULE_LINE_RX = /^─{8,}\s*$/
 // The question line the summary anchors on. detectsPermissionDialog (added on
 // develop by PR #1190) decides WHETHER a prompt is up; this module only has to
 // find the question again to quote it.
 const PERMISSION_SUMMARY_QUESTION_RX = /\bDo you want to (?:proceed|create|make|run)\b/i
 const PERMISSION_QUOTE_PREFIX_RX = /^\s*│\s?/
 const PERMISSION_REASON_MAX = 220
+// The cards whose subject line is a PATH: "Edit file", "Create file" (both
+// measured), any other "<Verb> file", and the same with the sub-agent suffix
+// ("Edit file · from the general-purpose agent"). On every other card -- a Bash
+// card above all -- the subject is what would RUN, and a command line can carry
+// a literal token (`curl -H "Authorization: Bearer ..."`).
+const PERMISSION_FILE_CARD_TITLE_RX = /^[A-Z][a-z]+ file(?: · from the \S+(?: \S+){0,3} agent)?$/
+
+/** Is this card header one whose subject line is a path, not a command? */
+export function isPermissionFileCardTitle(title: string | null | undefined): boolean {
+  return title != null && PERMISSION_FILE_CARD_TITLE_RX.test(title.trim())
+}
 
 export interface PermissionPromptSummary {
   /** The tool card's header, e.g. "Bash command · from the general-purpose agent". */
   title: string
-  /** First line of the reason Claude gives for needing consent. */
+  /** The reason Claude gives for needing consent, rejoined into one line. */
   reason: string
 }
 
@@ -719,46 +751,69 @@ export interface PermissionPromptSummary {
  *
  * Pure + dependency-free. Only meaningful on a pane where
  * detectsPermissionDialog() is true; returns null when the expected parts are
- * not both present.
+ * not both present -- and on a card that is not a file card, when no quoted
+ * block can be told apart from the command echo (see below).
  */
 export function permissionPromptSummary(pane: string): PermissionPromptSummary | null {
   if (!pane) return null
   const lines = pane.split('\n')
-  const questionIdx = lines.findIndex((l) => PERMISSION_SUMMARY_QUESTION_RX.test(l))
+  let questionIdx = -1
+  for (let i = lines.length - 1; i >= 0; i--) if (PERMISSION_SUMMARY_QUESTION_RX.test(lines[i])) { questionIdx = i; break }
   if (questionIdx < 0) return null
 
   // Title: first non-empty line after the horizontal rule that opens the card.
   let title = ''
+  let titleIdx = -1
   const ruleIdx = lines.slice(0, questionIdx).map((l) => PERMISSION_RULE_LINE_RX.test(l)).lastIndexOf(true)
   if (ruleIdx >= 0) {
-    for (const l of lines.slice(ruleIdx + 1, questionIdx)) {
-      const t = l.trim()
-      if (t) { title = t; break }
+    for (let i = ruleIdx + 1; i < questionIdx; i++) {
+      const t = lines[i].trim()
+      if (t) { title = t; titleIdx = i; break }
     }
+  }
+  if (!title) return null
+  const titleCol = lines[titleIdx].search(/\S/)
+
+  // The card's quoted blocks, top to bottom: runs of consecutive │ lines
+  // between the card's rule and the question, each rejoined into one line (the
+  // pane hard-wraps at the card width, so the first line alone can be as
+  // useless as "grep on", measured on the bash-grep fixture). Only the CARD: a
+  // │ line in the transcript above the rule -- a tree listing, a box another
+  // tool drew -- is not part of this prompt, and was read as its reason.
+  const blocks: { col: number; text: string; start: number; first: string }[] = []
+  for (let i = ruleIdx + 1; i < questionIdx; i++) {
+    if (!PERMISSION_QUOTE_PREFIX_RX.test(lines[i])) continue
+    const start = i
+    const parts: string[] = []
+    for (; i < questionIdx && PERMISSION_QUOTE_PREFIX_RX.test(lines[i]); i++) parts.push(lines[i].replace(PERMISSION_QUOTE_PREFIX_RX, '').trim())
+    blocks.push({ col: lines[start].indexOf('│'), text: parts.join(' ').replace(/\s+/g, ' ').trim(), start, first: parts[0] })
   }
 
-  // Reason: the LAST quoted block before the question, rejoined into one
-  // line. Two reasons for the shape:
-  //   - last block, not first: the command echo is quoted too, and the last
-  //     block is the one that says why consent is needed rather than what
-  //     would run.
-  //   - rejoined, not first-line: the pane hard-wraps at the card width, so
-  //     the first line alone can be as useless as "grep on" (measured on the
-  //     bash-grep fixture). Rejoining recovers the sentence; the cap keeps a
-  //     long reason from flooding the alert.
-  let reason = ''
-  let end = -1
-  for (let i = questionIdx - 1; i >= 0; i--) {
-    const quoted = PERMISSION_QUOTE_PREFIX_RX.test(lines[i])
-    if (quoted && end < 0) end = i
-    else if (!quoted && end >= 0) {
-      const block = lines.slice(i + 1, end + 1).map((l) => l.replace(PERMISSION_QUOTE_PREFIX_RX, '').trim())
-      reason = block.join(' ').replace(/\s+/g, ' ').trim()
-      break
-    }
-  }
+  // Reason: the LAST quoted block -- the command echo is quoted too, and comes
+  // first; the last block is the one that says why consent is needed. But on a
+  // card WITHOUT a reason block the last quoted block IS the command echo
+  // (review of #1907: the bash-grep capture with its reason block cut and a
+  // token in the command put the token into the sent alert). So on any card
+  // but a file card the last block is the reason only when the card has a
+  // block above it, and it sits LEFT of that block: on both live captures the
+  // command echo is indented under the header ("   │ cd ...") and the reason
+  // is not (" │ grep on ..."). Two blocks at one indent are a shape neither
+  // capture shows -- one command drawn in two runs would look like that -- so
+  // neither counts as a reason. The reason also sits in the card's MARGIN (the
+  // title's column): every line of the card body -- the echo, a path, a diff,
+  // and the command itself where it is drawn unquoted, │ boxes included -- is
+  // indented under the title. On a file card without a reason block, only the
+  // first line of the block right under the header is quoted: the path, which
+  // the alerts quote anyway. A quoted diff below it is file content.
+  const last = blocks[blocks.length - 1]
+  const above = blocks[blocks.length - 2]
+  const isReason = last != null && above != null && last.col < above.col && last.col <= titleCol
+  let reason: string
+  if (isReason) reason = last.text
+  else if (isPermissionFileCardTitle(title) && blocks[0] && lines.slice(titleIdx + 1, blocks[0].start).every((l) => !l.trim())) reason = blocks[0].first
+  else return null
   if (reason.length > PERMISSION_REASON_MAX) reason = reason.slice(0, PERMISSION_REASON_MAX - 1).trimEnd() + '…'
-  if (!title || !reason) return null
+  if (!reason) return null
   return { title, reason }
 }
 
@@ -1145,6 +1200,38 @@ export function detectsPermissionDialog(pane: string): boolean {
   if (hasIdleFooter(lines)) return false
   return PERMISSION_AMEND_RX.test(footerRegion)
     || (PERMISSION_QUESTION_RX.test(pane) && PERMISSION_YES_RX.test(pane))
+}
+
+// PEERHOLD925 (card c3f8f062): a cross-session (peer) message that the
+// receiving session holds for its user's approval renders its OWN dialog, not
+// the tool-permission card: no "Do you want to proceed?", no "Tab to amend".
+// Measured on 2026-09-23 on this install: kigyo's session sat on one for hours
+// with no alert -- detectsPermissionDialog does not match it, and the router's
+// session-stuck path only fires when inter-agent messages are QUEUED for the
+// session, which a cross-session send never is.
+//
+// The anchor is the dialog's rendered TITLE, "Held message from another
+// session" (#1596 review: `title:"Held message from another session"` in the
+// Claude Code 2.1.282 binary; still there in 2.1.296). The dialog's other
+// strings are deliberately not anchors: "Another Claude session sent a message"
+// also opens the model-facing wrapper of a DELIVERED peer message, and "A
+// message from another session needs your approval" is the notification text of
+// that state, not necessarily on screen. Same guards as detectsPermissionDialog:
+// a busy pane is never a dialog, and a visible idle footer means the prompt is
+// live and the title is merely quoted.
+const HELD_PEER_MESSAGE_RX = /Held message from another session/
+
+export function detectsHeldPeerMessage(pane: string): boolean {
+  if (!pane || !pane.trim()) return false
+  const lines = pane.split('\n')
+  const busyRegion = lines.slice(-BUSY_LIVE_REGION_LINES).join('\n')
+  for (const rx of BUSY_INDICATORS) {
+    if (rx.test(busyRegion)) return false
+  }
+  const footerRegion = liveTailRegion(lines, LIVE_FOOTER_REGION_LINES)
+  if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
+  if (IDLE_FOOTER_RX.test(pane)) return false
+  return HELD_PEER_MESSAGE_RX.test(pane)
 }
 
 export function detectsModelConsentDialog(pane: string): boolean {
@@ -1837,7 +1924,7 @@ export function parkedPasteSignature(pane: string): string | null {
   const footerRegion = liveTailRegion(lines, LIVE_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return null
   if (!detectsPastePlaceholder(pane)) return null
-  const sig = pastePlaceholderRegion(pane).replace(/\s+/g, ' ').trim()
+  const sig = pastePlaceholderRegion(pane).text.replace(/\s+/g, ' ').trim()
   return sig.length > 0 ? sig : null
 }
 

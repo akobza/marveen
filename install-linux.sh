@@ -1469,14 +1469,21 @@ if [ -d "$SCHED_TPL_DIR" ]; then
       continue
     fi
     mkdir -p "$target"
-    for f in "$tpl"*; do
-      [ -f "$f" ] || continue
-      sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
-          -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
-          -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-          -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
-          -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
-          "$f" > "$target/$(basename "$f")"
+    # SEEDREFDIR1018: a task may keep part of its text in a references/
+    # subdir that its SKILL.md points at; it ships with the same templating,
+    # or the pointer lands on a file that does not exist.
+    for sub in "" "references/"; do
+      [ -z "$sub" ] || [ -d "$tpl$sub" ] || continue
+      mkdir -p "$target/$sub"
+      for f in "$tpl$sub"*; do
+        [ -f "$f" ] || continue
+        sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+            -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
+            -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+            -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+            -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
+            "$f" > "$target/$sub$(basename "$f")"
+      done
     done
     ok "Utemezett feladat scaffoldolva: $task_name"
   done
@@ -1507,14 +1514,21 @@ if [ -d "$SEED_SCHED_DIR" ]; then
       continue
     fi
     mkdir -p "$target"
-    for f in "$tpl"*; do
-      [ -f "$f" ] || continue
-      sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
-          -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
-          -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-          -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
-          -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
-          "$f" > "$target/$(basename "$f")"
+    # SEEDREFDIR1018: a task may keep part of its text in a references/
+    # subdir that its SKILL.md points at; it ships with the same templating,
+    # or the pointer lands on a file that does not exist.
+    for sub in "" "references/"; do
+      [ -z "$sub" ] || [ -d "$tpl$sub" ] || continue
+      mkdir -p "$target/$sub"
+      for f in "$tpl$sub"*; do
+        [ -f "$f" ] || continue
+        sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+            -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
+            -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+            -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+            -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
+            "$f" > "$target/$sub$(basename "$f")"
+      done
     done
     SCHED_NEW=$((SCHED_NEW + 1))
   done
@@ -1672,6 +1686,17 @@ if [ -d "$SEED_SKILLS_DIR" ]; then
     for f in "$skill_dir"*; do
       [ -f "$f" ] || continue
       cp "$f" "$target/$(basename "$f")"
+    done
+    # SEEDSKILLSUB1018: a skill's subdirs (scripts/, references/, ...) ship too,
+    # verbatim and with their mode bits; its SKILL.md points into them.
+    # Only the files git TRACKS: a whole-dir copy also carried untracked and
+    # ignored files, and fleet-helper's own scripts/.gitignore names exactly
+    # those as secrets/personal data (mail_rules.json, .dashboard-token).
+    # Outside a git checkout nothing below the top level is copied.
+    git -C "$skill_dir" ls-files -z 2>/dev/null | while IFS= read -r -d '' rel; do
+      case "$rel" in */*) ;; *) continue ;; esac   # top-level files: the loop above
+      mkdir -p "$target/$(dirname "$rel")"
+      cp -p "$skill_dir$rel" "$target/$rel"
     done
     SEED_NEW=$((SEED_NEW + 1))
   done

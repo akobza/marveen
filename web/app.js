@@ -388,6 +388,7 @@ function switchPage(pageId) {
   if (pageId === 'tokenUsage') loadTokenUsage()
   if (pageId === 'costs') loadCosts()
   if (pageId === 'ideas') loadIdeasPage()
+  if (pageId === 'notes') loadNotesPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
   if (pageId === 'federation') loadFederationPage()
@@ -512,7 +513,7 @@ const NAV_I18N = {
   approvals: 'nav.approvals',
   docs: 'nav.docs', research: 'nav.research', status: 'nav.status',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
-  ideas: 'nav.ideas', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
+  ideas: 'nav.ideas', notes: 'nav.notes', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
 }
 
 function renderNav() {
@@ -886,6 +887,11 @@ async function loadKanban() {
         if (sortSel) sortSel.value = storedSort
       }
     }
+    // Best effort and in parallel: the board must still load when the status
+    // endpoint is slow or fails; it just shows no live markers then.
+    const agentStatusP = fetch('/api/agents/status')
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => [])
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
       fetch('/api/kanban/assignees'),
@@ -896,6 +902,7 @@ async function loadKanban() {
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
     kanbanAllLabels = await labelsRes.json()
+    setKanbanAgentStatus(await agentStatusP)
     populateProjectFilter()
     populateProjectSuggestions()
     setupAssigneeFilter()
@@ -1553,6 +1560,66 @@ function updateSubtaskBadges(embeddedSubtaskIds) {
   }
 }
 
+// Live agent state on the card (one human, many agents). An in_progress card
+// says an agent CLAIMED the work; it does not say the agent is still on it --
+// a stopped or stuck agent's card looks exactly like a moving one. The state is
+// already derived per agent by /api/agents/status (src/web/agent-status.ts), so
+// the board borrows that instead of guessing anything from the card itself.
+// The state belongs to the AGENT, not to the card: an agent holding two cards
+// in progress shows the same marker on both. 'unknown' renders nothing --
+// saying nothing beats asserting a state nobody measured.
+let kanbanAgentStatus = new Map()
+
+const KANBAN_AGENT_LIVE_LEVEL = {
+  working: 'ok',
+  idle: 'idle',
+  stalled: 'warn',
+  dead: 'bad',
+  stopped: 'bad',
+  unreachable: 'bad',
+}
+
+function setKanbanAgentStatus(rows) {
+  kanbanAgentStatus = new Map()
+  if (!Array.isArray(rows)) return
+  for (const r of rows) {
+    if (r && typeof r.agent === 'string') kanbanAgentStatus.set(r.agent.trim().toLowerCase(), r)
+  }
+}
+
+// An agent with several cards in progress is busy on at most one of them. When
+// the status names a DIFFERENT card as the agent's current work, 'working' and
+// 'stalled' would be false on this one, so it says where the agent is instead,
+// in grey. Stopped/dead/unreachable are true for every card the agent holds.
+function kanbanAgentLiveLevel(card) {
+  if (card.status !== 'in_progress' || !card.assignee) return null
+  const row = kanbanAgentStatus.get(String(card.assignee).trim().toLowerCase())
+  if (!row) return null
+  const level = KANBAN_AGENT_LIVE_LEVEL[row.state]
+  if (!level) return null
+  const otherCardId = row.work && row.work.kind === 'card' && row.work.cardId && row.work.cardId !== card.id
+    ? row.work.cardId
+    : null
+  if (otherCardId && (row.state === 'working' || row.state === 'stalled')) {
+    return { level: 'idle', row, elsewhere: kanbanCards.find((c) => c.id === otherCardId) || null }
+  }
+  return { level, row, elsewhere: null }
+}
+
+function kanbanAgentLiveBadge(card) {
+  const live = kanbanAgentLiveLevel(card)
+  if (!live) return ''
+  const { level, row, elsewhere } = live
+  const label = elsewhere
+    ? t('kanban.agent_live.elsewhere', { seq: elsewhere.seq != null ? '#' + elsewhere.seq : '' })
+    : t('kanban.agent_live.' + row.state)
+  let tip = t('kanban.agent_live.tooltip', { state: label })
+  if (typeof row.lastSignalAgeSec === 'number') {
+    tip += ' · ' + t('kanban.agent_live.last_signal', { age: formatDurationShort(row.lastSignalAgeSec) })
+  }
+  return `<span class="kanban-card-agent-live kanban-agent-live-${escapeAttr(level)}" data-agent-state="${escapeAttr(row.state)}" title="${escapeAttr(tip)}"><span class="kanban-agent-live-dot"></span>${escapeHtml(label)}</span>`
+}
+
 function createCardEl(card, embeddedChildren = []) {
   const el = document.createElement('div')
   el.className = 'kanban-card'
@@ -1563,6 +1630,8 @@ function createCardEl(card, embeddedChildren = []) {
   // a move that looks like it failed. So the card is simply not draggable
   // there; the touch path reads the same flag.
   el.draggable = kanbanSortBy === 'manual'
+  const agentLive = kanbanAgentLiveLevel(card)
+  if (agentLive) el.dataset.agentLive = agentLive.level
 
   // Assignee chip. Match the card's assignee against the known list
   // case-insensitively (a card stored as "gorcsevivan" must still match the
@@ -1674,7 +1743,7 @@ function createCardEl(card, embeddedChildren = []) {
   el.innerHTML = `
     ${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
-    <div class="kanban-card-footer">${assigneeHtml}${dueHtml}${blockedHtml}</div>
+    <div class="kanban-card-footer">${assigneeHtml}${kanbanAgentLiveBadge(card)}${dueHtml}${blockedHtml}</div>
     ${labelsHtml}
     <div class="kanban-card-actions">
       <button class="card-breakdown-btn" title="${t('kanban.btn.breakdown')}" aria-label="${t('kanban.btn.breakdown')}">⚡</button>
@@ -2003,6 +2072,7 @@ function openNewCardModal(status) {
   document.getElementById('cardPriority').value = 'normal'
   document.getElementById('cardProject').value = ''
   document.getElementById('cardDue').value = ''
+  document.getElementById('cardStart').value = ''
   document.getElementById('cardEditId').value = ''
   document.getElementById('cardEditStatus').value = status || 'planned'
   populateAssigneeSelect('cardAssignee')
@@ -2037,6 +2107,9 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
     project: document.getElementById('cardProject').value.trim() || null,
     due_date: document.getElementById('cardDue').value
       ? Math.floor(new Date(document.getElementById('cardDue').value).getTime() / 1000)
+      : null,
+    start_date: document.getElementById('cardStart').value
+      ? Math.floor(new Date(document.getElementById('cardStart').value).getTime() / 1000)
       : null,
   }
 
@@ -2172,6 +2245,58 @@ async function renderCardLabelsSection(card) {
 // Renders both directions from one GET: what this card waits on, and what waits
 // on it. The reverse list is read-only on purpose -- a block is removed from the
 // card that carries it, so there is exactly one place to clear each link.
+// Card 0f21864e (#568): the assignee's token use while this card was
+// in_progress. The number is an upper bound when the agent had other cards
+// in_progress at the same time, and the text says so instead of splitting it.
+function formatTokenCount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k'
+  return String(n)
+}
+
+async function renderCardTokensSection(card) {
+  const box = document.getElementById('cardDetailTokens')
+  const body = document.getElementById('cardDetailTokensBody')
+  if (!box || !body) return
+  box.hidden = true
+  body.textContent = ''
+  let data
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/tokens`)
+    if (!r.ok) return
+    data = await r.json()
+  } catch { return }
+  if (!data || !data.agent || !Array.isArray(data.windows) || data.windows.length === 0) return
+  const lines = []
+  if (data.totalCalls === 0) {
+    lines.push(t('kanban.tokens.none'))
+  } else {
+    // Cache reads dominate the raw sum (96-98% on 4 live cards), so the
+    // headline names the three kinds instead of one big number.
+    lines.push(t('kanban.tokens.total', {
+      output: formatTokenCount(data.outputTokens),
+      fresh: formatTokenCount(data.freshInputTokens),
+      cached: formatTokenCount(data.cacheReadTokens),
+      calls: data.totalCalls,
+    }))
+    for (const m of data.perModel) {
+      lines.push(`${m.model || '?'}: ${t('kanban.tokens.model_line', { output: formatTokenCount(m.outputTokens), calls: m.calls })}`)
+    }
+  }
+  if (data.overlappingCards > 0) lines.push(t('kanban.tokens.overlap', { n: data.overlappingCards }))
+  const lastTo = data.windows[data.windows.length - 1].to
+  if (data.dataUntil && data.dataUntil < lastTo) {
+    lines.push(t('kanban.tokens.data_until', { time: new Date(data.dataUntil * 1000).toLocaleString() }))
+  }
+  for (const line of lines) {
+    const div = document.createElement('div')
+    div.textContent = line
+    body.appendChild(div)
+  }
+  box.title = t('kanban.tokens.tooltip', { agent: data.agent })
+  box.hidden = false
+}
+
 async function renderCardBlockersSection(card) {
   const listEl = document.getElementById('cardBlockerList')
   const addSelect = document.getElementById('cardBlockerAdd')
@@ -2338,6 +2463,10 @@ async function showCardDetail(card) {
       <span class="meta-value">${card.project ? escapeHtml(card.project) : t('kanban.meta.none')}</span>
     </div>
     <div class="meta-item">
+      <span class="meta-label">${t('kanban.meta.start')}</span>
+      <span class="meta-value">${card.start_date ? new Date(card.start_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
+    </div>
+    <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.deadline')}</span>
       <span class="meta-value">${card.due_date ? new Date(card.due_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
     </div>
@@ -2459,6 +2588,7 @@ async function showCardDetail(card) {
 
   renderCardLabelsSection(card)
   renderCardBlockersSection(card)
+  renderCardTokensSection(card)
 
   // #115: Parent meta row — dropdown replaces the old read-only display; shown only when editable
   const parentMetaItem = document.getElementById('parentMetaItem')
@@ -2562,6 +2692,9 @@ async function showCardDetail(card) {
     document.getElementById('cardProject').value = card.project || ''
     document.getElementById('cardDue').value = card.due_date
       ? new Date(card.due_date * 1000).toISOString().split('T')[0]
+      : ''
+    document.getElementById('cardStart').value = card.start_date
+      ? new Date(card.start_date * 1000).toISOString().split('T')[0]
       : ''
     document.getElementById('cardEditId').value = card.id
     document.getElementById('cardEditStatus').value = card.status
@@ -5204,13 +5337,15 @@ document.getElementById('saveIdleFlushBtn').addEventListener('click', async () =
   // Like auto-restart, this applies to the main session too, so role === 'main'
   // is NOT skipped. The context-guard store is keyed by the same id.
   const id = currentAgent.autoRestartId || currentAgent.name
-  // Send the WHOLE config, not just the three idle fields. The endpoint
-  // normalizes the body into a complete config, so a fragment would silently
-  // reset actPct/hardPct/saturationRestart/enabled to their defaults -- saving
-  // an idle-flush preference would disarm the wedge tiers on an agent that had
-  // them on. Re-read rather than trusting the cached detail: not every path
-  // that opens this pane populates contextGuard, and an empty object here is
-  // indistinguishable from a genuinely default config.
+  // Send the WHOLE config, not just the three idle fields. The endpoint used
+  // to REPLACE the stored row with the normalized body, so a fragment reset
+  // actPct/hardPct/saturationRestart/enabled to their defaults -- saving an
+  // idle-flush preference disarmed the wedge tiers on an agent that had them
+  // on. It merges now (mergeContextGuardConfig); the full body stays because
+  // it is correct under both behaviours. Re-read rather than trusting the
+  // cached detail: not every path that opens this pane populates
+  // contextGuard, and an empty object here is indistinguishable from a
+  // genuinely default config.
   let current = {}
   try {
     const cur = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`)
@@ -15269,6 +15404,7 @@ async function loadSettings() {
       for (const def of defs) {
         group.appendChild(buildSettingRow(def))
       }
+      buildSettingsGroupReset(group)
       panel.appendChild(group)
       tabPanels.appendChild(panel)
     }
@@ -15302,6 +15438,7 @@ async function loadSettings() {
         for (const def of securityDefs) {
           group.appendChild(buildSettingRow(def))
         }
+        buildSettingsGroupReset(group)
         panel.appendChild(group)
       }
       tabPanels.appendChild(panel)
@@ -15383,6 +15520,7 @@ async function loadSettings() {
         for (const def of claudePlansDefs) {
           group.appendChild(buildSettingRow(def))
         }
+        buildSettingsGroupReset(group)
         panel.appendChild(group)
       }
 
@@ -16144,6 +16282,7 @@ function buildSettingRow(def) {
   }
   if (def.type === 'color') metaParts.push(t('settings.meta.format') + ': #rrggbb')
   metaParts.push(t('settings.meta.default') + ': ' + def.default)
+  if (def.source === 'override') metaParts.push(t('settings.meta.overridden'))
   meta.textContent = metaParts.join(' · ')
   info.appendChild(meta)
 
@@ -16199,8 +16338,221 @@ function buildSettingRow(def) {
   valueInput.addEventListener('input', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
   valueInput.addEventListener('change', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
 
+  // A value saved from this page is an override (config-overrides.json), and
+  // until now it could only be replaced, never removed. The button drops the
+  // override; the row is rebuilt from the answer so the input, the dirty
+  // tracking and the button itself all reflect the layer that answers now.
+  if (def.source === 'override') {
+    const resetBtn = document.createElement('button')
+    resetBtn.type = 'button'
+    resetBtn.className = 'btn-secondary btn-compact settings-reset-default-btn'
+    resetBtn.textContent = t('settings.btn.reset_default')
+    const preview = settingResetPreview(def)
+    resetBtn.title = t('settings.btn.reset_default_title') + ' ' + formatSettingValue(preview.from) + ' \u2192 ' + formatSettingValue(preview.to) + ' (' + preview.source + ')'
+    resetBtn.addEventListener('click', () => resetSettingToDefault(def, row, resetBtn, errorEl))
+    editor.insertBefore(resetBtn, errorEl)
+  }
+
+  row._settingDef = def
   row.appendChild(editor)
   return row
+}
+
+// Removes one saved override and rebuilds its row from the answer. Shared by
+// the row button and the per-tab button; reports instead of toasting so the
+// caller decides what to tell the operator.
+async function removeSettingOverride(row) {
+  const def = row._settingDef
+  const errorEl = row.querySelector('.settings-row-error')
+  if (errorEl) errorEl.textContent = ''
+  try {
+    const res = await fetch('/api/settings/' + encodeURIComponent(def.key), { method: 'DELETE' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (errorEl) errorEl.textContent = data.error || 'Hiba'
+      return { ok: false }
+    }
+    settingsDirty.delete(def.key)
+    row.replaceWith(buildSettingRow({ ...def, value: data.value, source: data.source, resetValue: data.value, resetSource: data.source }))
+    return { ok: true, source: data.source, requiresRestart: !!data.requiresRestart }
+  } catch {
+    if (errorEl) errorEl.textContent = 'Kapcsolati hiba'
+    return { ok: false }
+  }
+}
+
+async function resetSettingToDefault(def, row, btn, errorEl) {
+  // One row is confirmed the same way as a tab: the button used to reset at
+  // once, and the first sign of a wrong click could be a notification on the
+  // wrong channel.
+  if (!(await confirmSettingsReset([settingResetPreview(def)]))) return
+  btn.disabled = true
+  const group = row.closest('.settings-group')
+  const result = await removeSettingOverride(row)
+  if (!result.ok) {
+    btn.disabled = false
+    return
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  const base = result.source === 'env' ? t('settings.toast.reset_env') : t('settings.toast.reset_default')
+  showToast(result.requiresRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+}
+
+// One button per tab: every overridden row of this group back to its default.
+// It changes several values at once, so it is confirmed, and the question
+// lists the keys -- the operator approves a named set, not "everything here".
+function overriddenSettingRows(group) {
+  return [...group.querySelectorAll('.settings-row')].filter((r) => r._settingDef && r._settingDef.source === 'override')
+}
+
+function buildSettingsGroupReset(group) {
+  const bar = document.createElement('div')
+  bar.className = 'settings-group-actions'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'btn-secondary btn-compact settings-reset-tab-btn'
+  btn.addEventListener('click', () => resetSettingsGroupToDefault(group))
+  bar.appendChild(btn)
+  group.prepend(bar)
+  refreshSettingsGroupReset(group)
+}
+
+function refreshSettingsGroupReset(group) {
+  const btn = group ? group.querySelector('.settings-reset-tab-btn') : null
+  if (!btn) return
+  const count = overriddenSettingRows(group).length
+  btn.disabled = count === 0
+  btn.textContent = count === 0 ? t('settings.btn.reset_tab') : t('settings.btn.reset_tab') + ' (' + count + ')'
+  btn.title = count === 0 ? t('settings.btn.reset_tab_none') : t('settings.btn.reset_tab_title')
+}
+
+// What a row turns into when its override is removed, as the page knows it
+// from GET /api/settings: the value that answers without the override, and the
+// layer it comes from (.env or the registry default).
+function settingResetPreview(def) {
+  return {
+    key: def.key,
+    from: String(def.value),
+    to: String(def.resetValue !== undefined ? def.resetValue : def.default),
+    source: def.resetSource === 'env' ? t('settings.source.env') : t('settings.source.default'),
+    requiresRestart: !!def.requiresRestart,
+  }
+}
+
+function formatSettingValue(value) {
+  return value === '' ? t('settings.value.empty') : value
+}
+
+// The confirmation for a reset, per row and per tab, in the app's own modal
+// (the native confirm() carries the host name as its title and cannot show a
+// list as a list). An override is often a deliberate choice, and removing one
+// can switch a safety setting back (notifications on again, isolation off), so
+// the dialog shows for every key what the value is now, what it becomes and
+// where that comes from -- the owner approves a change, not a list of names.
+// Resolves true only on the explicit confirm button; Escape, the close button,
+// the backdrop and Cancel all resolve false, and Cancel has the focus, so
+// Enter on a freshly opened dialog changes nothing.
+function confirmSettingsReset(items) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay active'
+    overlay.setAttribute('role', 'dialog')
+    overlay.setAttribute('aria-modal', 'true')
+
+    const modal = document.createElement('div')
+    modal.className = 'modal modal-wide'
+
+    const header = document.createElement('div')
+    header.className = 'modal-header'
+    const title = document.createElement('h2')
+    title.textContent = t('settings.confirm.reset_tab_title')
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'modal-close'
+    closeBtn.textContent = '\u00d7'
+    header.append(title, closeBtn)
+
+    const body = document.createElement('div')
+    body.className = 'modal-body settings-reset-confirm'
+    const message = document.createElement('p')
+    message.textContent = t('settings.confirm.reset_tab')
+    const list = document.createElement('ul')
+    list.className = 'settings-reset-confirm-keys'
+    for (const item of items) {
+      const li = document.createElement('li')
+      const key = document.createElement('span')
+      key.className = 'settings-reset-confirm-key'
+      key.textContent = item.key
+      const change = document.createElement('span')
+      change.className = 'settings-reset-confirm-change'
+      change.textContent = formatSettingValue(item.from) + ' \u2192 ' + formatSettingValue(item.to) + ' (' + item.source + ')'
+      li.append(key, change)
+      if (item.requiresRestart) {
+        const restart = document.createElement('span')
+        restart.className = 'settings-restart-badge'
+        restart.textContent = t('settings.restart_badge')
+        li.appendChild(restart)
+      }
+      list.appendChild(li)
+    }
+    const actions = document.createElement('div')
+    actions.className = 'settings-reset-confirm-actions'
+    const cancelBtn = document.createElement('button')
+    cancelBtn.type = 'button'
+    cancelBtn.className = 'btn-secondary'
+    cancelBtn.textContent = t('common.cancel')
+    const okBtn = document.createElement('button')
+    okBtn.type = 'button'
+    okBtn.className = 'btn-primary'
+    okBtn.textContent = t('settings.confirm.reset_tab_ok')
+    actions.append(cancelBtn, okBtn)
+    body.append(message, list, actions)
+
+    modal.append(header, body)
+    overlay.appendChild(modal)
+
+    const finish = (answer) => {
+      document.removeEventListener('keydown', onKey)
+      overlay.remove()
+      resolve(answer)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') finish(false) }
+    document.addEventListener('keydown', onKey)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(false) })
+    closeBtn.addEventListener('click', () => finish(false))
+    cancelBtn.addEventListener('click', () => finish(false))
+    okBtn.addEventListener('click', () => finish(true))
+
+    document.body.appendChild(overlay)
+    cancelBtn.focus()
+  })
+}
+
+async function resetSettingsGroupToDefault(group) {
+  const rows = overriddenSettingRows(group)
+  if (rows.length === 0) return
+  if (!(await confirmSettingsReset(rows.map((r) => settingResetPreview(r._settingDef))))) return
+
+  const btn = group.querySelector('.settings-reset-tab-btn')
+  if (btn) btn.disabled = true
+  let failed = 0
+  let needsRestart = false
+  for (const row of rows) {
+    const result = await removeSettingOverride(row)
+    if (!result.ok) failed++
+    else if (result.requiresRestart) needsRestart = true
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  if (failed) {
+    showToast(t('settings.toast.reset_tab_partial'), 6000)
+  } else {
+    const base = t('settings.toast.reset_tab')
+    showToast(needsRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+  }
 }
 
 async function saveAllSettings() {
@@ -16227,6 +16579,14 @@ async function saveAllSettings() {
       } else {
         input.dataset.originalValue = String(raw)
         if (data.requiresRestart) needsRestart = true
+        // The saved value is an override now: rebuild the row so it offers
+        // "reset to default" without a page reload.
+        const savedRow = input.closest('.settings-row')
+        if (savedRow && savedRow._settingDef) {
+          const rebuilt = buildSettingRow({ ...savedRow._settingDef, value: data.value ?? raw, source: 'override' })
+          savedRow.replaceWith(rebuilt)
+          refreshSettingsGroupReset(rebuilt.closest('.settings-group'))
+        }
       }
     } catch {
       errorEl.textContent = 'Kapcsolati hiba'
@@ -17409,6 +17769,169 @@ let ideaScope = (() => {
 })()
 const STATUS_COLORS = { new: 'var(--accent)', reviewed: '#f59e0b', kanban: '#22c55e', rejected: '#ef4444' }
 const STATUS_LABELS = { new: () => t('ideas.status.new'), reviewed: () => t('ideas.status.reviewed'), kanban: () => t('ideas.status.kanban'), rejected: () => t('ideas.status.rejected') }
+
+// ============================================================
+// === Team notes ("Jegyzetek") ===
+// ============================================================
+// The team's small follow-ups, kept off the kanban board. Rows come from
+// /api/notes (active, sorted by due date) and ?include_deleted=1 for the
+// last-7-days deleted section. Deletion is soft on the server.
+
+let notesAssigneesLoaded = false
+
+function notesLocalToday() {
+  // The viewer's local date (the browser's timezone), not UTC.
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function notesFmtTs(unix) {
+  if (!unix) return ''
+  const locale = (window._lang || 'hu') === 'en' ? 'en-GB' : 'hu-HU'
+  return new Date(unix * 1000).toLocaleString(locale, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function notesAssigneeLabel(name) {
+  if (name === 'mindenki') return t('notes.assignee.mindenki')
+  if (name === 'gazda') return t('notes.assignee.gazda')
+  return name
+}
+
+async function loadNotesAssignees() {
+  const sel = document.getElementById('notesAssignee')
+  if (!sel) return
+  let names = []
+  let loaded = false
+  try {
+    const r = await fetch('/api/agents')
+    if (r.ok) {
+      const list = await r.json()
+      if (Array.isArray(list)) { names = list.map((a) => a && a.name).filter(Boolean); loaded = true }
+    }
+  } catch { /* the fixed entries below are enough to keep the form usable */ }
+  // Stored assignees are lower-case (the server lower-cases them too).
+  const main = mainAgentId().toLowerCase()
+  const fixed = ['mindenki', 'gazda', main]
+  const all = [...fixed, ...[...new Set(names.map((n) => String(n).toLowerCase()))].filter((n) => !fixed.includes(n)).sort()]
+  const prev = sel.value
+  sel.innerHTML = all.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(notesAssigneeLabel(n))}</option>`).join('')
+  if (prev && all.includes(prev)) sel.value = prev
+  // Only a real agent list counts as loaded: after a failed request the next
+  // visit tries again instead of keeping the fallback list for the session.
+  notesAssigneesLoaded = loaded
+}
+
+async function loadNotesPage() {
+  // The author (kanbanMoveActor) and the assignee list (mainAgentId) both read
+  // window._marveen, which only some pages fill: resolve it first, or a
+  // token-authenticated first add/delete goes out without a name and gets a 400.
+  await ensureMarveenLoaded()
+  wireNotesPage()
+  if (!notesAssigneesLoaded) loadNotesAssignees()
+  // A language switch since the options were drawn: relabel them in place.
+  document.querySelectorAll('#notesAssignee option').forEach((o) => { o.textContent = notesAssigneeLabel(o.value) })
+  const tbody = document.getElementById('notesTbody')
+  const delTbody = document.getElementById('notesDeletedTbody')
+  let rows = []
+  try {
+    const r = await fetch('/api/notes?include_deleted=1')
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    rows = await r.json()
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.load_error', { msg: String(err.message || err) }))}</td></tr>`
+    return
+  }
+  const active = rows.filter((n) => n.deleted_at == null)
+  const deleted = rows.filter((n) => n.deleted_at != null).sort((a, b) => b.deleted_at - a.deleted_at)
+  const today = notesLocalToday()
+
+  if (tbody) {
+    tbody.innerHTML = active.length ? active.map((n) => {
+      const overdue = n.due_date && n.due_date < today
+      const dueToday = n.due_date === today
+      const cls = overdue ? 'notes-row-overdue' : dueToday ? 'notes-row-today' : ''
+      const dueLabel = n.due_date
+        ? escapeHtml(n.due_date) + (overdue ? ` <span class="notes-due-tag">${escapeHtml(t('notes.overdue'))}</span>` : dueToday ? ` <span class="notes-due-tag">${escapeHtml(t('notes.today'))}</span>` : '')
+        : '<span class="notes-muted">-</span>'
+      return `<tr class="${cls}">
+        <td data-label="${escapeHtml(t('notes.col.assignee'))}" class="notes-assignee">${escapeHtml(notesAssigneeLabel(n.assignee))}</td>
+        <td data-label="${escapeHtml(t('notes.col.content'))}" class="notes-content">${escapeHtml(n.content)}</td>
+        <td data-label="${escapeHtml(t('notes.col.created'))}" class="notes-muted">${escapeHtml(notesFmtTs(n.created_at))} · ${escapeHtml(n.created_by)}</td>
+        <td data-label="${escapeHtml(t('notes.col.due'))}">${dueLabel}</td>
+        <td class="notes-actions"><button class="btn-secondary btn-compact" data-note-done="${escapeHtml(n.id)}">${escapeHtml(t('notes.btn.done'))}</button></td>
+      </tr>`
+    }).join('') : `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.empty'))}</td></tr>`
+  }
+
+  if (delTbody) {
+    delTbody.innerHTML = deleted.length ? deleted.map((n) => `<tr>
+        <td data-label="${escapeHtml(t('notes.col.assignee'))}">${escapeHtml(notesAssigneeLabel(n.assignee))}</td>
+        <td data-label="${escapeHtml(t('notes.col.content'))}" class="notes-content">${escapeHtml(n.content)}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_when'))}" class="notes-muted">${escapeHtml(notesFmtTs(n.deleted_at))}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_by'))}">${escapeHtml(n.deleted_by || '')}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_reason'))}" class="notes-muted">${escapeHtml(n.delete_reason || '-')}</td>
+      </tr>`).join('') : `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.deleted.empty'))}</td></tr>`
+  }
+  const summary = document.querySelector('#notesDeleted > summary')
+  if (summary) summary.textContent = t('notes.deleted.title_n', { n: deleted.length })
+}
+
+let notesPageWired = false
+function wireNotesPage() {
+  if (notesPageWired) return
+  notesPageWired = true
+  document.getElementById('notesForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const assignee = document.getElementById('notesAssignee')?.value || ''
+    const contentEl = document.getElementById('notesContent')
+    const dueEl = document.getElementById('notesDue')
+    const content = (contentEl?.value || '').trim()
+    if (!content) { contentEl?.focus(); return }
+    await ensureMarveenLoaded()
+    // The author is the owner from the page config, as for the board's moves
+    // (kanbanMoveActor). A login session or device key overrides it on the
+    // server with the name of whoever is actually signed in.
+    const body = { assignee, content, created_by: kanbanMoveActor() }
+    if (dueEl?.value) body.due_date = dueEl.value
+    const btn = document.getElementById('notesAddBtn')
+    if (btn) btn.disabled = true
+    try {
+      const r = await fetch('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      if (contentEl) contentEl.value = ''
+      if (dueEl) dueEl.value = ''
+      showToast(t('notes.toast.added'))
+      loadNotesPage()
+    } catch (err) {
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+    } finally {
+      if (btn) btn.disabled = false
+    }
+  })
+  document.getElementById('notesTbody')?.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-note-done]')
+    if (!btn) return
+    const reason = window.prompt(t('notes.prompt.reason'), '')
+    if (reason === null) return // cancelled
+    btn.disabled = true
+    await ensureMarveenLoaded()
+    try {
+      const r = await fetch(`/api/notes/${encodeURIComponent(btn.dataset.noteDone)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ by: kanbanMoveActor(), reason: reason.trim() || null }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      showToast(t('notes.toast.deleted'))
+      loadNotesPage()
+    } catch (err) {
+      btn.disabled = false
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+    }
+  })
+}
 
 async function loadIdeasPage() {
   const statusFilter = document.getElementById('ideaStatusFilter')?.value ?? 'active'
@@ -19249,7 +19772,7 @@ async function openResearchDoc(agent, name) {
 
     // Exclude cards whose entire bar lies outside the window
     cards = cards.filter(c => {
-      const barStart = c.created_at ? c.created_at * 1000 : rangeStart.getTime()
+      const barStart = c.start_date ? c.start_date * 1000 : c.created_at ? c.created_at * 1000 : rangeStart.getTime()
       const barEnd   = c.due_date * 1000
       return barEnd >= rangeStart && barStart <= rangeEnd
     })
@@ -19312,7 +19835,7 @@ async function openResearchDoc(agent, name) {
 
       // Card rows
       for (const card of projCards) {
-        const barStartMs = card.created_at ? card.created_at * 1000 : rangeStart.getTime()
+        const barStartMs = card.start_date ? card.start_date * 1000 : card.created_at ? card.created_at * 1000 : rangeStart.getTime()
         const barEndMs   = card.due_date * 1000
         const isOverdue  = card.status !== 'done' && barEndMs < nowMs
 

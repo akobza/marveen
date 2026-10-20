@@ -14,7 +14,9 @@ Nothing at all ran on the main agent's own sends -- and the main agent is the on
 that actually writes to customers.
 
 What it checks, all three from standing owner rules in CLAUDE.md:
-  1. Hungarian text that is missing its accents (the incident above).
+  1. Hungarian text that is missing its accents (the incident above). Known limit (KAPUES1018): a text with fewer
+     than 3 distinct HU markers can pass with an accentless 'es'; see the KNOWN LIMIT comment above
+     AMBIGUOUS_TRIGGER.
   2. Em dash (U+2014) -- forbidden in every deliverable.
   3. Owner-specific NAME rules (misspelled surnames etc.) -- loaded from an
      untracked local rules file (GATEPERSIST816), never hardcoded here.
@@ -385,7 +387,8 @@ def _segment_is_send(toks, depth: int) -> bool:
 # SUBAGENTMAILGATE1016: the sender was recognised only with the script as the
 # FIRST interpreter argument and the exact --to flag. The boundary and the
 # measured bypasses are written out at pythonHeadSends in email-send-gate.mjs
-# (the JS twin); send-invocation-cases.json binds the two.
+# (the JS twin); send-invocation-cases.json binds the two. MAILGATEVARARGS1020
+# narrowed the undecidable-path branch to the recipient flag (same place).
 _PY_OPT_WITH_ARG = {"-X", "-W", "--check-hash-based-pycs"}
 _RECIPIENT_FLAG = re.compile(r"^--to?(=|$)")
 _UNDECIDABLE_PATH = re.compile(r"[*?[{$]")
@@ -485,7 +488,7 @@ def _python_head_sends(rest) -> bool:
     if script is not None and _SENDPY.match(_basename(script)):
         return recipient
     if script is not None and _UNDECIDABLE_PATH.search(script):
-        return recipient or any(t != script and "$" in t for t in rest)
+        return recipient  # MAILGATEVARARGS1020
     if stdin or (script is None and stdin_redirect):
         return recipient
     return False
@@ -774,6 +777,149 @@ ACCENTLESS = {
     "kezzel": "kézzel", "peldaul": "például", "izolalt": "izolált",
     "kozben": "közben", "udvozlettel": "üdvözlettel", "oket": "őket",
     "afa": "áfa", "allapot": "állapot", "all": "áll",
+    # EKEZET1018 (2026-10-18): +476 entries. The candidates are accented word forms collected from a live
+    # install's own correctly accented Hungarian customer-facing copy (web pages, ad and post texts), after
+    # stripping code, paths and hyphenated identifiers. The trigger: short accentless messages ('unnepek', 'lakas',
+    # 'haloszoba', 'padlofutes', 'kulcsszef') went through the gate. Each key went through the filters below and a
+    # manual review (three review rounds). LEFT OUT, with the reason:
+    #   automatically: accentless forms of <= 3 letters (meg, kor, kod, var, fel, jo, mar, ...: too many homonyms),
+    #   forms that are also words in correctly accented Hungarian prose (helyen), English words (panorama), and
+    #   everything that was already in the dictionary;
+    #   by manual judgement, because the accentless form is ANOTHER real Hungarian word: mert, mertek, mertem,
+    #   merve, merne, merni, meri (merni = 'dare'), akar, kapna, kapcsolhatok, agyak, aggyal, varja, fele, teli,
+    #   termek, hajra, deli, tora, futott (fut), mentes ('free of'), tartalmat (accusative of tartalom, the same
+    #   class as 'levelet'), tartsatok (imperative), tarolunk (tarol is a verb), and instrumental -nal/-nel forms
+    #   of place names; frequent English / international forms: dont, fore, datum, foto, hatter; proper names and
+    #   place names in general (this dictionary holds no proper names).
+    # Where the accentless form can stand for two correct forms, both are suggested (kornyeken, szoveget, ertek,
+    # meglevo, szallashelyen, ...), and where the spelling rules require two words, that form is named first
+    # (ujepitesu -> 'új építésű', nyitvatartast -> 'nyitva tartást'; AkH12).
+    "ablakaba": "ablakába", "adataibol": "adataiból", "adatfeldolgozokent": "adatfeldolgozóként",
+    "adatkezelesi": "adatkezelési", "adatkezelo": "adatkezelő", "adatkezeloje": "adatkezelője",
+    "adatvedelmi": "adatvédelmi", "adozasi": "adózási", "ajanlat": "ajánlat",
+    "ajanlatot": "ajánlatot", "alakjaban": "alakjában", "alapjan": "alapján", "alapveto": "alapvető",
+    "allitas": "állítás", "allitashoz": "állításhoz", "allithatjatok": "állíthatjátok", "allithato": "állítható",
+    "alvohely": "alvóhely", "alvohelyet": "alvóhelyet / alvóhelyét", "apartmantol": "apartmantól", "atjon": "átjön",
+    "atment": "átment", "atnezve": "átnézve", "atutalas": "átutalás", "autoval": "autóval", "bajtokra": "bájtokra",
+    "bajtra": "bájtra", "bankkartya": "bankkártya",
+    "bankkartyas": "bankkártyás", "barki": "bárki", "barmikor": "bármikor", "beallitasok": "beállítások",
+    "beallitasokban": "beállításokban", "bejutas": "bejutás", "belul": "belül", "berelt": "bérelt", "betu": "betű",
+    "beture": "betűre", "bongeszod": "böngésződ", "bonthato": "bontható", "borvidek": "borvidék",
+    "bringaut": "bringaút", "bringaval": "bringával", "cellaba": "cellába", "cimben": "címben",
+    "csaladoknak": "családoknak", "csuszda": "csúszda", "datuma": "dátuma", "datumkorlat": "dátumkorlát",
+    "datumok": "dátumok", "datumos": "dátumos", "datumot": "dátumot", "datumsor": "dátumsor",
+    "dobozaban": "dobozában", "dohanyzas": "dohányzás", "dontese": "döntése", "dontesi": "döntési", "donto": "döntő",
+    "edeny": "edény", "egesz": "egész", "egeszeben": "egészében", "egyeb": "egyéb", "egyesevel": "egyesével",
+    "egyezest": "egyezést", "egymas": "egymás", "ejes": "éjes", "ejjel": "éjjel", "ejre": "éjre",
+    "ejszaka": "éjszaka", "ejszam": "éjszám", "ejszamot": "éjszámot", "ekezet": "ékezet", "ekezetet": "ékezetet / ékezetét",
+    "ekezettel": "ékezettel", "elemzese": "elemzése", "elemzesehez": "elemzéséhez", "elerhetoseg": "elérhetőség",
+    "elerhetosegek": "elérhetőségek", "elirtuk": "elírtuk", "elkepzelheto": "elképzelhető",
+    "ellenorizheted": "ellenőrizheted", "ellenorizve": "ellenőrizve", "ellenorzesek": "ellenőrzések",
+    "elmeny": "élmény", "elobb": "előbb", "eloirasoknak": "előírásoknak", "elotte": "előtte", "elotti": "előtti",
+    "elsodleges": "elsődleges", "elteres": "eltérés", "elutasitana": "elutasítana", "elutasitasi": "elutasítási",
+    "epitesu": "építésű", "erdekeben": "érdekében", "erheto": "érhető", "erhetok": "érhetők", "erkezes": "érkezés",
+    "erkezessel": "érkezéssel", "erkezik": "érkezik", "ertek": "érték / értek", "ertekeles": "értékelés",
+    "ertekelesek": "értékelések", "eszkozt": "eszközt", "eszkozzel": "eszközzel", "etterem": "étterem",
+    "ettol": "ettől", "evszakban": "évszakban", "felbontason": "felbontáson", "felhasznaloi": "felhasználói",
+    "felnott": "felnőtt", "feltetelek": "feltételek", "felugyeletevel": "felügyeletével", "felul": "felül",
+    "fizetes": "fizetés", "foglalas": "foglalás", "foglalasi": "foglalási", "foglalaskezeles": "foglaláskezelés",
+    "foglalasnal": "foglalásnál", "foglalasra": "foglalásra", "foglalast": "foglalást", "foglalhato": "foglalható",
+    "foglalo": "foglaló", "foglaloig": "foglalóig", "foldszint": "földszint", "foldszinti": "földszinti",
+    "fooldal": "főoldal", "fooldalon": "főoldalon", "fooldalra": "főoldalra", "formatumban": "formátumban",
+    "forras": "forrás", "forrashoz": "forráshoz", "forrasukhoz": "forrásukhoz", "foszezonban": "főszezonban",
+    "fozolap": "főzőlap", "furdoszoba": "fürdőszoba", "futheto": "fűthető", "fuves": "füves", "graphbol": "graphból",
+    "grillezo": "grillező", "grillezohely": "grillezőhely", "gyujtott": "gyűjtött / gyújtott", "hajszarito": "hajszárító",
+    "haloban": "hálóban", "haloszoba": "hálószoba", "haloszobaban": "hálószobában", "haloszobaszam": "hálószobaszám",
+    "haloszobaval": "hálószobával", "halozat": "hálózat", "hany": "hány", "harmas": "hármas", "hasznal": "használ",
+    "hasznalhatjatok": "használhatjátok", "hasznalhatnak": "használhatnak", "hasznalhattok": "használhattok",
+    "hasznaljak": "használják / használjak", "hasznaljuk": "használjuk", "hasznalt": "használt",
+    "hasznalunk": "használunk", "hatalyos": "hatályos", "hatosag": "hatóság", "hazadat": "házadat / hazádat",
+    "helyiseget": "helyiséget / helyiségét", "hetvege": "hétvége", "hetvegek": "hétvégék", "hetvegen": "hétvégén",
+    "hetvegere": "hétvégére", "hirdetesbol": "hirdetésből", "hirdetesek": "hirdetések", "hirdetesen": "hirdetésen / hirdetésén",
+    "hirdetesszovege": "hirdetésszövege", "hofok": "hőfok", "hofokot": "hőfokot", "homerseklet": "hőmérséklet",
+    "homokozo": "homokozó", "honapig": "hónapig", "hoszivattyus": "hőszivattyús", "hoterkepek": "hőtérképek",
+    "hozzajarul": "hozzájárul", "hozzajarulasat": "hozzájárulását", "hutes": "hűtés", "hutest": "hűtést",
+    "hutheto": "hűthető", "idejeig": "idejéig", "idopontot": "időpontot", "iger": "ígér", "inditasa": "indítása",
+    "indulas": "indulás", "informaciok": "információk", "informacioszabadsag": "információszabadság",
+    "irhato": "írható", "irjon": "írjon", "irjuk": "írjuk", "jatszoter": "játszótér", "jatszoteret": "játszóteret / játszóterét",
+    "jogszabalyi": "jogszabályi", "jogszabalyoknak": "jogszabályoknak", "jonnel": "jönnél",
+    "jovahagyas": "jóváhagyás", "jovahagyott": "jóváhagyott", "jutast": "jutást", "kanape": "kanapé",
+    "kanapeagy": "kanapéágy", "karacsony": "karácsony", "kartya": "kártya", "kattintassal": "kattintással",
+    "kauciot": "kauciót", "kavefozo": "kávéfőző", "kedvezmeny": "kedvezmény", "kenyelmes": "kényelmes",
+    "kepek": "képek", "kepen": "képen / képén", "kepernyo": "képernyő", "kepernyoje": "képernyője", "kepre": "képre",
+    "kerdesekkel": "kérdésekkel", "kerekparokat": "kerékpárokat", "kerekpartarolo": "kerékpártároló",
+    "kerekpartaroloban": "kerékpártárolóban", "keri": "kéri", "kertjeben": "kertjében", "kertjet": "kertjét",
+    "kerul": "kerül", "kerunk": "kérünk", "kezeleseben": "kezelésében", "kezeljuk": "kezeljük",
+    "kihuzhato": "kihúzható", "kikotoi": "kikötői", "kilato": "kilátó", "kitetel": "kitétel", "kivul": "kívül",
+    "kockazatos": "kockázatos", "koddal": "kóddal", "kodjai": "kódjai", "kodot": "kódot / ködöt", "koncepcio": "koncepció",
+    "konyhakep": "konyhakép", "konyhas": "konyhás", "konyhaval": "konyhával", "korbekeritve": "körbekerítve",
+    "korben": "körben", "korbol": "körből / korból", "korfajl": "körfájl", "korfajlba": "körfájlba",
+    "kornyeken": "környéken / környékén", "kornyezetben": "környezetben", "korul": "körül",
+    "kotelezettseg": "kötelezettség", "kotelezo": "kötelező", "kotheto": "köthető", "kovess": "kövess",
+    "kozel": "közel", "kozelben": "közelben", "kozelgo": "közelgő", "kozeli": "közeli",
+    "kozremukodik": "közreműködik", "koztarsasag": "köztársaság", "kozti": "közti", "kozvetlen": "közvetlen",
+    "kreativok": "kreatívok", "kulcsszeffel": "kulcsszéffel", "kulonallo": "különálló", "kulonben": "különben",
+    "lakas": "lakás", "lakasban": "lakásban", "lakashoz": "lakáshoz", "lakassal": "lakással", "lakasunk": "lakásunk",
+    "lakhatasi": "lakhatási", "lassuk": "lássuk", "latjuk": "látjuk", "latogato": "látogató",
+    "latogatok": "látogatók / látogatok", "latogatottsag": "látogatottság", "latogatottsagot": "látogatottságot",
+    "legkondicionalt": "légkondicionált", "legrovidebb": "legrövidebb", "leiras": "leírás", "leirast": "leírást",
+    "lejar": "lejár", "lemondas": "lemondás", "lemondasi": "lemondási",
+    "letszam": "létszám", "levo": "lévő / levő", "listaja": "listája", "listajahoz": "listájához", "majustol": "májustól",
+    "masodik": "második", "masodperces": "másodperces", "medencek": "medencék", "medencet": "medencét",
+    "megallitja": "megállítja", "megerkezhettek": "megérkezhettek", "megfelelo": "megfelelő",
+    "megfeleloen": "megfelelően", "megfigyeles": "megfigyelés", "megis": "mégis",
+    "megjelenitesehez": "megjelenítéséhez", "megkeresheto": "megkereshető", "megkulonbozteto": "megkülönböztető",
+    "meglevo": "meglévő / meglevő", "megnezve": "megnézve", "megnyitasa": "megnyitása", "megtalalhato": "megtalálható",
+    "megtekinteseig": "megtekintéséig", "mentese": "mentése", "meretu": "méretű", "merhetoseg": "mérhetőség",
+    "merjuk": "mérjük / merjük", "mezoje": "mezője", "mikrohullamu": "mikrohullámú", "mindharom": "mindhárom",
+    "mindkettoben": "mindkettőben", "molo": "móló", "mosogatogep": "mosogatógép", "mosogep": "mosógép",
+    "mosogeppel": "mosógéppel", "mukodesehez": "működéséhez", "munkaterulet": "munkaterület", "mutans": "mutáns",
+    "mutanson": "mutánson", "nalunk": "nálunk", "napfeny": "napfény", "napjan": "napján", "napozashoz": "napozáshoz",
+    "nappalibol": "nappaliból", "naptar": "naptár", "naptarban": "naptárban", "naptarig": "naptárig",
+    "nehany": "néhány", "nekunk": "nekünk", "nelkuli": "nélküli", "nezd": "nézd", "neztem": "néztem",
+    "nezzetek": "nézzetek / nézzétek", "nyar": "nyár", "nyilik": "nyílik",
+    "nyitvatartast": "nyitva tartást / nyitvatartást", "onallo": "önálló",
+    "orszagbol": "országból", "orzesi": "őrzési", "orzi": "őrzi", "osszel": "ősszel", "oszi": "őszi",
+    "padlofutes": "padlófűtés", "padlofutessel": "padlófűtéssel", "parkolas": "parkolás", "parkolo": "parkoló",
+    "parkoloval": "parkolóval", "paroknak": "pároknak", "partisztasag": "pártisztaság",
+    "partisztasaga": "pártisztasága", "partjan": "partján", "pezsgo": "pezsgő", "pihenes": "pihenés",
+    "piheneshez": "pihenéshez", "pihenesre": "pihenésre", "privat": "privát", "proban": "próbán",
+    "ralatas": "rálátás", "redony": "redőny", "regisztracio": "regisztráció",
+    "rendezvenyek": "rendezvények", "resze": "része", "reszleteket": "részleteket", "rogzitett": "rögzített",
+    "rogzitunk": "rögzítünk", "segitheti": "segítheti", "seta": "séta", "setany": "sétány", "soran": "során",
+    "sotet": "sötét", "sotetitett": "sötétített", "strandfurdo": "strandfürdő", "surgos": "sürgős", "suti": "süti",
+    "sutijei": "sütijei", "sutik": "sütik", "sutiket": "sütiket", "sutikhez": "sütikhez", "sutit": "sütit",
+    "suto": "sütő", "szabaly": "szabály", "szabalyok": "szabályok", "szabalyon": "szabályon", "szallas": "szállás",
+    "szallasdijbol": "szállásdíjból", "szallashelyen": "szálláshelyen / szálláshelyén", "szamjegy": "számjegy",
+    "szamodra": "számodra", "szamozott": "számozott", "szandekosan": "szándékosan", "szazalek": "százalék",
+    "szemelyes": "személyes", "szemelyre": "személyre", "szemenek": "szemének", "szol": "szól",
+    "szolgaltatasa": "szolgáltatása", "szolgaltatast": "szolgáltatást", "szolgaltatunk": "szolgáltatunk",
+    "szoljon": "szóljon", "szomszedban": "szomszédban", "szovegbe": "szövegbe", "szovegben": "szövegben",
+    "szovege": "szövege", "szovegeben": "szövegében", "szovegek": "szövegek", "szoveget": "szöveget / szövegét",
+    "szoveggel": "szöveggel", "szovegmezok": "szövegmezők", "szukseg": "szükség", "szuksegesek": "szükségesek",
+    "tagas": "tágas", "talalhato": "található", "talalsz": "találsz", "tamogatja": "támogatja",
+    "tarolhatjatok": "tárolhatjátok", "tartozkodas": "tartózkodás",
+    "taviranyitos": "távirányítós", "taviranyitoval": "távirányítóval", "tavolsagok": "távolságok",
+    "telefonszam": "telefonszám", "telen": "télen / telén", "terkep": "térkép", "terulet": "terület",
+    "tetel": "tétel", "tietek": "tiétek", "toltodik": "töltődik", "torli": "törli",
+    "torlodnek": "törlődnek", "tortenik": "történik", "tudnivalo": "tudnivaló", "tuzijatek": "tűzijáték",
+    "udvarbol": "udvarból", "ugras": "ugrás", "ugyanigy": "ugyanígy", "ujepitesu": "új építésű / újépítésű",
+    "ujrarender": "újrarender", "unnep": "ünnep", "unnepek": "ünnepek", "unnepi": "ünnepi", "urlapok": "űrlapok",
+    "utja": "útja", "utoirat": "utóirat", "uzemelnek": "üzemelnek", "uzemelteto": "üzemeltető", "valaszd": "válaszd",
+    "valaszolunk": "válaszolunk", "valo": "való", "valtozat": "változat", "valtozatlanul": "változatlanul",
+    "valtozo": "változó", "varnotok": "várnotok", "vasalo": "vasaló", "vegeig": "végéig", "vegleges": "végleges",
+    "velemenyek": "vélemények", "vendegek": "vendégek", "vendegeket": "vendégeket",
+    "vendegertekelesek": "vendégértékelések", "vendeglo": "vendéglő", "veszit": "veszít",
+    "vezerelheto": "vezérelhető", "vezerlopaneleken": "vezérlőpaneleken", "videolejatszast": "videolejátszást",
+    "visszaellenorizhesse": "visszaellenőrizhesse", "visszaigazolas": "visszaigazolás",
+    "visszaolvasasa": "visszaolvasása", "vitorlas": "vitorlás", "vizpartig": "vízpartig", "zaro": "záró",
+    "zart": "zárt", "zuhanyzoval": "zuhanyzóval",
+    # adatvedelem and kornyek are also typical page paths ('az /adatvedelem/ lap'). They stay in the dictionary:
+    # the EKEZETMASZK1018 path mask covers a /path after a space, and in running prose they are still errors.
+    "adatvedelem": "adatvédelem", "kornyek": "környék",
+    # Not from the collected copy, but forms that went through the gate in the measurement above: 'kulcsszef' (the
+    # copy only has 'kulcsszéffel') and 'olcso'. Neither is a real word without its accents.
+    "kulcsszef": "kulcsszéf", "olcso": "olcsó",
 }
 
 # GATEHOMOGLIF816 (2026-08-16, Marveen merese): 33 cirill homoglifa ult a
@@ -1117,9 +1263,40 @@ _TECH_SUFFIXED = r"""
 TECHNICAL = re.compile(_TECH_COMMON + "|" + _TECH_SUFFIXED, re.X)
 NAME_MASK = re.compile(_TECH_COMMON, re.X)
 
+# EKEZETMASZK1018 (2026-10-18): all three review rounds of the EKEZET1018 dictionary extension found the same class:
+# a dictionary word matched in a place that is not Hungarian prose. TECHNICAL does not cover an #anchor, a --flag or a
+# /path that starts after a space (it does cover 'word/word': \b[\w-]*/[\w/-]+ needs a word boundary before the
+# opening '/'). These three branches are a SEPARATE mask that only the accent check uses (hits, ratio, context),
+# applied after TECHNICAL. TECHNICAL is also used by the homoglyph rule (mixed_script_words) and the double-hyphen
+# count, and there the mask would hide a Cyrillic homoglyph inside '#fоglalas' or '--jоvahagyott'. The name-rule
+# mask (NAME_MASK) does not get them either.
+# The path branch does NOT swallow a sentence-final period ('/kapcsolat.'): otherwise the next sentence's capitalised
+# first word would look like a mid-sentence capital, and the accent check would skip it.
+# COPYMASK1019 (2026-10-20, measured on the #2065 corpus check): two more shapes that only carry identifiers, also
+# accent-only for the same reason: a directory with its trailing slash ('kepek/', 'fizetes/*'; a word/word path is
+# already in TECHNICAL) and a key=value pair ('funkcio=ertekeles'). NOT masked, deliberately:
+#   - a QUOTED word or phrase. A quoted single token looked like a literal value ('lakas'), but it is also exactly how
+#     a button label or a value to type is written for a customer ('kattints a "reszletek" gombra'), so a mask would
+#     let accentless customer copy through (Samu, #2085 review). A quoted identifier goes in backticks;
+#   - a bare table or page name in a sentence ('a velemenyek táblán'), which has no shape that tells it from prose:
+#     backticks again.
+_ACCENT_ONLY = r"""
+        (?<![\w&])\#[\w-]+                   # anchor / hashtag (#reszletek): an identifier, not prose
+      | (?<![\w-])--[A-Za-z][\w-]*            # command-line flag (--jovahagyott)
+      | (?<![\w/])/[\w-]+(?:[./][\w-]+)*/?    # a path that starts with / after a space (az /adatvedelem/ lap), no final period
+      | (?<![\w/.-])[\w.-]+/\**(?=[\s,;:.!?)\]'"]|$)   # a directory written with its trailing slash (kepek/, fizetes/*)
+      | (?<![\w.-])[A-Za-z_][\w.-]*=[^\s,;)\]'"]+   # key=value (funkcio=ertekeles), a parameter, not prose
+"""
+ACCENT_MASK = re.compile(_ACCENT_ONLY, re.X)
+
 
 def strip_technical(text: str) -> str:
     return TECHNICAL.sub(" ", text)
+
+
+def strip_for_accent(prose: str) -> str:
+    """The accent check's own ADDITIONAL mask, applied to the strip_technical output (EKEZETMASZK1018)."""
+    return ACCENT_MASK.sub(" ", prose)
 
 
 def strip_for_name(text: str) -> str:
@@ -1141,14 +1318,40 @@ def is_hungarian(text: str) -> bool:
 # vizsgalatra. Az alabbi kizaras CSAK a triggerre vonatkozik: ha a szoveg mas
 # uton magyarnak bizonyult, ezek a talalatok is jelentesre kerulnek -- de egyedul
 # nem ranthatnak be egy angol szoveget az auditba ("the all-new level editor").
+# KNOWN LIMIT (KAPUES1018, 2026-10-18): so a Hungarian text with fewer than 3 DISTINCT HU_MARKERS words (substring
+# matches count), and without any ACCENTLESS word that is NOT listed here, can pass with an accentless "es", whatever
+# its length (the >200-letter ratio branch also runs only once the audit has started). Measured size: of 267
+# Hungarian sentences with one "és" -> "es" mutation, the gate lets 206 through. Measured and pinned case:
+# "Örülünk, hogy jöttök, es nem sietünk." -> exit 0 (2 markers: hogy, nem); with "már" (a 3rd marker) the same text
+# is blocked. A third trigger built on the text's other accented words gave false blocks in three review rounds on
+# non-Hungarian customer text that quotes a Hungarian dish or place name (e.g. Spanish "Probamos pörkölt y
+# kürtőskalács, es delicioso."), so it was rejected: the gate's main value is that it does not wrongly block a
+# customer message. Test: scripts/__tests__/outgoing-copy-gate-kapues1018-hatar.test.py.
 AMBIGUOUS_TRIGGER = {
     "es", "ar", "arak", "ev", "evi", "ot", "uj", "ujat", "het", "ora", "mas",
     "all", "level", "video", "netto",
+    # EKEZET1018: foreign-looking forms that must not pull a non-Hungarian text into the audit on their own; in a
+    # text that is Hungarian by other evidence they are still reported.
+    "privat", "zart", "molo", "seta", "mutans", "kanape",
+}
+
+# EKEZET1018: the NAME class exempts only when CAPITALISED. In lowercase these are frequent Hungarian words (soran,
+# kozel, hany, keri, levo), and in a short accentless message they are exactly the evidence; only the capitalised
+# sentence-start form can be a foreign name ("Soran will ship", "Kozel agreed"). accent_check_tokens() already drops
+# a capitalised word in mid-sentence, so a capitalised token here is always sentence-initial.
+AMBIGUOUS_NAME_TRIGGER = {
+    # sentence-start English words / names (Keri, Iger, Soran) that would pull an English text in on their own
+    "keri", "iger", "soran",
+    # the same class (sentence-start foreign names / brands: Hany, Korben, Kozel, Barki, Levo)
+    "hany", "korben", "kozel", "barki", "levo",
 }
 
 
-def accentless_evidence(words):
-    return {w for w in words if w in ACCENTLESS and w not in AMBIGUOUS_TRIGGER}
+def accentless_evidence(tok_pos, text):
+    """The trigger evidence, from (lowercase form, position) pairs, using the original case in `text`."""
+    return {w for w, p in tok_pos
+            if w in ACCENTLESS and w not in AMBIGUOUS_TRIGGER
+            and not (w in AMBIGUOUS_NAME_TRIGGER and text[p:p + 1].isupper())}
 
 
 # collect_bash_body / collect_mcp_body moved VERBATIM to email_extract.py
@@ -1164,7 +1367,7 @@ def accentless_evidence(words):
 # calls these) fail-open as designed.
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from email_extract import collect_bash_body, collect_mcp_body  # noqa: E402
+    from email_extract import collect_bash_body, collect_mcp_body, classify_mail_tool  # noqa: E402
 except Exception as _extract_exc:  # noqa: BLE001 -- deliberate fail-closed stub
     _EXTRACT_ERR = repr(_extract_exc)
 
@@ -1173,6 +1376,19 @@ except Exception as _extract_exc:  # noqa: BLE001 -- deliberate fail-closed stub
 
     def collect_mcp_body(tool_input: dict):
         return ""
+
+    def classify_mail_tool(tool_name):
+        # Without the shared classifier nothing can be classified precisely.
+        # Crude SUPERSET instead: every outbound name holds one of these words,
+        # so each lands on the unreadable (fail-closed) branch of main();
+        # manage_email keeps its operation test, and plain reads (search /
+        # read / list) still pass.
+        n = str(tool_name or "").lower()
+        if n == "bash":
+            return None
+        if "manage_email" in n:
+            return "manage_email"
+        return "draft" if re.search(r"send|draft|reply|forward", n) else None
 
 
 # --- Telegram reply (GATETG816) ---------------------------------------------
@@ -1463,14 +1679,17 @@ def audit(text: str):
             "Latin szoba keveredett nem-latin betu: olvasva lathatatlan, de a keresest/grepet neman eltori. "
             + MIXED_SCRIPT_LIMIT
         )
-    tok_pos = accent_check_tokens(prose)
+    # EKEZETMASZK1018: the accent check runs on the text after the ADDITIONAL identifier mask (anchor, flag, /path);
+    # the homoglyph and double-hyphen rules above still see the TECHNICAL-masked prose, unchanged.
+    accent_prose = strip_for_accent(prose)
+    tok_pos = accent_check_tokens(accent_prose)
     words = [w for w, _ in tok_pos]
-    if is_hungarian(plain) or accentless_evidence(words):
+    if is_hungarian(plain) or accentless_evidence(tok_pos, accent_prose):
         hits = sorted({w for w in words if w in ACCENTLESS})
         # Az aranyot is a prozan merjuk: a technikai tokenekben nincs ekezet, tehat
         # egy kodban gazdag, egyebkent helyes level aranyat lefele huznak.
-        letters = sum(1 for ch in prose if ch.isalpha())
-        acc = sum(1 for ch in prose if ch in ACCENTED)
+        letters = sum(1 for ch in accent_prose if ch.isalpha())
+        acc = sum(1 for ch in accent_prose if ch in ACCENTED)
         ratio = (acc / letters) if letters else 0.0
         if hits:
             first_pos = {}
@@ -1478,7 +1697,7 @@ def audit(text: str):
                 if w in ACCENTLESS and w not in first_pos:
                     first_pos[w] = p
             shown = ", ".join(
-                f"{h} -> {ACCENTLESS[h]} ({_hit_context(prose, first_pos[h], len(h))})"
+                f"{h} -> {ACCENTLESS[h]} ({_hit_context(accent_prose, first_pos[h], len(h))})"
                 for h in hits[:12]
             )
             more = f" (+{len(hits) - 12} tovabbi)" if len(hits) > 12 else ""
@@ -1503,13 +1722,23 @@ MANAGE_EMAIL_OUTBOUND_OPS = {"send", "reply", "replyall", "forward"}
 # GMAILCONNECTOR914: the server segment is NOT always exactly "gmail" -- the
 # claude.ai connector is mcp__claude_ai_Gmail__send_message, one underscore
 # before Gmail, and `(^|__)gmail__` never matched it, so its sends fell through
-# to sys.exit(0) with no audit (measured 2026-08-30, 2026-09-08). Anything
-# ending in "gmail__<send-shaped tool>" is a send now, whatever the prefix.
+# to sys.exit(0) with no audit (measured 2026-08-30, 2026-09-08).
+# The names are now classified by the shared suffix classifier
+# (email_extract.classify_mail_tool), a superset of the pattern that stood here:
+# a tool prefix (mcp__gmail__v2_reply_all) or a server without "gmail__" right
+# before the base (mcp__server-gmail-autoauth-mcp__reply_all) no longer moves a
+# send out of the audit. EMAIL_TOOL_RE stays for importers only.
 EMAIL_TOOL_RE = re.compile(
     r"(send_email|create_draft|draft_email|update_draft"
     r"|gmail__(reply|reply_all|send_message|forward)$)",
     re.I,
 )
+# The kinds whose payload carries OUR text and is audited here. send_draft is
+# deliberately NOT one of them: it carries only a draftId, so there is no text
+# of ours in the call (the draft's text was audited when it was written), and
+# an empty payload would turn every send_draft into a permanent fail-closed
+# deny, overruling the approval gate's level decision for it.
+_AUDITED_MAIL_KINDS = ("send_email", "connector_send", "draft")
 
 
 # --- Inter-agent messages: HOMOGLYPH-ONLY (INTERAGENTHOMOGLIF923) -----------
@@ -1819,8 +2048,7 @@ def main():
     if not isinstance(tool_input, dict):
         shape = type(tool_input).__name__
         gated = (re.search(r"telegram.*__reply$", tool, re.I)
-                 or re.search(r"(^|__)manage_email$", tool, re.I)
-                 or EMAIL_TOOL_RE.search(tool)
+                 or classify_mail_tool(tool) is not None
                  or tool == "Bash")
         if not gated:
             sys.exit(0)  # not a send: the net must never widen the gate
@@ -1857,7 +2085,8 @@ def main():
     # while the same text was blocked on the Telegram path. Same class as the
     # email-send-gate's MANAGEOP904 fix: a multiplexer cannot be classified by
     # its name, only by the operation it was asked to perform.
-    if re.search(r"(^|__)manage_email$", tool, re.I):
+    mail_kind = classify_mail_tool(tool)
+    if mail_kind == "manage_email":
         op = str(tool_input.get("operation") or tool_input.get("action") or "").strip().lower()
         if op not in MANAGE_EMAIL_OUTBOUND_OPS:
             sys.exit(0)  # search/read/labels/trash...: no outgoing text of ours
@@ -1867,7 +2096,7 @@ def main():
         if op == "forward" and not str(tool_input.get("body") or "").strip():
             sys.exit(0)
         text, unreadable = collect_mcp_body(tool_input), None
-    elif EMAIL_TOOL_RE.search(tool):
+    elif mail_kind in _AUDITED_MAIL_KINDS:
         text, unreadable = collect_mcp_body(tool_input), None
     elif tool == "Bash":
         cmd = str(tool_input.get("command") or "")

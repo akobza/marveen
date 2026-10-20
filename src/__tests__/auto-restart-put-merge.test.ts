@@ -128,6 +128,19 @@ describe('PUT /api/agents/:name/auto-restart -- merge, not replace', () => {
     expect(stored()).toEqual(INTERVAL)
   })
 
+  // ARPUTTESTGAP1018: the mirror of the two cases above, on a DAILY row. Only the
+  // dailyTime side was pinned; dropping the validity check on the intervalHours
+  // side (so any intervalHours key cleared dailyTime) stayed green. A null or
+  // malformed intervalHours must not switch a daily schedule off.
+  it('does not let a null or malformed intervalHours clear a daily schedule', async () => {
+    for (const intervalHours of [null, 'abc', 0, -3]) {
+      seed(DAILY)
+      const r = await putAutoRestart(MAIN_AGENT_ID, { intervalHours })
+      expect(r.status, String(intervalHours)).toBe(200)
+      expect(stored(), String(intervalHours)).toEqual(DAILY)
+    }
+  })
+
   it('never enables auto-restart for an agent with no row', async () => {
     const r = await putAutoRestart(MAIN_AGENT_ID, { mode: 'fresh', dailyTime: '03:00' })
     expect(r.status).toBe(200)

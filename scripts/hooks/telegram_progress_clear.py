@@ -178,11 +178,20 @@ def main():
     answer = last_assistant_text(transcript)
     tok = token(sd)
     if tok:
+        # One pending entry per inbound MESSAGE, not per chat: a batched delivery
+        # (several messages from one chat in one turn) leaves several entries for
+        # the same chat. The answer goes to each chat (and topic) ONCE; every
+        # placeholder is still deleted (FALLBACKEGYSZER1019). A failed send does
+        # not count as sent, so the next entry of that chat retries it.
+        sent = set()
         for p in pend:
             cid, mid = p.get("chat_id"), p.get("message_id")
-            if answer:
+            topic = topic_of(p)
+            dest = (str(cid), topic.get("message_thread_id"))
+            if answer and dest not in sent:
                 try:
-                    api(tok, "sendMessage", {"chat_id": cid, "text": answer[:4000], **topic_of(p)})
+                    api(tok, "sendMessage", {"chat_id": cid, "text": answer[:4000], **topic})
+                    sent.add(dest)
                 except Exception as e:
                     log(sd, f"[enforce] fallback send failed: {e}")
             try:

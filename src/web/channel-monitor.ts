@@ -13,11 +13,11 @@ import { mainRelaunchSucceeded } from '../auto-restart.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { launchableDistributionDefaultSync } from './default-model-guard.js'
 import { agentDir, listAgentNames, readAgentChannelProvider, readAgentRemoteHost, readAgentWorksourceChannel } from './agent-config.js'
-import { listKanbanCards } from '../db.js'
+import { listKanbanCards, createAgentMessage } from '../db.js'
 import {
   agentHasChannel,
   agentSessionName,
-  capturePane,
+  capturePane, capturePaneWithHistory,
   captureParkedInputView,
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
@@ -57,8 +57,10 @@ import {
 } from '../pane-state.js'
 import { MAIN_CHANNELS_SESSION, MAIN_CHANNELS_PLIST } from './main-agent.js'
 import { recordChannelEvent } from './channel-event-log.js'
-import { notifyChannel } from '../notify.js'
+import { notifyChannel, type AlertMeta } from '../notify.js'
+import type { PermPromptEscalationState } from './permission-prompt-escalation.js'
 import { sendRoutineAlert } from './routine-alert.js'
+import { runPermissionPromptPass, clearPermissionPromptAlert } from './permission-prompt-alert.js'
 import { getProvider, channelStateDir, channelStateDirEnvVar, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { attemptChannelMcpReconnect } from './channel-mcp-reconnect.js'
 import { readLastIngestionTimestampAcross, mainTranscriptDirs } from './inbound-probe.js'
@@ -853,6 +855,10 @@ const paneMenuState: Map<string, PaneErrorAlertState> = new Map()
 const MENU_RECOVER_CONFIRM_MS = 45_000
 const MENU_RECOVER_DEDUP_MS = 5 * 60 * 1000
 const MENU_RECOVER_CLEAR_MS = 2 * 60 * 1000
+// Card 68cb6715: per session, which tool-permission prompt the main agent was
+// told about and when (permission-prompt-escalation.ts). Dropped together with
+// the paneMenuState entry, so a prompt answered in between never escalates.
+const permPromptState: Map<string, PermPromptEscalationState> = new Map()
 
 export type MarveenRecoveryStage = 'soft' | 'save' | 'resume' | 'hard' | 'gave_up'
 interface MarveenDownState {
@@ -1134,7 +1140,14 @@ export function buildMainSessionRespawnCmd(opts: {
     // unauthenticated session).
     ...(opts.config.isolatedConfigDir
       ? (opts.config.ownCredentials
-          ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}'`]
+          // The pane inherits the tmux global env, which carries the fleet
+          // token, and an env token outranks the dir's own login (the
+          // inference-only setup-token hid the claude.ai connectors,
+          // measured 2026-10-16) -- so drop it explicitly. channels.sh also puts
+          // ANTHROPIC_API_KEY in the tmux global env when .env has one, and that
+          // outranks a /login credential as well (Claude Code docs, "Authentication
+          // precedence"): this dir authenticates with its own login only.
+          ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY`]
           : opts.config.tokenSecretId
             ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && _plan_token="$(node '${RESOLVE_PLAN_TOKEN_PATH}' '${opts.config.tokenSecretId}' '${FLEET_OAUTH_TOKEN_PATH}' '${CHANNELS_FAILURES_LOG_PATH}')" && export CLAUDE_CODE_OAUTH_TOKEN="$_plan_token"`]
             : [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`])
@@ -2332,8 +2345,8 @@ function checkMainKeepaliveStaleness(): void {
   }
 }
 
-export function sendAlert(text: string): void {
-  notifyChannel(text).catch(() => {})
+export function sendAlert(text: string, meta?: AlertMeta): void {
+  notifyChannel(text, meta).catch(() => {})
 }
 
 async function handleMarveenDown(): Promise<void> {
@@ -2686,6 +2699,9 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       })
       if (decision.next.firstSeenAt === null) {
         paneMenuState.delete(t.session)
+        permPromptState.delete(t.session)
+        // PERMFLOOD1012: the spell is over, so a later prompt is a new question.
+        clearPermissionPromptAlert(t.session)
       } else {
         paneMenuState.set(t.session, decision.next)
       }
@@ -2738,8 +2754,22 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             // requests ~45s after they appeared, while the operator believed
             // they had approved them. Same rule as the unrecognised trust dialog
             // above: no keystroke is neutral, so send none and say so, loudly.
-            logger.warn({ session: t.session, agent: label }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
-            sendAlert(`🔐 A(z) ${label} session egy engedélykérésen vár, és NEM nyomtam meg semmit: ott az Escape NEM-et jelentene. Döntsd el te: tmux attach -t ${t.session}`)
+            // Card 68cb6715 + PERMFLOOD1012: this branch is reached once per dedup
+            // window for as long as nobody answers. The main agent hears first
+            // (an inter-agent message, Escape only); the owner hears at fixed
+            // marks of the prompt's age (the first one, 15 min by default, is the
+            // main agent's head start), and the message says what is asked. The
+            // main agent's own prompt goes to the owner on the same marks. The
+            // decision and both sends live in runPermissionPromptPass
+            // (permission-prompt-alert.ts), where they are under test.
+            const escalation = runPermissionPromptPass(label, t.session, paneNow, {
+              captureWithHistory: capturePaneWithHistory,
+              escalation: permPromptState,
+              isMainAgent: t.isMarveen,
+              messageMainAgent: (text) => { createAgentMessage('system', MAIN_AGENT_ID, text) },
+              send: (text, meta) => sendAlert(text, meta),
+            })
+            logger.warn({ session: t.session, agent: label, escalation }, 'Blocking "menu" is a tool-permission prompt -- a human decides, NO keystrokes sent')
           } else {
             logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
             try {

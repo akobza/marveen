@@ -942,8 +942,26 @@ export function hasThreadReplyCapability(name: string, capabilities: string[]): 
 // keeps the draft surface reachable even under a server name with no gmail in
 // it at all -- a name-keyed matcher goes blind on the next new name, so the
 // draft surface is pinned by the OPERATION too, not only by the server.
+// The gates classify a tool by its base-name SUFFIX on a server of any name
+// (email_extract.classify_mail_tool / classifyMailTool), but a hook that never
+// FIRES checks nothing, and `.*[Gg]mail.*__.*` needs "gmail" in the SERVER
+// segment: a mail MCP registered under any other name exposed send_draft /
+// update_draft / create_draft / reply_all (and the Google Workspace MCP's
+// send_gmail_message / draft_gmail_message) with no hook at all. So every base
+// the classifiers treat as a send or a draft is its own alternative. The three
+// generic connector words (send_message / reply / forward) stay tied to
+// "gmail" -- in the classifiers AND here -- because the Telegram plugin's tool
+// is `..._telegram__reply`, and the email gates must never fire on it. The
+// `[Gg][Mm][Aa][Ii][Ll].*<word>` form is case-insensitive like the
+// classifiers' lowercased test, and it also reaches a "gmail" that sits in a
+// tool PREFIX (mcp__mail__gmail_reply), which `[Gg]mail.*__` cannot. Kept a
+// FLAT alternation (no inner `|`): the drift test splits it on '|'.
+// Binding: email-gate-matcher-drift.test.ts asserts this matcher fires for
+// every name either classifier gates, and never for the Telegram tools.
 export const EMAIL_GATE_MATCHER =
   'Bash|.*send_email.*|.*manage_email.*|.*[Gg]mail.*__.*|.*draft_email.*'
+  + '|.*send_draft.*|.*update_draft.*|.*create_draft.*|.*reply_all.*|.*send_gmail_message.*|.*draft_gmail_message.*'
+  + '|.*[Gg][Mm][Aa][Ii][Ll].*send_message.*|.*[Gg][Mm][Aa][Ii][Ll].*reply.*|.*[Gg][Mm][Aa][Ii][Ll].*forward.*'
 
 // Does an existing PreToolUse array carry an email-gate entry whose matcher is
 // NOT the current one? Pure + exported: this is the predicate that lets
@@ -2808,31 +2826,105 @@ export function ensureProjectRootInClaudeMd(name: string): boolean {
   return true
 }
 
-// SKILLUTCSAPDA822: the near-identical `.claude-config/skills` path IS the
-// shared global directory (a symlink to ~/.claude/skills, single-copy
-// distribution -- deliberate, see skills-symlink-single-copy), and the
-// skill-run base directory even DISPLAYS that path. An agent writing "its
-// own" skill there writes to the whole fleet, and nothing says so. Measured
-// 2026-08-22: five third-party marketing skills landed in the shared dir and
-// only luck caught them. The symlink stays; the fix is naming the trap in
-// every agent's CLAUDE.md, idempotently, on every respawn.
+// SKILLUTCSAPDA822: the isolated config root's `skills` entry IS the shared
+// global directory (a symlink to ~/.claude/skills, single-copy distribution --
+// deliberate, see skills-symlink-single-copy), and the skill-run base directory
+// even DISPLAYS that path. An agent writing "its own" skill there writes to the
+// whole fleet, and nothing says so. Measured 2026-08-22: five third-party
+// marketing skills landed in the shared dir and only luck caught them. The
+// symlink stays; the fix is naming the trap in every agent's CLAUDE.md,
+// idempotently, on every respawn.
+//
+// SKILLGYOKERLATSZIK923: the body used to be ONE text for everybody, and it was
+// wrong for the main agent in the direction that matters. It said "your own,
+// private skill goes in your working directory's .claude/skills" -- true for a
+// sub-agent, whose cwd is agents/<name>, but the MAIN agent's cwd IS the project
+// root, and every sub-agent's cwd sits UNDER it. That directory is therefore
+// their ancestor: the main agent's "private" skills are visible to the whole
+// fleet. Measured 2026-09-23 -- the main agent told a sub-agent a new skill was
+// private, the sub-agent measured it and showed he was already reading it. So
+// the body is per-agent: the same three locations, described from the reader's
+// own position.
+//
+// Upstream review of #1563: the measurement above assumed an isolated root. On a DEFAULT install
+// (MAIN_AGENT_ISOLATED_CONFIG=0, the flag is tied to the fleet OAuth token) the main agent runs on the
+// shared ~/.claude, CLAUDE_CONFIG_DIR is empty, and `ls -ld "$CLAUDE_CONFIG_DIR/skills"` becomes
+// `ls -ld /skills`. So the body says what an empty variable means and the command falls back to
+// ~/.claude. The five-vantage-point measurement below was taken on an isolated install.
+// SKILLGYOKERNEV925: the body no longer NAMES the isolated config root either --
+// it asks the reader to MEASURE it (`echo "$CLAUDE_CONFIG_DIR"`). Measured
+// 2026-09-25 from five vantage points: EVERY agent has an isolated root whose
+// `skills` entry is a symlink to ~/.claude/skills (53 skills). Only the NAME
+// differs -- sub-agents get agents/<name>/.claude-config, the main agent gets
+// <PROJECT_ROOT>/.channels-config. Naming one path teaches a false
+// generalisation in both directions, and both were actually made: from "my
+// .claude-config does not exist" one agent concluded the install has none (false
+// for four agents out of five), and a body that calls `.claude-config` THE trap
+// invites the reverse -- that a differently named root is safe. The name is the
+// per-agent part; the symlink is the invariant, so the body pins the measurement,
+// not the name.
 const SKILLS_TRAP_BEGIN = '<!-- BEGIN GENERATED: skills-path-trap (auto-generated, do not edit by hand) -->'
 const SKILLS_TRAP_END = '<!-- END GENERATED: skills-path-trap -->'
 const SKILLS_TRAP_BLOCK_RE = new RegExp(
   `${SKILLS_TRAP_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SKILLS_TRAP_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
 )
 
-function buildSkillsPathTrapBody(): string {
-  return [
+function buildSkillsPathTrapBody(name: string): string {
+  const isMain = name === MAIN_AGENT_ID
+  const shared = [
     '## Skill-útvonal csapda (KÖTELEZŐ elolvasni skill-írás előtt)',
     '',
-    'A `.claude-config/skills` NEM a saját mappád: symlink a globális',
-    '`~/.claude/skills`-re, tehát ami oda kerül, az a TELJES flottánál megjelenik',
-    '-- akkor is, ha a skill-futtatás base directory-ja ezt az utat mutatja.',
-    'A saját, csak neked szóló vagy kipróbálatlan külső skill a munkakönyvtárad',
-    '`.claude/skills/` mappájába megy. A globálisba írás tudatos, flotta-szintű',
-    'döntés legyen, ne alapértelmezés.',
+    'HÁROM hely van, nem kettő, és a különbség nem az, hogy melyik "globális",',
+    'hanem hogy KI LÁTJA. Mielőtt skillt írsz vagy mozgatsz, MÉRD MEG, melyik',
+    'config-gyökérből futsz:',
     '',
+    '```bash',
+    'echo "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; ls -ld "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"',
+    '```',
+    '',
+    'Ha a `$CLAUDE_CONFIG_DIR` ÜRES (alapértelmezett telepítés, ahol a fő ágens',
+    'izolált config-gyökér nélkül, a megosztott `~/.claude`-on fut), a gyökered',
+    'maga a `~/.claude`, és annak `skills` mappája a globális: a lenti 1. pont,',
+    'symlink nélkül. Izolált módban a gyökér NEVE ágensenként MÁS (a sub-ágenseké',
+    '`agents/<név>/.claude-config`, a fő ágensé `<projekt-gyökér>/.channels-config`),',
+    'ezért a NÉVRE emlékezni félrevezet, mindkét irányban: abból, hogy egy út NÁLAD',
+    'nem létezik, semmi nem következik a flotta többi tagjára, és attól, hogy a',
+    'gyökeredet másképp hívják, még nem a tiéd, ami benne van. A viselkedés',
+    'mindenhol UGYANAZ, és pont ezt mutatja meg a fenti `ls -ld`: izolált',
+    'módban a `$CLAUDE_CONFIG_DIR/skills` SYMLINK a globálisra, tehát az 1. pont,',
+    'más néven; üres változónál maga a `~/.claude/skills` az.',
+    '',
+    '1. `~/.claude/skills` -- a globális. MINDEN ágens látja. Ide írni tudatos,',
+    '   flotta-szintű döntés legyen, ne alapértelmezés. A skill-futtatás base',
+    '   directory-ja a saját config-gyökeredet MUTATHATJA -- attól még a flottáé.',
+  ]
+  const perAgent = isMain
+    ? [
+        '2. A PROJEKT-GYÖKÉR `.claude/skills` mappája. **EZ NEKED NEM PRIVÁT.**',
+        '   A munkakönyvtárad MAGA a projekt gyökere, a sub-ágenseké pedig',
+        '   (`agents/<név>`) ezen BELÜL van, tehát ez a mappa az ŐSÜK: amit ide',
+        '   írsz, az megjelenik a listájukban. Láthatóságban úgy viselkedik,',
+        '   mint a globális.',
+        '3. `agents/<név>/.claude/skills` -- egy SUB-ÁGENS saját mappája. Csak övé.',
+        '   NEKED NINCS ilyen: az `agents/<sajat-neved>` mappa nem létezik, és egy',
+        '   ott létrehozott mappa a te munkakönyvtárad GYEREKE lenne, nem az őse,',
+        '   tehát te magad sem látnád.',
+        '',
+        'KÖVETKEZMÉNY: ezen a telepítésen NINCS olyan hely, ahova a fő ágens',
+        'csak-magának írhat skillt. Ne feltételezd, hogy privát -- 2026-09-23-án',
+        'ez a feltételezés dőlt meg, és nem magától: egy sub-ágens mérte meg.',
+      ]
+    : [
+        '2. A PROJEKT-GYÖKÉR `.claude/skills` mappája. A munkakönyvtárad EZEN BELÜL',
+        '   van, tehát ez a mappa az ŐSÖD: az itt álló skilleket LÁTOD, akkor is,',
+        '   ha nem te írtad és nem neked szólnak. Ide te NE írj: ez a fő ágens',
+        '   területe, és amit ide tennél, azt a többi ágens is látná.',
+        '3. A saját `.claude/skills` mappád a munkakönyvtáradban',
+        '   (`agents/<a-te-neved>/.claude/skills`). EZ az egyetlen, ami tényleg',
+        '   csak a tiéd. A saját, csak neked szóló vagy kipróbálatlan külső skill',
+        '   ide megy.',
+      ]
+  const memory = [
     // 2026-09-07: a leanarchivist a saját tanulságát a
     // `.claude-config/projects/-home-istvan-marveen/memory/MEMORY.md`-be akarta
     // írni. Megmérve: `projects -> ~/.claude/projects`, tehát az a fájl a Lean
@@ -2864,7 +2956,8 @@ function buildSkillsPathTrapBody(): string {
     'benne (saját stub git-repó vagy git nélküli telepítés). A saját, csak rád',
     'tartozó emlék helye ettől függetlenül a dashboard API (`POST /api/memories`,',
     '`agent_id`-vel).',
-  ].join('\n')
+  ]
+  return [...shared, ...perAgent, '', ...memory].join('\n')
 }
 
 // Same five-rule idempotency contract as ensureFleetRosterSection /
@@ -2876,7 +2969,7 @@ export function ensureSkillsPathTrapSection(name: string): void {
     : join(agentDir(name), 'CLAUDE.md')
   if (!existsSync(claudeMdPath)) return
 
-  const block = `${SKILLS_TRAP_BEGIN}\n${buildSkillsPathTrapBody()}\n${SKILLS_TRAP_END}`
+  const block = `${SKILLS_TRAP_BEGIN}\n${buildSkillsPathTrapBody(name)}\n${SKILLS_TRAP_END}`
 
   let existing: string
   try {
@@ -3580,8 +3673,12 @@ TÖRLÉS NINCS, ÉS SZÁNDÉKOSAN NE IS LEGYEN. A DELETE /api/memories/:id léte
 
 Az ütemezett feladatok a ~/.claude/scheduled-tasks/ mappában élnek, fájl-alapúak (SKILL.md + task-config.json). A schedule runner 60 másodpercenként ellenőrzi és a te tmux session-ödbe küldi a promptot.
 
-Feladat létrehozása API-n keresztül:
-curl -s -X POST ${dashboardOrigin}/api/schedules -H "Content-Type: application/json" -H "Authorization: Bearer $(cat ${tokenPath})" -d '{"name": "feladat-nev", "description": "Rövid leírás", "prompt": "A részletes prompt", "schedule": "0 8 * * *", "agent": "AGENT_NAME", "type": "heartbeat"}'
+Ütemezést NEM hozhatsz létre, NEM módosíthatsz, NEM kapcsolhatsz ki/be és NEM törölhetsz magad: se az API-n (semmilyen klienssel: curl, python, node, wget...), se a ~/.claude/scheduled-tasks/ mappa írásával, se az SQLite táblában. A governance-kapu (self-pace-gate) ezeket megtagadja. Ha ütemezés kell, kérd ${BOT_NAME}-t (${MAIN_AGENT_ID}) inter-agent üzenetben (a lenti, idézett heredoces alakban): név, leírás, prompt, cron, ágens (AGENT_NAME), típus. Ő hozza létre vagy módosítja.
+
+Olvasni (listázni) szabad, PONTOSAN ebben az alakban:
+curl -q -s -H "Authorization: Bearer $(cat ${tokenPath})" ${dashboardOrigin}/api/schedules
+
+A -q legyen az ELSŐ argumentum, a token útja SZÓ SZERINT ez az abszolút út (relatív út, ~ vagy $HOME esetén a kapu megtagadja), és ne tegyél mellé -X, -d, -o vagy -w kapcsolót.
 
 Típusok: task (mindig szól az eredménnyel) vagy heartbeat (csak fontosnál szól).
 Cron formátum: perc óra nap hónap hétnapja (pl. 0 8 * * * = minden nap 8:00).

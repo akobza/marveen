@@ -1,6 +1,6 @@
 {
   "name": "marveen",
-  "version": "1.43.0",
+  "version": "1.44.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "setup": "tsx scripts/setup.ts",
     "status": "tsx scripts/status.ts",
     "remote-enroll": "tsx scripts/remote-access-enroll.ts",
+    "bridge-device-key": "tsx scripts/bridge-device-key.ts",
     "dashboard-user": "tsx scripts/dashboard-user.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

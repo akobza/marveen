@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, closeSync, statSync } from 'node:fs'
 import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ, EMBED_URL, EMBED_MODEL, EMBED_DIMS, MAIN_AGENT_ID } from './config.js'
+import { isSearchStopword } from './memory-search-stopwords.js'
 import { getEffectiveSettingValue } from './settings-store.js'
 import { logger } from './logger.js'
 import { TOOL_TIMEOUTS } from './tool-timeouts.js'
@@ -256,6 +257,16 @@ export function initDatabase(dbPathOverride?: string): void {
   // be dropped again on the very installs that still need it.
   try {
     db.exec('ALTER TABLE kanban_cards ADD COLUMN test_steps TEXT')
+  } catch {
+    // column already exists
+  }
+  // Migration: planned start of the work, for the timeline view. Without it a
+  // bar ran from created_at, so a step planned for next week drew as if it had
+  // started the day it was filed. Must stay AFTER the testing migration above:
+  // that one recreates the table from a fixed column list, so a column added
+  // before it would be dropped again on an old database.
+  try {
+    db.exec('ALTER TABLE kanban_cards ADD COLUMN start_date INTEGER')
   } catch {
     // column already exists
   }
@@ -1171,6 +1182,25 @@ export function initDatabase(dbPathOverride?: string): void {
   // Migration: existing idea boxes predate the work/personal boundary.
   try { db.exec("ALTER TABLE idea_box ADD COLUMN scope TEXT NOT NULL DEFAULT 'munka'") } catch { /* column already exists */ }
 
+  // --- Team notes ("Jegyzetek") ---
+  // Small follow-ups ("I'll check it tomorrow") kept off the kanban board.
+  // Deletion is soft: deleted_at/deleted_by/delete_reason keep the history
+  // auditable, and the UI shows the last 7 days of deletions.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS team_notes (
+      id TEXT PRIMARY KEY,
+      assignee TEXT NOT NULL,
+      content TEXT NOT NULL,
+      due_date TEXT,
+      created_at INTEGER NOT NULL,
+      created_by TEXT NOT NULL,
+      deleted_at INTEGER,
+      deleted_by TEXT,
+      delete_reason TEXT
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_team_notes_active ON team_notes(deleted_at, due_date)`)
+
   // --- Idea Comments ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS idea_comments (
@@ -1725,7 +1755,7 @@ export function saveMemory(
 // search terms. We also cap the number and length of tokens to bound query
 // cost (the sanitizer previously allowed an arbitrary-length prefix expansion
 // that could make a single request scan the entire index).
-export function buildFtsMatchExpression(query: string, join: 'AND' | 'OR' = 'AND'): string {
+function ftsQueryTokens(query: string): string[] {
   const MAX_TOKENS = 20
   const MAX_TOKEN_LEN = 64
   const sanitized = query
@@ -1735,15 +1765,45 @@ export function buildFtsMatchExpression(query: string, join: 'AND' | 'OR' = 'AND
     // fusing into a single unfindable token "rankcheck".
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .trim()
-  if (!sanitized) return ''
-  const tokens = sanitized
+  if (!sanitized) return []
+  return sanitized
     .split(/\s+/)
     .filter((t) => t.length > 0)
     .slice(0, MAX_TOKENS)
-    .map((t) => t.slice(0, MAX_TOKEN_LEN) + '*')
+    .map((t) => t.slice(0, MAX_TOKEN_LEN))
+}
+
+export function buildFtsMatchExpression(query: string, join: 'AND' | 'OR' = 'AND'): string {
+  const tokens = ftsQueryTokens(query).map((t) => t + '*')
   // A space between FTS5 terms is an implicit AND, so the default keeps the
-  // strict behaviour. 'OR' is the relaxed pass used by ftsWithOrFallback.
+  // strict behaviour. 'OR' is the plain OR join; the relaxed pass itself uses
+  // buildRelaxedFtsExpression, which also drops the filler words.
   return join === 'OR' ? tokens.join(' OR ') : tokens.join(' ')
+}
+
+/**
+ * The OR expression the relaxed pass runs: the query's
+ * tokens minus filler words and one-character tokens.
+ *
+ * Measured on the live store, 2026-09-23: `zebra a hogy nem` returned ~50 rows,
+ * none about zebras -- `a*`, `hogy*` and `nem*` prefix-match nearly every
+ * Hungarian memory. A one-character token is the same hazard in general form:
+ * `x*` is every word starting with x. What is left is the query's content, and
+ * only content may rescue a query the strict pass could not answer. Empty when
+ * nothing but filler remains, and then no relaxed pass runs at all.
+ *
+ * A token of digits only (of two or more characters) IS content and stays:
+ * searching by an amount or an ID is common (`mennyi 5000` must find the
+ * "napi limit 5000" row). The cost is known: FTS5 splits every date
+ * (`2026-09-23` -> `2026`, `09`, `23`), so a year in an otherwise unmatched
+ * query rescues every memory dated that year. Those rows come back labelled
+ * relaxed, and strict=1 still answers only on a real match.
+ */
+export function buildRelaxedFtsExpression(query: string): string {
+  return ftsQueryTokens(query)
+    .filter((t) => t.length > 1 && !isSearchStopword(t))
+    .map((t) => t + '*')
+    .join(' OR ')
 }
 
 /**
@@ -1794,8 +1854,10 @@ function ftsWithOrFallback<T>(
   const rows = run(strict)
   if (rows.length > 0) return { rows, relaxed: false }
   if (!allowRelaxed) return { rows, relaxed: false }
-  const relaxedTerms = buildFtsMatchExpression(query, 'OR')
-  if (relaxedTerms === strict) return { rows, relaxed: false }
+  // Filler words never reach this pass. With only filler
+  // left there is nothing to relax to, and the honest answer is the strict one.
+  const relaxedTerms = buildRelaxedFtsExpression(query)
+  if (!relaxedTerms || relaxedTerms === strict) return { rows, relaxed: false }
   return { rows: run(relaxedTerms), relaxed: true }
 }
 
@@ -1852,9 +1914,18 @@ function withoutRank<T extends { rank: number }>(rows: T[]): Omit<T, 'rank'>[] {
   return rows.map(({ rank: _rank, ...rest }) => rest)
 }
 
-export function searchMemories(query: string, chatId: string, limit = 3, allowRelaxed = true, category?: string): Memory[] {
+export function searchMemories(
+  query: string,
+  chatId: string,
+  limit = 3,
+  allowRelaxed = true,
+  category?: string,
+  // Same label searchAgentMemories reports. Without it the no-agent branch of
+  // the endpoint said `relaxed=false` whatever this function actually did.
+  trace?: { relaxed: boolean },
+): Memory[] {
   try {
-    const { rows } = ftsWithOrFallback(query, (terms) =>
+    const { rows, relaxed } = ftsWithOrFallback(query, (terms) =>
       (category
         ? db.prepare(
             `SELECT m.*, f.rank AS rank FROM memories m
@@ -1871,6 +1942,7 @@ export function searchMemories(query: string, chatId: string, limit = 3, allowRe
              LIMIT ?`
           ).all(terms, chatId, limit * RECENCY_OVERSAMPLE)) as (Memory & { rank: number })[]
       , allowRelaxed)
+    if (trace) trace.relaxed = relaxed
     return withoutRank(reRankByRecency(rows, limit)) as Memory[]
   } catch {
     return []
@@ -2495,6 +2567,7 @@ export interface KanbanCard {
   project: string | null
   parent_id: string | null
   due_date: number | null
+  start_date?: number | null
   sort_order: number
   created_at: number
   updated_at: number
@@ -2750,6 +2823,58 @@ export function parentWouldCycle(cardId: string, parentId: string): boolean {
   return false
 }
 
+// start_date and due_date are INTEGER unix seconds and every reader does
+// `* 1000`, but SQLite is dynamically typed: a caller that sent "2026-09-12"
+// (the natural shape when an agent writes a date) stored a STRING, which read
+// back as NaN -- "Invalid Date" on the card and a card missing from the
+// timeline. Coerced once, on the way in, instead of at every read site.
+//
+// Exactly three shapes are accepted, everything else becomes null:
+//   1. epoch SECONDS, as a number or as digits in a string (also a decimal
+//      shape, "1790000000.0", which the INTEGER column would store as the same
+//      value -- kanban-field-events test), floored, below MAX_CARD_EPOCH_SECONDS
+//      so a millisecond timestamp is refused instead of stored as a date tens
+//      of thousands of years ahead;
+//   2. a bare "YYYY-MM-DD", as UTC midnight -- the same instant the dashboard's
+//      own <input type="date"> handler produces (`new Date(value)`). Local
+//      midnight would be off by one in the edit modal (which reads the value
+//      back with toISOString) for any timezone east of UTC, and saving the
+//      modal would then move the date a day earlier;
+//   3. a full ISO timestamp with an explicit offset ("Z" or "+02:00"), so the
+//      instant does not depend on the server's timezone.
+// No `Date.parse` fallback: V8's legacy formats read "12.09.2026" and
+// "12/09/2026" month-first, "2026.09.12" as local midnight, "-5" and "Sep 12"
+// as dates in 2001 -- a wrong date stored silently is worse than null. A day
+// that does not exist on the calendar ("2026-02-30", which V8 rolls over to
+// 2 March) is null too.
+export const MAX_CARD_EPOCH_SECONDS = 1e11 // year 5138; any ms timestamp after 1973 is above it
+
+const CARD_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/
+const CARD_ISO_OFFSET_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/
+
+function isCalendarDay(y: string, m: string, d: string): boolean {
+  const dt = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)))
+  return dt.getUTCFullYear() === Number(y) && dt.getUTCMonth() === Number(m) - 1 && dt.getUTCDate() === Number(d)
+}
+
+function epochSecondsOrNull(n: number): number | null {
+  if (!Number.isFinite(n) || n < 0 || n >= MAX_CARD_EPOCH_SECONDS) return null
+  return Math.floor(n)
+}
+
+export function normaliseCardDate(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null
+  if (typeof v === 'number') return epochSecondsOrNull(v)
+  if (typeof v !== 'string') return null
+  const trimmed = v.trim()
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return epochSecondsOrNull(Number(trimmed))
+  const m = CARD_DATE_RE.exec(trimmed) ?? CARD_ISO_OFFSET_RE.exec(trimmed)
+  if (!m || !isCalendarDay(m[1], m[2], m[3])) return null
+  const ms = Date.parse(trimmed)
+  return Number.isNaN(ms) ? null : epochSecondsOrNull(ms / 1000)
+}
+
 // The fields createKanbanCard actually reads off its argument. Deliberately a
 // SUBSET of KANBAN_WRITABLE_FIELDS (the PUT/update set), not the same list:
 // creation computes its own `sort_order` (see below) and never accepts
@@ -2762,6 +2887,7 @@ export function parentWouldCycle(cardId: string, parentId: string): boolean {
 // returned 200, stored `archived_at=null` and `sort_order=0`, logged nothing).
 export const KANBAN_CREATE_FIELDS = [
   'title', 'description', 'test_steps', 'status', 'assignee', 'priority', 'project', 'parent_id', 'due_date',
+  'start_date',
 ] as const
 
 export function createKanbanCard(card: {
@@ -2774,7 +2900,8 @@ export function createKanbanCard(card: {
   priority?: KanbanCard['priority']
   project?: string
   parent_id?: string
-  due_date?: number
+  due_date?: number | string | null
+  start_date?: number | string | null
 }): void {
   const now = Math.floor(Date.now() / 1000)
   const status = card.status ?? 'planned'
@@ -2784,12 +2911,12 @@ export function createKanbanCard(card: {
   const sortOrder = (maxRow?.m ?? -1) + 1
 
   db.prepare(
-    `INSERT INTO kanban_cards (id, title, description, test_steps, status, assignee, priority, project, parent_id, due_date, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO kanban_cards (id, title, description, test_steps, status, assignee, priority, project, parent_id, due_date, start_date, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     card.id, card.title, card.description ?? null, card.test_steps ?? null, status,
     card.assignee ?? null, card.priority ?? 'normal',
-    card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now
+    card.project ?? null, card.parent_id ?? null, normaliseCardDate(card.due_date), normaliseCardDate(card.start_date), sortOrder, now, now
   )
   // A card BORN in a status other than 'planned' gets its opening event row
   // here, because nothing else will ever write one for it: kanban_card_events
@@ -2819,7 +2946,7 @@ export function createKanbanCard(card: {
 // was writing one (e.g. `description_append`).
 export const KANBAN_WRITABLE_FIELDS = [
   'title', 'description', 'test_steps', 'status', 'assignee', 'priority', 'project',
-  'parent_id', 'due_date', 'sort_order', 'archived_at',
+  'parent_id', 'due_date', 'start_date', 'sort_order', 'archived_at',
 ] as const
 
 // The columns whose changes updateKanbanCard records in kanban_card_field_events
@@ -2848,7 +2975,13 @@ export function updateKanbanCard(
   const card = getKanbanCard(id)
   if (!card) return false
   const now = Math.floor(Date.now() / 1000)
-  const f = { ...card, ...fields, updated_at: now }
+  // Coerce only what the CALLER sent, never the merged record: normalising a
+  // legacy value already in the row would make an unrelated PUT look like a
+  // real change and stamp updated_at.
+  const incoming = { ...fields }
+  if ('due_date' in incoming) incoming.due_date = normaliseCardDate(incoming.due_date)
+  if ('start_date' in incoming) incoming.start_date = normaliseCardDate(incoming.start_date)
+  const f = { ...card, ...incoming, updated_at: now }
   // #1023: bump updated_at ONLY when a writable column actually changes. The
   // UPDATE below always matches the row, so a no-op PUT (an unknown field, or a
   // known field echoed back unchanged) used to stamp updated_at=now and report
@@ -2864,9 +2997,9 @@ export function updateKanbanCard(
   // left the card changed with no row saying who changed it.
   return db.transaction((): boolean => {
     const changed = db.prepare(
-      `UPDATE kanban_cards SET title=?, description=?, test_steps=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
+      `UPDATE kanban_cards SET title=?, description=?, test_steps=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, start_date=?, sort_order=?, updated_at=?, archived_at=?
        WHERE id=?`
-    ).run(f.title, f.description, f.test_steps, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+    ).run(f.title, f.description, f.test_steps, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.start_date ?? null, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
     // Same dispatched_at rule as moveKanbanCard (kanbanWriteClearsDispatch). Before,
     // a card the PUT took out of in_progress kept its stamp, and the next /move to
     // in_progress woke nobody. The PUT only clears: it never dispatches.
@@ -3413,6 +3546,40 @@ export function getBlockedByCard(cardId: string): KanbanCardRef[] {
     WHERE b.blocker_id = ?
     ORDER BY b.created_at ASC
   `).all(cardId) as KanbanCardRef[]
+}
+
+// When `cardId` last went INTO done (a reorder inside done is not a closing),
+// or null when no such transition is recorded. The unblock notice dedupes on it:
+// a freed card's system comment from this closing on means it was already told.
+export function getLatestDoneTransitionAt(cardId: string): number | null {
+  const row = db.prepare(`
+    SELECT created_at FROM kanban_card_events
+    WHERE card_id = ? AND to_status = 'done' AND (from_status IS NULL OR from_status <> 'done')
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(cardId) as { created_at: number } | undefined
+  return row ? row.created_at : null
+}
+
+// The cards that the closing of `blockerId` has just freed (card 08bf8326, #567):
+// cards it blocks that are still open (not done, not archived) and have NO other
+// unfinished blocker left. Called after `blockerId` reached done, so it does not
+// count against itself. An archived blocker that never reached done still blocks,
+// the same rule as getBlockersForCard.
+export function getCardsUnblockedBy(blockerId: string): Array<KanbanCardRef & { assignee: string | null }> {
+  return db.prepare(`
+    SELECT c.id, c.rowid AS seq, c.title, c.status, c.archived_at, c.assignee
+    FROM kanban_card_blockers b
+    JOIN kanban_cards c ON c.id = b.card_id
+    WHERE b.blocker_id = ?
+      AND c.status <> 'done'
+      AND c.archived_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM kanban_card_blockers b2
+        JOIN kanban_cards c2 ON c2.id = b2.blocker_id
+        WHERE b2.card_id = c.id AND c2.status <> 'done'
+      )
+    ORDER BY b.created_at ASC
+  `).all(blockerId) as Array<KanbanCardRef & { assignee: string | null }>
 }
 
 // Bulk variant for the board list view -- one JOIN query instead of an N+1
@@ -4788,7 +4955,97 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))
 }
 
-function vectorSearch(agentId: string, queryEmbedding: number[], limit: number = 10, category?: string): Memory[] {
+/**
+ * The vector branch's floor.
+ *
+ * Without one the branch always answers with its top-N, however unrelated:
+ * measured on the live store, 2026-09-23, hybrid `q=zebra` returned 5 rows, all
+ * vector-only. An ABSOLUTE cosine floor cannot fix that on nomic-embed-text,
+ * because the model's scores sit on a query-dependent plateau. Calibrated on the
+ * live store (135 embedded rows, read-only) with 26 real queries and 29 nonsense
+ * ones:
+ *
+ *   nonsense top-1 cosine   0.382 .. 0.704   ("zebra" 0.443,
+ *                                              "XYZZY-NINCS-ILYEN-KIFEJEZES-2026" 0.704)
+ *   real target cosine      0.451 .. 0.788   ("who signs outgoing email" 0.509)
+ *
+ * The ranges overlap, so no absolute value separates them. What does is the
+ * height ABOVE the plateau, measured against the query's median similarity to
+ * the corpus:
+ *
+ *   nonsense top-1 minus median   0.042 .. 0.096
+ *   real target minus median      -0.024 .. 0.296  (15 of 26 at >= 0.104)
+ *
+ * A margin of 0.10 leaves 0 of 29 nonsense queries with any vector hit and keeps
+ * 15 of 26 real targets. Of the 11 it loses, 10 were ranked 2nd to 70th by the
+ * vector branch already; the one rank-1 loss sat at 0.077, inside the nonsense
+ * band, where no margin can keep it without letting the nonsense back in.
+ *
+ * Below VECTOR_BASELINE_MIN_ROWS scored rows a median describes nothing, so a
+ * small corpus falls back to an absolute floor just above the highest nonsense
+ * top-1 measured (0.704). That is conservative: on a small store a vector-only
+ * hit has to be a near-duplicate. Lexical hits are never subject to either.
+ * The row count is the number of rows scored for THIS query, i.e. after the
+ * agent and category filter, so a small tier (e.g. hot) on a large store also
+ * takes the absolute floor. That is intended: the median is computed over the
+ * same filtered rows, and on a handful of rows it describes nothing either.
+ *
+ * The three values below are the DEFAULTS. They were calibrated on one store
+ * and one embedding model (nomic-embed-text), and EMBED_MODEL is a setting, so
+ * each one can be overridden (config-overrides.json > .env > default):
+ * MEMORY_VECTOR_MIN_MARGIN, MEMORY_VECTOR_BASELINE_MIN_ROWS and
+ * MEMORY_VECTOR_SMALL_CORPUS_MIN_SIMILARITY. An unset, unparsable or
+ * out-of-range value falls back to the default.
+ */
+export const VECTOR_MIN_MARGIN = 0.10
+export const VECTOR_BASELINE_MIN_ROWS = 10
+export const VECTOR_SMALL_CORPUS_MIN_SIMILARITY = 0.72
+
+export interface VectorFloorParams {
+  minMargin: number
+  baselineMinRows: number
+  smallCorpusMinSimilarity: number
+}
+
+function numericSetting(key: string, fallback: number, valid: (n: number) => boolean): number {
+  try {
+    const raw = String(getEffectiveSettingValue(key) ?? '').trim()
+    if (raw === '') return fallback
+    const n = Number(raw)
+    return Number.isFinite(n) && valid(n) ? n : fallback
+  } catch {
+    return fallback
+  }
+}
+
+/** The floor's thresholds as configured right now (read per search, no restart needed). */
+export function vectorFloorParams(): VectorFloorParams {
+  return {
+    minMargin: numericSetting('MEMORY_VECTOR_MIN_MARGIN', VECTOR_MIN_MARGIN, (n) => n >= 0 && n <= 1),
+    baselineMinRows: numericSetting('MEMORY_VECTOR_BASELINE_MIN_ROWS', VECTOR_BASELINE_MIN_ROWS, (n) => Number.isInteger(n) && n >= 1),
+    smallCorpusMinSimilarity: numericSetting('MEMORY_VECTOR_SMALL_CORPUS_MIN_SIMILARITY', VECTOR_SMALL_CORPUS_MIN_SIMILARITY, (n) => n >= 0 && n <= 1),
+  }
+}
+
+export function vectorSimilarityFloor(scores: number[], params: VectorFloorParams = vectorFloorParams()): number {
+  if (scores.length < params.baselineMinRows) return params.smallCorpusMinSimilarity
+  const sorted = [...scores].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+  return median + params.minMargin
+}
+
+interface VectorHit {
+  memory: Memory
+  similarity: number
+}
+
+function vectorSearch(
+  agentId: string,
+  queryEmbedding: number[],
+  limit: number = 10,
+  category?: string,
+): { hits: VectorHit[]; floor: number } {
   // Same push-down as searchAgentMemories: this branch scores EVERY embedded
   // row in JS, so filtering in SQL is both correct and strictly less work.
   const rows = (category
@@ -4805,18 +5062,21 @@ function vectorSearch(agentId: string, queryEmbedding: number[], limit: number =
   // neither sorts to the top nor raises -- the search quietly returns junk.
   // Drop the mismatches instead, so a half-migrated table degrades to "fewer
   // results" rather than "wrong results".
-  const scored = rows.flatMap(m => {
+  const scored = rows.flatMap((m): VectorHit[] => {
     try {
       const emb = JSON.parse(m.embedding!) as number[]
       if (emb.length !== queryEmbedding.length) return []
-      return [{ memory: m, score: cosineSimilarity(queryEmbedding, emb) }]
+      return [{ memory: m, similarity: cosineSimilarity(queryEmbedding, emb) }]
     } catch {
-      return [{ memory: m, score: 0 }]
+      return [{ memory: m, similarity: 0 }]
     }
   })
 
-  scored.sort((a, b) => b.score - a.score)
-  return scored.slice(0, limit).map(s => s.memory)
+  // The floor comes from EVERY scored row, before the cut to `limit`: the
+  // plateau is a property of the corpus, not of the top of the list.
+  const floor = vectorSimilarityFloor(scored.map(s => s.similarity))
+  scored.sort((a, b) => b.similarity - a.similarity)
+  return { hits: scored.slice(0, limit), floor }
 }
 
 /**
@@ -4828,11 +5088,26 @@ function vectorSearch(agentId: string, queryEmbedding: number[], limit: number =
  */
 export interface HybridSearchTrace {
   ftsHits: number
+  /** Vector rows that entered the fusion: above the floor, or vouched for lexically. */
   vectorHits: number
   /** The FTS branch found nothing with AND and was retried with OR. */
   ftsRelaxed: boolean
   /** Every returned row came from the vector branch alone. */
   vectorOnly: boolean
+  /** Vector-only rows dropped for scoring below the similarity floor. */
+  vectorDropped?: number
+}
+
+/**
+ * Per-row provenance on a hybrid answer, additive to Memory. The header labels
+ * the answer as a whole; this labels each row, so a caller holding one row can still tell what vouched for it.
+ */
+export type HybridSearchHit = Memory & {
+  match_kind: 'lexical' | 'vector' | 'lexical+vector'
+  /** The fused RRF score the ranking used. */
+  score: number
+  /** Cosine similarity to the query, when the vector branch scored this row. */
+  similarity?: number
 }
 
 export async function hybridSearch(
@@ -4841,7 +5116,7 @@ export async function hybridSearch(
   limit: number = 10,
   trace?: HybridSearchTrace,
   category?: string,
-): Promise<Memory[]> {
+): Promise<HybridSearchHit[]> {
   const k = 60 // RRF constant
 
   // FTS5 results
@@ -4850,16 +5125,26 @@ export async function hybridSearch(
   // endpoint: the hybrid answer fuses two rankings and already reports which
   // branch produced it, so a loose lexical hit here is labelled, not silent.
   const ftsResults = searchAgentMemories(agentId, query, limit * 2, ftsTrace, true, category)
+  const ftsIds = new Set(ftsResults.map(m => m.id))
 
-  // Vector results
+  // Vector results. A row below the floor survives only when the keyword
+  // branch found it too: lexical support is evidence of its own. Its fusion
+  // score is NOT the one it had before the floor existed: the vector rank below
+  // is computed on the already filtered list, so a kept row moves up past the
+  // dropped ones and its RRF term grows accordingly.
   const queryEmbedding = await generateEmbedding(query)
-  const vecResults = queryEmbedding ? vectorSearch(agentId, queryEmbedding, limit * 2, category) : []
+  const vec = queryEmbedding
+    ? vectorSearch(agentId, queryEmbedding, limit * 2, category)
+    : { hits: [] as VectorHit[], floor: 0 }
+  const vecResults = vec.hits.filter(h => h.similarity >= vec.floor || ftsIds.has(h.memory.id))
+  const vectorDropped = vec.hits.length - vecResults.length
 
   if (trace) {
     trace.ftsHits = ftsResults.length
     trace.vectorHits = vecResults.length
     trace.ftsRelaxed = ftsTrace.relaxed
     trace.vectorOnly = ftsResults.length === 0 && vecResults.length > 0
+    trace.vectorDropped = vectorDropped
   }
   if (ftsResults.length === 0 && vecResults.length > 0) {
     logger.warn(
@@ -4871,19 +5156,32 @@ export async function hybridSearch(
   // Reciprocal Rank Fusion
   const scores: Map<number, number> = new Map()
   const byId: Map<number, Memory> = new Map()
+  const similarityById: Map<number, number> = new Map()
 
   ftsResults.forEach((m, rank) => {
     scores.set(m.id, (scores.get(m.id) || 0) + 1 / (k + rank + 1))
     byId.set(m.id, m)
   })
 
-  vecResults.forEach((m, rank) => {
+  vecResults.forEach((h, rank) => {
+    const m = h.memory
     scores.set(m.id, (scores.get(m.id) || 0) + 1 / (k + rank + 1))
+    similarityById.set(m.id, h.similarity)
     byId.set(m.id, m)
   })
 
   const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1])
-  return ranked.slice(0, limit).map(([id]) => byId.get(id)!)
+  return ranked.slice(0, limit).map(([id, score]): HybridSearchHit => {
+    const lexical = ftsIds.has(id)
+    const similarity = similarityById.get(id)
+    const vector = similarity !== undefined
+    return {
+      ...byId.get(id)!,
+      match_kind: lexical && vector ? 'lexical+vector' : lexical ? 'lexical' : 'vector',
+      score,
+      ...(vector ? { similarity } : {}),
+    }
+  })
 }
 
 // What one backfill run did. BACKFILLZERO (card 370f34c0): the old bare
@@ -5056,6 +5354,60 @@ export function deleteIdea(id: string): boolean {
 
 export function listIdeaCategories(): string[] {
   return (db.prepare('SELECT DISTINCT category FROM idea_box ORDER BY category').all() as { category: string }[]).map(r => r.category)
+}
+
+// --- Team notes ---
+
+export interface TeamNoteRow {
+  id: string
+  assignee: string
+  content: string
+  due_date: string | null
+  created_at: number
+  created_by: string
+  deleted_at: number | null
+  deleted_by: string | null
+  delete_reason: string | null
+}
+
+/**
+ * Active notes, due_date ascending with undated notes last, then oldest first.
+ * `assignee` narrows to that assignee's lines plus the 'mindenki' (everyone)
+ * lines. `includeDeletedSince` (unix s) also returns notes soft-deleted at or
+ * after that moment.
+ */
+export function listTeamNotes(opts?: { assignee?: string; includeDeletedSince?: number }): TeamNoteRow[] {
+  let q = 'SELECT * FROM team_notes WHERE '
+  const params: unknown[] = []
+  if (opts?.includeDeletedSince !== undefined) {
+    q += '(deleted_at IS NULL OR deleted_at >= ?)'
+    params.push(opts.includeDeletedSince)
+  } else {
+    q += 'deleted_at IS NULL'
+  }
+  // Case-insensitive: the API stores lower-case, but a row written before
+  // that (or straight into the table) must not fall out of the filter.
+  if (opts?.assignee) { q += " AND (lower(assignee) = lower(?) OR lower(assignee) = 'mindenki')"; params.push(opts.assignee) }
+  q += ' ORDER BY (due_date IS NULL), due_date ASC, created_at ASC, rowid ASC'
+  return db.prepare(q).all(...params) as TeamNoteRow[]
+}
+
+export function getTeamNote(id: string): TeamNoteRow | undefined {
+  return db.prepare('SELECT * FROM team_notes WHERE id = ?').get(id) as TeamNoteRow | undefined
+}
+
+export function createTeamNote(note: Pick<TeamNoteRow, 'id' | 'assignee' | 'content' | 'due_date' | 'created_by'>): void {
+  db.prepare(
+    `INSERT INTO team_notes (id, assignee, content, due_date, created_at, created_by)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(note.id, note.assignee, note.content, note.due_date ?? null, Math.floor(Date.now() / 1000), note.created_by)
+}
+
+/** Soft delete; returns false when missing or already deleted. */
+export function softDeleteTeamNote(id: string, by: string, reason: string | null): boolean {
+  return db.prepare(
+    'UPDATE team_notes SET deleted_at = ?, deleted_by = ?, delete_reason = ? WHERE id = ? AND deleted_at IS NULL'
+  ).run(Math.floor(Date.now() / 1000), by, reason, id).changes > 0
 }
 
 // --- Idea Comments ---

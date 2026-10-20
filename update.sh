@@ -1110,10 +1110,41 @@ seed_copy_is_untouched() {
   return 1
 }
 
+# Render one shipped file the way the seeder would write it ($1 = source, $2 = mode).
+render_seed_file() {
+  if [ "$2" = "template" ]; then render_seed_template <"$1"; else cat "$1"; fi
+}
+
+# Refresh ONE installed copy of a shipped file if it is provably untouched.
+# $1 = source file, $2 = installed path, $3 = repo-relative path, $4 = mode.
+refresh_one_seed_file() {
+  f="$1"; installed="$2"; rel="$3"; mode="$4"
+  # Already identical to what we would write -> not an update. Without this
+  # the run is not idempotent: it would rewrite the same bytes and report a
+  # refresh on every single update, which is exactly the kind of constant
+  # signal that stops being read.
+  want="$(render_seed_file "$f" "$mode" | shasum -a 256 | awk '{print $1}')"
+  have="$(shasum -a 256 <"$installed" 2>/dev/null | awk '{print $1}')"
+  [ "$want" = "$have" ] && return 0
+  if seed_copy_is_untouched "$installed" "$rel" "$mode"; then
+    if [ "$mode" = "template" ]; then
+      render_seed_template <"$f" >"$installed.seedtmp" && mv "$installed.seedtmp" "$installed"
+    else
+      cp "$f" "$installed"
+    fi
+    SEED_REFRESH_UPDATED=$((SEED_REFRESH_UPDATED + 1))
+  else
+    SEED_REFRESH_KEPT=$((SEED_REFRESH_KEPT + 1))
+  fi
+  return 0
+}
+
 # Refresh one seeded directory tree. $1 = repo source dir (relative), $2 = target
-# root, $3 = verbatim|template.
+# root, $3 = verbatim|template, $4 = which subdirs ship: "references" (a task's
+# references/ only, the default) or "all" (every subdir: a skill's scripts/,
+# references/, ...; SEEDSKILLSUB1018).
 refresh_untouched_seeds() {
-  src_rel="$1"; target_root="$2"; mode="${3:-verbatim}"
+  src_rel="$1"; target_root="$2"; mode="${3:-verbatim}"; subdirs="${4:-references}"
   [ -d "$INSTALL_DIR/$src_rel" ] || return 0
   [ -d "$target_root" ] || return 0
   for d in "$INSTALL_DIR/$src_rel"/*/; do
@@ -1125,29 +1156,45 @@ refresh_untouched_seeds() {
       base="$(basename "$f")"
       installed="$target_root/$name/$base"
       [ -f "$installed" ] || continue           # never add files to an existing dir
-      rel="$src_rel/$name/$base"
-      # Already identical to what we would write -> not an update. Without this
-      # the run is not idempotent: it would rewrite the same bytes and report a
-      # refresh on every single update, which is exactly the kind of constant
-      # signal that stops being read.
-      if [ "$mode" = "template" ]; then
-        want="$(render_seed_template <"$f" | shasum -a 256 | awk '{print $1}')"
-      else
-        want="$(shasum -a 256 <"$f" | awk '{print $1}')"
-      fi
-      have="$(shasum -a 256 <"$installed" 2>/dev/null | awk '{print $1}')"
-      [ "$want" = "$have" ] && continue
-      if seed_copy_is_untouched "$installed" "$rel" "$mode"; then
+      refresh_one_seed_file "$f" "$installed" "$src_rel/$name/$base" "$mode"
+    done
+    # SEEDREFDIR1018: the references/ subdir a SKILL.md points at. An existing
+    # copy follows the same untouched-only rule. A MISSING one is the single
+    # exception to "never add files": it is added only when the installed
+    # SKILL.md is now byte-identical to the shipped one -- that copy runs our
+    # text, and our text points at the file. A locally edited SKILL.md is the
+    # operator's, so its directory gets nothing added.
+    skill_current=0
+    if [ -f "${d}SKILL.md" ] && [ -f "$target_root/$name/SKILL.md" ]; then
+      want="$(render_seed_file "${d}SKILL.md" "$mode" | shasum -a 256 | awk '{print $1}')"
+      have="$(shasum -a 256 <"$target_root/$name/SKILL.md" | awk '{print $1}')"
+      [ "$want" = "$have" ] && skill_current=1
+    fi
+    # Subdir files: the TRACKED ones only, the same set the seed loops copy
+    # (an untracked or ignored file can be a secret; SEEDSKILLSUB1018). Read
+    # into a variable first: the loop body must update the counters in THIS
+    # shell, not in a pipeline subshell.
+    tracked="$(git -C "$d" ls-files 2>/dev/null)"
+    while IFS= read -r rel; do
+      case "$rel" in */*) ;; *) continue ;; esac
+      [ "$subdirs" = "all" ] || case "$rel" in references/*) ;; *) continue ;; esac
+      f="$d$rel"
+      [ -f "$f" ] || continue
+      installed="$target_root/$name/$rel"
+      if [ -f "$installed" ]; then
+        refresh_one_seed_file "$f" "$installed" "$src_rel/$name/$rel" "$mode"
+      elif [ "$skill_current" = "1" ]; then
+        mkdir -p "$(dirname "$installed")"
         if [ "$mode" = "template" ]; then
           render_seed_template <"$f" >"$installed.seedtmp" && mv "$installed.seedtmp" "$installed"
         else
-          cp "$f" "$installed"
+          cp -p "$f" "$installed"   # verbatim keeps the mode bits (a skill's scripts)
         fi
         SEED_REFRESH_UPDATED=$((SEED_REFRESH_UPDATED + 1))
-      else
-        SEED_REFRESH_KEPT=$((SEED_REFRESH_KEPT + 1))
       fi
-    done
+    done <<EOF_TRACKED
+$tracked
+EOF_TRACKED
   done
   return 0
 }
@@ -1166,7 +1213,7 @@ run_seed_refresh() {
     OWNER_NAME="${OWNER_NAME:-$(sed -n 's/^OWNER_NAME=//p' "$INSTALL_DIR/.env" | head -1 | tr -d '"')}"
     WEB_PORT="${WEB_PORT:-$(sed -n 's/^WEB_PORT=//p' "$INSTALL_DIR/.env" | head -1 | tr -d '"')}"
   fi
-  refresh_untouched_seeds "seed-skills" "$HOME/.claude/skills" "verbatim"
+  refresh_untouched_seeds "seed-skills" "$HOME/.claude/skills" "verbatim" "all"
   if [ -n "${MAIN_AGENT_ID:-}" ]; then
     refresh_untouched_seeds "seed-scheduled-tasks" "$HOME/.claude/scheduled-tasks" "template"
     # SEEDREFRESH826: the TOP-LEVEL scheduled-tasks/ dir (dream-engine,
@@ -1423,6 +1470,17 @@ if [ -d "$SEED_SKILLS_DIR" ]; then
       [ -f "$f" ] || continue
       cp "$f" "$target/$(basename "$f")"
     done
+    # SEEDSKILLSUB1018: a skill's subdirs (scripts/, references/, ...) ship too,
+    # verbatim and with their mode bits; its SKILL.md points into them.
+    # Only the files git TRACKS: a whole-dir copy also carried untracked and
+    # ignored files, and fleet-helper's own scripts/.gitignore names exactly
+    # those as secrets/personal data (mail_rules.json, .dashboard-token).
+    # Outside a git checkout nothing below the top level is copied.
+    git -C "$skill_dir" ls-files -z 2>/dev/null | while IFS= read -r -d '' rel; do
+      case "$rel" in */*) ;; *) continue ;; esac   # top-level files: the loop above
+      mkdir -p "$target/$(dirname "$rel")"
+      cp -p "$skill_dir$rel" "$target/$rel"
+    done
     if [ "$forced" = "1" ]; then SEED_FORCED=$((SEED_FORCED + 1)); else SEED_NEW=$((SEED_NEW + 1)); fi
   done
   if [ "$SEED_NEW" -gt 0 ] || [ "$SEED_SKIP" -gt 0 ] || [ "$SEED_FORCED" -gt 0 ]; then
@@ -1467,19 +1525,24 @@ if [ -d "$SEED_SCHED_DIR" ]; then
         fi
       fi
       mkdir -p "$target"
-      for f in "$tpl"*; do
-        [ -f "$f" ] || continue
-        # {{WEB_PORT}} belongs here too: install-linux.sh substitutes it in both
-        # of its seeding loops, and a task seeded by THIS path used to keep the
-        # literal placeholder in its URLs. Same placeholder set on both paths,
-        # or a template silently means different things depending on which
-        # script created the copy.
-        sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
-            -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
-            -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-            -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
-            -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
-            "$f" > "$target/$(basename "$f")"
+      # SEEDREFDIR1018: the references/ subdir ships too (see install-linux.sh).
+      for sub in "" "references/"; do
+        [ -z "$sub" ] || [ -d "$tpl$sub" ] || continue
+        mkdir -p "$target/$sub"
+        for f in "$tpl$sub"*; do
+          [ -f "$f" ] || continue
+          # {{WEB_PORT}} belongs here too: install-linux.sh substitutes it in both
+          # of its seeding loops, and a task seeded by THIS path used to keep the
+          # literal placeholder in its URLs. Same placeholder set on both paths,
+          # or a template silently means different things depending on which
+          # script created the copy.
+          sed -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+              -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
+              -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+              -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+              -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
+              "$f" > "$target/$sub$(basename "$f")"
+        done
       done
       if [ "$forced" = "1" ]; then SCHED_FORCED=$((SCHED_FORCED + 1)); else SCHED_NEW=$((SCHED_NEW + 1)); fi
     done
@@ -1715,6 +1778,20 @@ RESULT_FILE="$5"; BUILT="$6"; NEW_SHORT="$7"; NODE_PIN_DIR="$8"; NOTIFY="${9:-0}
 [ -n "$NODE_PIN_DIR" ] && export PATH="$NODE_PIN_DIR:$PATH"
 cd "$INSTALL_DIR" 2>/dev/null || true
 
+# FINSTAGE930: the verdict has gone missing on installs where the finalizer
+# reaches the restart and then simply is not there any more, so nothing told
+# "died" apart from "never got to _write". These stage marks cost two echoes
+# and turn the next occurrence into a location.
+# The trap is deliberately NON-FATAL: a TERM/HUP/INT is logged with the stage
+# and the finalizer carries on, so a stray reaper TERM no longer costs the
+# verdict (measured: one still arrives in the field, source unknown). This
+# includes the rollback branch, git reset --hard included. The flip side: a
+# deliberate stop of a running finalizer needs SIGKILL, which leaves the last
+# stage= line as the marker.
+STAGE="boot"
+_stage() { STAGE="$1"; echo "[finalize] stage=$1 $(date '+%H:%M:%S')" >&2; }
+trap 'echo "[finalize] SIGNAL caught in stage=${STAGE} $(date +%H:%M:%S)" >&2' TERM HUP INT
+
 _esc() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$1"; }
 _write() { # status phase code message
   printf '{"status":%s,"phase":%s,"code":%s,"old":%s,"new":%s,"message":%s,"ts":%s}\n' \
@@ -1769,14 +1846,18 @@ _unit_drift() {
   return 0
 }
 
+_stage restart
 _restart
+_stage unit-drift
 UNIT_DRIFT="$(_unit_drift)"
 if [ -n "$UNIT_DRIFT" ]; then
   echo "FIGYELEM: enabled, de NEM active unit(ok) a restart utan: ${UNIT_DRIFT}" >&2
   echo "          A szolgaltatas valaszolhat a portjan, de a unitjan KIVUL fut:" >&2
   echo "          a Restart= es az OnFailure= ilyenkor NEM vonatkozik ra." >&2
 fi
+_stage health
 if _health; then
+  _stage write-verdict
   if [ -n "$UNIT_DRIFT" ]; then
     _finish success restart 0 "A frissites lement es a dashboard valaszol, DE enabled unit(ok) nem active: ${UNIT_DRIFT}. A szolgaltatas a unitjan kivul fut, tehat a Restart=/OnFailure= felugyelet nem ervenyes ra."
   fi
@@ -1786,6 +1867,7 @@ fi
 # Restart did not bring the dashboard back -> auto-rollback to the pre-update
 # commit (safe: ff-only ancestor, no force-push, no local-change discard) and
 # restart that, so the box ends on a WORKING old version.
+_stage rollback
 if [ -n "$OLD_FULL" ]; then
   git reset --hard "$OLD_FULL" >/dev/null 2>&1 || true
   # --include=dev: same reason as the main npm ci (AUTOUPDNODEENV905) -- under

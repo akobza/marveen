@@ -86,6 +86,14 @@ export interface SettingDefinition {
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
 
+// A '' (use the default) or a number in [0, 1], e.g. a cosine-similarity threshold.
+function validUnitFraction(v: string): string | null {
+  const t = v.trim()
+  if (t === '') return null
+  const n = Number(t)
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? null : '0 és 1 közötti szám szükséges (pl. 0.1).'
+}
+
 export const SETTINGS_REGISTRY: SettingDefinition[] = [
   {
     key: 'KANBAN_WIP_PLANNED',
@@ -376,6 +384,37 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+  },
+  {
+    key: 'MEMORY_VECTOR_MIN_MARGIN',
+    type: 'string',
+    default: '0.1',
+    description: 'Memória-keresés (hybrid), a vektor-ág küszöbe: egy csak vektor alapján talált emlék akkor marad a válaszban, ha a hasonlósága legalább ennyivel a lekérdezés medián-hasonlósága fölött van. 0 és 1 közötti szám, üres = 0.1. A 0.1 a nomic-embed-text modellen kalibrált érték; más EMBED_MODEL-nél újra kell mérni.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+    validate: (v) => validUnitFraction(v),
+  },
+  {
+    key: 'MEMORY_VECTOR_BASELINE_MIN_ROWS',
+    type: 'int',
+    default: 10,
+    min: 1,
+    max: 100000,
+    description: 'Memória-keresés (hybrid): ennyi pontozott emlék alatt (az ágens- és tier-szűrés UTÁN számolva) a medián helyett az abszolút küszöb (MEMORY_VECTOR_SMALL_CORPUS_MIN_SIMILARITY) érvényes.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    key: 'MEMORY_VECTOR_SMALL_CORPUS_MIN_SIMILARITY',
+    type: 'string',
+    default: '0.72',
+    description: 'Memória-keresés (hybrid), kis korpusz: a csak vektor alapján talált emlék minimális koszinusz-hasonlósága, ha kevesebb emlék van, mint a MEMORY_VECTOR_BASELINE_MIN_ROWS. 0 és 1 közötti szám, üres = 0.72. A nomic-embed-text modellen kalibrált érték; más EMBED_MODEL-nél újra kell mérni.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+    validate: (v) => validUnitFraction(v),
   },
   {
     key: 'MEMORY_IMPORT_CATEGORIZE_MODEL',
@@ -700,6 +739,15 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     type: 'boolean',
     default: '0',
     description: 'Telegram-témák: ha a bot privát chatjében témák vannak, a válasz abba a témába megy, ahonnan az üzenet jött, és a gépelés-jelzés is ott látszik. Bekapcsolva a csatorna-indítás egy kiegészítést tesz a Telegram plugin forrására (scripts/patch-telegram-plugin.py), ami a bejövő üzenet téma-azonosítóját átadja az ügynöknek, és a reply toolt témába küldésre is képessé teszi; kikapcsolva a kiegészítést leveszi, és a plugin pontosan a mai. A privát chatben a témákat a BotFather-ben kell bekapcsolni. A riasztások, a jóváhagyás-kérések és a többi rendszerüzenet ettől függetlenül téma nélkül megy ki. Alapértelmezés: kikapcsolva. A módosítás a csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'PERMISSION_ALERT_MARKS',
+    type: 'string',
+    default: '15m,30m,1h,2h,8h,24h',
+    description: 'Mikor szóljon a figyelő egy megválaszolatlan engedélykérő dialógusról: vesszővel elválasztott időpontok a dialógus megjelenésétől számítva, például 15m,30m,1h,2h,8h,24h (s = másodperc, m = perc, h = óra, d = nap; a mértékegység nélküli szám perc). Az utolsó érték egyben az ismétlési idő is, az alapértelmezéssel tehát az első nap után naponta egy üzenet megy, amíg a kérdés áll. A 0 első értékként azonnali jelzést jelent. Egy al-ügynök engedélykéréséről a fő ügynök azonnal üzenetet kap; az első érték az ő előnye, utána szól a figyelő neked. Értelmezhetetlen érték esetén az alapértelmezés marad érvényben, és ez a naplóba kerül. Billentyűt a figyelő ilyenkor sosem küld, csak üzen. A módosítás a dashboard újraindításakor lép életbe.',
     module: 'channels',
     secret: false,
     requiresRestart: true,
