@@ -57,10 +57,14 @@ const HELD_PEER_PANE = [
   ' Enter to confirm · Esc to cancel',
 ].join('\n')
 
+// The input box's two lines, as a real pane draws them: the idle footer counts only right below the input
+// box (a38182bd, src/pane-state.ts liveFooterIndex), so a bare `? for shortcuts` line reads 'unknown'.
 const IDLE_PANE = [
   '  Done.',
   '',
+  '─'.repeat(80),
   '❯ ',
+  '─'.repeat(80),
   '  ? for shortcuts',
 ].join('\n')
 
