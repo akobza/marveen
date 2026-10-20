@@ -30,14 +30,14 @@ afterAll(() => {
 describe('the federation case-fold backfill', () => {
   it('b1: folds the system prefix of qualified ids at boot, keeps the agent segment and the rest', () => {
     const ins = getDb().prepare("INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at) VALUES (?, ?, 'x', 'done', 1)")
-    ins.run('Teodor/Agent-A', 'ugyvezeto')
-    ins.run('ugyvezeto', 'MARVEEN/Fejleszto')
+    ins.run('Teodor/Agent-A', 'local-main')
+    ins.run('local-main', 'ARTHUR/Marketing')
     ins.run('teodor/agent-b', 'Plain-Name')
     initDatabase(dbPath) // the boot re-runs the backfill
     const rows = getDb().prepare('SELECT from_agent, to_agent FROM agent_messages ORDER BY id').all() as { from_agent: string; to_agent: string }[]
     expect(rows).toEqual([
-      { from_agent: 'teodor/Agent-A', to_agent: 'ugyvezeto' },
-      { from_agent: 'ugyvezeto', to_agent: 'marveen/Fejleszto' },
+      { from_agent: 'teodor/Agent-A', to_agent: 'local-main' },
+      { from_agent: 'local-main', to_agent: 'arthur/Marketing' },
       { from_agent: 'teodor/agent-b', to_agent: 'Plain-Name' },
     ])
   })
