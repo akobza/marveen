@@ -50,10 +50,15 @@ export default defineConfig({
     //    the live-install gate above: that one inspects the CHECKOUT, and ~/.ssh is
     //    HOME-scoped -- a clean worktree run leaked 62 real keys (ENROLL813,
     //    2026-09-15). A seam, not a gate: it sets state, so it lives in its own file.
+    //  - no-live-ollama: refuse every request to port 11434 so no test reaches the
+    //    host's Ollama. With no .env a checkout's EMBED_URL is the live default, and
+    //    a full run sent 453 embedding requests into the fleet's shared model
+    //    (1a7b1b66, 2026-10-24). no-live-ollama-guard.test.ts holds it in place.
     setupFiles: [
       './src/__tests__/setup/assert-not-live-install.ts',
       './src/__tests__/setup/assert-supported-node.ts',
       './src/__tests__/setup/default-ssh-dir-seam.ts',
+      './src/__tests__/setup/no-live-ollama.ts',
     ],
   },
 })
